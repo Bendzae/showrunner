@@ -83,6 +83,7 @@ All keybindings are customizable via `~/.showrunner/keybindings.toml`. The table
 | `p` | Add project | `add_project` |
 | `/` | Filter projects/tasks/sessions | `search` |
 | `Z` | Toggle archived view | `toggle_archive_view` |
+| `K` / `J` | Move the selected task or group up / down | `move_task_up` / `move_task_down` |
 | `t` | Cycle color theme | `cycle_theme` |
 | `q` | Quit | `quit` |
 
@@ -135,8 +136,17 @@ Run sessions are independent per item, so running on a different item starts a s
 | `P` | Push branch | `push` |
 | `b` | Checkout branch in project dir | `checkout` |
 | `o` | Open/create PR | `open_pr` |
+| `g` | Set group (empty to ungroup) | `group` |
 | `A` | Archive | `archive` |
 | `d` | Delete | `delete` |
+
+**Task group actions** (on a `▣ group` header):
+
+| Key | Action | Config key |
+|-----|--------|------------|
+| `t` | Add task to the group | `add_task` |
+| `g` | Rename group | `group` |
+| `G` | Ungroup tasks (dissolve the group) | `ungroup` |
 
 **Session actions:**
 
@@ -228,9 +238,16 @@ base_branch = "develop"                # rebase/diff target (defaults to "main")
 [[projects.tasks]]
 name = "add-dark-mode"
 branch = "feature/dark-mode"
+group = "ui"                            # optional manual grouping in the task list
 ```
 
 Most of these fields are set for you through the TUI (`run_command` on first Run, `base_branch` via `B`), so manual editing is rarely necessary. A running TUI picks up external edits on its next idle refresh.
+
+#### Task groups and ordering
+
+Tasks are listed in the order they appear in the config. `K` / `J` move the selected task up / down within its project (the change is saved to the config, so the CLI and web UI see the same order). Members of a [stack](#stacked-prs) move together as one unit.
+
+Tasks can also be grouped by hand: `g` on a task prompts for a group name, and every task in a project sharing that name is listed under a collapsible `▣ group` header (an empty name removes the task from its group). A grouped task moves within its group; selecting the header moves the whole group, and its context menu adds a task straight into the group, renames it or dissolves it. The group is stored as `group = "..."` on each `[[projects.tasks]]` entry and shows up as `group=...` in `showrunner list` (a `group` field in `--json`).
 
 #### Stacked PRs
 

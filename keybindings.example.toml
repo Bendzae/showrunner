@@ -13,6 +13,8 @@ add_project         = "p"
 toggle_archive_view = "Z"
 search              = "/"
 cycle_theme         = "t"
+move_task_up        = "K"
+move_task_down      = "J"
 
 # Context menu action keybindings
 [context_menu_keys]
@@ -35,3 +37,5 @@ copy_path               = "y"
 review                  = "r"
 fetch_pull              = "f"
 run                     = "x"
+group                   = "g"
+ungroup                 = "G"

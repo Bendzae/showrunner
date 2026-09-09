@@ -145,6 +145,7 @@ fn build_state(cfg: &Config, u: &WorkerUpdate, hostname: &str) -> Value {
                         "branch": t.branch,
                         "base_branch": t.base_branch(),
                         "archived": t.archived,
+                        "group": t.group,
                         "pr_url": u.prs.get(&t.branch).map(|p| &p.url),
                         "pr": u.prs.get(&t.branch).map(pr_json),
                         "diff": u.task_diff_stats.get(&t.branch).map(diff_json),

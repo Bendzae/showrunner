@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -100,6 +100,18 @@ fn kb_search() -> char {
 fn kb_cycle_theme() -> char {
     't'
 }
+fn kb_move_task_up() -> char {
+    'K'
+}
+fn kb_move_task_down() -> char {
+    'J'
+}
+fn cm_group() -> char {
+    'g'
+}
+fn cm_ungroup() -> char {
+    'G'
+}
 
 fn is_false(b: &bool) -> bool {
     !*b
@@ -166,6 +178,12 @@ pub struct ContextMenuKeyBindings {
     /// New session, picking the agent harness first (default: S)
     #[serde(default = "cm_new_session_with_agent")]
     pub new_session_with_agent: char,
+    /// Set a task's group, or rename a group (default: g)
+    #[serde(default = "cm_group")]
+    pub group: char,
+    /// Dissolve a group (default: G)
+    #[serde(default = "cm_ungroup")]
+    pub ungroup: char,
 }
 
 impl Default for ContextMenuKeyBindings {
@@ -190,6 +208,8 @@ impl Default for ContextMenuKeyBindings {
             run: cm_run(),
             add_task_with_agent: cm_add_task_with_agent(),
             new_session_with_agent: cm_new_session_with_agent(),
+            group: cm_group(),
+            ungroup: cm_ungroup(),
         }
     }
 }
@@ -226,6 +246,12 @@ pub struct KeyBindings {
     /// Cycle the color theme (default: t)
     #[serde(default = "kb_cycle_theme")]
     pub cycle_theme: char,
+    /// Move the selected task or group up in the list (default: K)
+    #[serde(default = "kb_move_task_up")]
+    pub move_task_up: char,
+    /// Move the selected task or group down in the list (default: J)
+    #[serde(default = "kb_move_task_down")]
+    pub move_task_down: char,
     /// Context menu action keybindings
     #[serde(default)]
     pub context_menu_keys: ContextMenuKeyBindings,
@@ -243,6 +269,8 @@ impl Default for KeyBindings {
             toggle_archive_view: kb_toggle_archive_view(),
             search: kb_search(),
             cycle_theme: kb_cycle_theme(),
+            move_task_up: kb_move_task_up(),
+            move_task_down: kb_move_task_down(),
             context_menu_keys: ContextMenuKeyBindings::default(),
         }
     }
@@ -277,6 +305,10 @@ pub struct Task {
     /// Archived: hidden from default view, sessions killed but worktrees/branches/context preserved.
     #[serde(default, skip_serializing_if = "is_false")]
     pub archived: bool,
+    /// Manual group: tasks sharing a group name are listed together under a
+    /// collapsible group header.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
 }
 
 impl Task {
@@ -398,44 +430,177 @@ impl Project {
             .collect()
     }
 
-    /// Tasks in display order: members of a stack appear consecutively in
-    /// chain order (root first), the whole chain sitting where its first
-    /// member appears in config order. Everything else keeps config order.
-    pub fn tasks_stack_ordered(&self) -> Vec<&Task> {
-        let chains = self.stack_chains();
+    /// Display structure of the task list. Each block is either a group (all
+    /// its members) or one ungrouped stack chain / lone task, sitting where
+    /// its first member appears in config order. Within a block, chains list
+    /// their members root first; a chain spanning several groups is split per
+    /// group. Values are indices into `tasks`.
+    fn display_blocks(&self) -> Vec<DisplayBlock> {
         let index_of: HashMap<&str, usize> = self
             .tasks
             .iter()
             .enumerate()
             .map(|(i, t)| (t.branch.as_str(), i))
             .collect();
-
-        let mut chain_of: HashMap<&str, &Vec<(&str, usize)>> = HashMap::new();
-        for members in chains.values().filter(|m| m.len() >= 2) {
-            for (branch, _) in members {
-                chain_of.insert(branch, members);
+        let mut chain_of: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
+        for members in self.stack_chains().into_values() {
+            let members: Vec<(usize, usize)> = members
+                .into_iter()
+                .map(|(branch, depth)| (depth, index_of[branch]))
+                .collect();
+            for (_, idx) in &members {
+                chain_of.insert(*idx, members.clone());
             }
         }
 
-        let mut emitted: HashSet<&str> = HashSet::new();
-        let mut ordered = Vec::with_capacity(self.tasks.len());
-        for task in &self.tasks {
-            if !emitted.insert(task.branch.as_str()) {
+        let mut emitted = vec![false; self.tasks.len()];
+        let mut blocks: Vec<DisplayBlock> = Vec::new();
+        let mut group_block: HashMap<&str, usize> = HashMap::new();
+        for (i, task) in self.tasks.iter().enumerate() {
+            if emitted[i] {
                 continue;
             }
-            let Some(members) = chain_of.get(task.branch.as_str()) else {
-                ordered.push(task);
-                continue;
-            };
-            let mut members: Vec<(&str, usize)> = (*members).clone();
-            members.sort_by_key(|(branch, depth)| (*depth, index_of[branch]));
-            for (branch, _) in members {
-                emitted.insert(branch);
-                ordered.push(&self.tasks[index_of[branch]]);
+            let mut chain: Vec<(usize, usize)> = chain_of[&i]
+                .iter()
+                .copied()
+                .filter(|(_, idx)| self.tasks[*idx].group == task.group)
+                .collect();
+            chain.sort();
+            let chain: Vec<usize> = chain.into_iter().map(|(_, idx)| idx).collect();
+            for idx in &chain {
+                emitted[*idx] = true;
+            }
+            match &task.group {
+                Some(group) => match group_block.get(group.as_str()) {
+                    Some(&b) => blocks[b].chains.push(chain),
+                    None => {
+                        group_block.insert(group, blocks.len());
+                        blocks.push(DisplayBlock {
+                            group: Some(group.clone()),
+                            chains: vec![chain],
+                        });
+                    }
+                },
+                None => blocks.push(DisplayBlock {
+                    group: None,
+                    chains: vec![chain],
+                }),
             }
         }
-        ordered
+        blocks
     }
+
+    /// Tasks in display order: group members together, stack members together
+    /// (root first), everything else in config order. See `display_blocks`.
+    pub fn tasks_ordered(&self) -> Vec<&Task> {
+        self.display_blocks()
+            .iter()
+            .flat_map(|b| b.chains.iter().flatten())
+            .map(|&i| &self.tasks[i])
+            .collect()
+    }
+
+    fn reorder_tasks(&mut self, blocks: &[DisplayBlock]) {
+        let mut slots: Vec<Option<Task>> = std::mem::take(&mut self.tasks)
+            .into_iter()
+            .map(Some)
+            .collect();
+        self.tasks = blocks
+            .iter()
+            .flat_map(|b| b.chains.iter().flatten())
+            .map(|&i| slots[i].take().expect("every task appears once"))
+            .collect();
+    }
+
+    /// Move a task one step up or down in display order, past neighbours
+    /// hidden in the other (archived/active) view. A grouped task moves within
+    /// its group; an ungrouped one moves past whole groups. Stack chains move
+    /// as a unit. Returns false when nothing changed.
+    pub fn move_task(&mut self, task_name: &str, up: bool) -> bool {
+        let Some(idx) = self.tasks.iter().position(|t| t.name == task_name) else {
+            return false;
+        };
+        let archived = self.tasks[idx].archived;
+        let mut blocks = self.display_blocks();
+        let Some(bi) = blocks
+            .iter()
+            .position(|b| b.chains.iter().any(|c| c.contains(&idx)))
+        else {
+            return false;
+        };
+        let moved = if blocks[bi].group.is_some() {
+            let chains = &mut blocks[bi].chains;
+            let ci = chains.iter().position(|c| c.contains(&idx)).unwrap();
+            move_element(chains, ci, up, |c| {
+                c.iter().any(|&i| self.tasks[i].archived == archived)
+            })
+        } else {
+            move_element(&mut blocks, bi, up, |b| {
+                b.has_task_with_archived(&self.tasks, archived)
+            })
+        };
+        if moved {
+            self.reorder_tasks(&blocks);
+        }
+        moved
+    }
+
+    /// Move a whole group one step up or down among the top-level blocks
+    /// visible in the given (archived/active) view. Returns false when nothing
+    /// changed.
+    pub fn move_group(&mut self, group: &str, up: bool, archived: bool) -> bool {
+        let mut blocks = self.display_blocks();
+        let Some(bi) = blocks
+            .iter()
+            .position(|b| b.group.as_deref() == Some(group))
+        else {
+            return false;
+        };
+        let moved = move_element(&mut blocks, bi, up, |b| {
+            b.has_task_with_archived(&self.tasks, archived)
+        });
+        if moved {
+            self.reorder_tasks(&blocks);
+        }
+        moved
+    }
+}
+
+struct DisplayBlock {
+    group: Option<String>,
+    chains: Vec<Vec<usize>>,
+}
+
+impl DisplayBlock {
+    fn has_task_with_archived(&self, tasks: &[Task], archived: bool) -> bool {
+        self.chains
+            .iter()
+            .flatten()
+            .any(|&i| tasks[i].archived == archived)
+    }
+}
+
+/// Move `items[i]` past the nearest neighbour in the given direction that
+/// satisfies `visible`, skipping the ones that don't. Returns false when there
+/// is no such neighbour.
+fn move_element<T>(items: &mut Vec<T>, i: usize, up: bool, visible: impl Fn(&T) -> bool) -> bool {
+    let target = if up {
+        (0..i).rev().find(|&j| visible(&items[j]))
+    } else {
+        (i + 1..items.len()).find(|&j| visible(&items[j]))
+    };
+    let Some(j) = target else {
+        return false;
+    };
+    let item = items.remove(i);
+    items.insert(j, item);
+    true
+}
+
+/// Normalized group name: trimmed, `None` when empty.
+pub fn normalize_group(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 /// Which diff review tool the review action launches.
@@ -795,6 +960,7 @@ impl Config {
                     branch,
                     base_branch: None,
                     archived: false,
+                    group: None,
                 });
                 return true;
             }
@@ -827,6 +993,32 @@ impl Config {
             }
         }
         false
+    }
+
+    /// Put a task into a group (`None` removes it from its group).
+    pub fn set_task_group(&mut self, project_name: &str, task_name: &str, group: Option<String>) {
+        if let Some(task) = self
+            .projects
+            .iter_mut()
+            .find(|p| p.name == project_name)
+            .and_then(|p| p.tasks.iter_mut().find(|t| t.name == task_name))
+        {
+            task.group = group.as_deref().and_then(normalize_group);
+        }
+    }
+
+    /// Rename a group across its members; `None` dissolves it.
+    pub fn rename_group(&mut self, project_name: &str, group: &str, new_name: Option<String>) {
+        let new_name = new_name.as_deref().and_then(normalize_group);
+        if let Some(project) = self.projects.iter_mut().find(|p| p.name == project_name) {
+            for task in project
+                .tasks
+                .iter_mut()
+                .filter(|t| t.group.as_deref() == Some(group))
+            {
+                task.group = new_name.clone();
+            }
+        }
     }
 
     /// The configured run command for a project, trimmed; `None` if unset/empty.
@@ -916,6 +1108,7 @@ mod tests {
             branch: branch.into(),
             base_branch: base.map(str::to_string),
             archived: false,
+            group: None,
         }
     }
 
@@ -956,7 +1149,7 @@ mod tests {
     }
 
     #[test]
-    fn tasks_stack_ordered_groups_chain_members_at_the_first_members_slot() {
+    fn tasks_ordered_groups_chain_members_at_the_first_members_slot() {
         let project = project_with_tasks(vec![
             task("api", "feat/api", None),
             task("other", "fix/typo", None),
@@ -966,7 +1159,7 @@ mod tests {
         ]);
 
         let order: Vec<&str> = project
-            .tasks_stack_ordered()
+            .tasks_ordered()
             .iter()
             .map(|t| t.name.as_str())
             .collect();
@@ -976,7 +1169,7 @@ mod tests {
     }
 
     #[test]
-    fn tasks_stack_ordered_keeps_config_order_without_stacks() {
+    fn tasks_ordered_keeps_config_order_without_stacks() {
         let project = project_with_tasks(vec![
             task("a", "feat/a", None),
             task("b", "feat/b", Some("develop")),
@@ -984,7 +1177,7 @@ mod tests {
         ]);
 
         let order: Vec<&str> = project
-            .tasks_stack_ordered()
+            .tasks_ordered()
             .iter()
             .map(|t| t.name.as_str())
             .collect();
@@ -992,7 +1185,7 @@ mod tests {
     }
 
     #[test]
-    fn tasks_stack_ordered_places_a_chain_at_a_child_seen_before_its_root() {
+    fn tasks_ordered_places_a_chain_at_a_child_seen_before_its_root() {
         let project = project_with_tasks(vec![
             task("tests", "feat/tests", Some("feat/api")),
             task("other", "fix/typo", None),
@@ -1000,12 +1193,144 @@ mod tests {
         ]);
 
         let order: Vec<&str> = project
-            .tasks_stack_ordered()
+            .tasks_ordered()
             .iter()
             .map(|t| t.name.as_str())
             .collect();
         // "tests" is seen first, so its whole chain (root first) lands there.
         assert_eq!(order, vec!["api", "tests", "other"]);
+    }
+
+    fn grouped(mut t: Task, group: &str) -> Task {
+        t.group = Some(group.into());
+        t
+    }
+
+    fn names(project: &Project) -> Vec<&str> {
+        project
+            .tasks_ordered()
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn tasks_ordered_gathers_group_members_at_the_first_members_slot() {
+        let project = project_with_tasks(vec![
+            grouped(task("a", "feat/a", None), "auth"),
+            task("b", "feat/b", None),
+            grouped(task("c", "feat/c", None), "auth"),
+            task("d", "feat/d", None),
+        ]);
+        assert_eq!(names(&project), vec!["a", "c", "b", "d"]);
+    }
+
+    #[test]
+    fn tasks_ordered_splits_a_chain_spanning_groups() {
+        let project = project_with_tasks(vec![
+            task("root", "feat/root", None),
+            task("other", "fix/other", None),
+            grouped(task("child", "feat/child", Some("feat/root")), "g"),
+        ]);
+        assert_eq!(names(&project), vec!["root", "other", "child"]);
+    }
+
+    #[test]
+    fn move_task_swaps_with_its_neighbour() {
+        let mut project = project_with_tasks(vec![
+            task("a", "feat/a", None),
+            task("b", "feat/b", None),
+            task("c", "feat/c", None),
+        ]);
+        assert!(project.move_task("c", true));
+        assert_eq!(names(&project), vec!["a", "c", "b"]);
+        assert!(project.move_task("a", false));
+        assert_eq!(names(&project), vec!["c", "a", "b"]);
+        assert!(!project.move_task("c", true));
+        assert!(!project.move_task("b", false));
+    }
+
+    #[test]
+    fn move_task_jumps_over_whole_groups_and_chains() {
+        let mut project = project_with_tasks(vec![
+            task("solo", "feat/solo", None),
+            grouped(task("g1", "feat/g1", None), "g"),
+            grouped(task("g2", "feat/g2", None), "g"),
+            task("root", "feat/root", None),
+            task("child", "feat/child", Some("feat/root")),
+        ]);
+        assert!(project.move_task("solo", false));
+        assert_eq!(names(&project), vec!["g1", "g2", "solo", "root", "child"]);
+        assert!(project.move_task("solo", false));
+        assert_eq!(names(&project), vec!["g1", "g2", "root", "child", "solo"]);
+        assert!(project.move_task("child", true));
+        assert_eq!(names(&project), vec!["root", "child", "g1", "g2", "solo"]);
+    }
+
+    #[test]
+    fn move_task_stays_inside_its_group() {
+        let mut project = project_with_tasks(vec![
+            task("solo", "feat/solo", None),
+            grouped(task("g1", "feat/g1", None), "g"),
+            grouped(task("g2", "feat/g2", None), "g"),
+            task("last", "feat/last", None),
+        ]);
+        assert!(project.move_task("g2", true));
+        assert_eq!(names(&project), vec!["solo", "g2", "g1", "last"]);
+        assert!(!project.move_task("g2", true));
+        assert!(!project.move_task("g1", false));
+    }
+
+    #[test]
+    fn move_group_moves_all_members() {
+        let mut project = project_with_tasks(vec![
+            task("solo", "feat/solo", None),
+            grouped(task("g1", "feat/g1", None), "g"),
+            grouped(task("g2", "feat/g2", None), "g"),
+        ]);
+        assert!(project.move_group("g", true, false));
+        assert_eq!(names(&project), vec!["g1", "g2", "solo"]);
+        assert!(!project.move_group("g", true, false));
+    }
+
+    #[test]
+    fn move_task_skips_neighbours_hidden_in_the_other_view() {
+        let mut archived = task("hidden", "feat/hidden", None);
+        archived.archived = true;
+        let mut project = project_with_tasks(vec![
+            task("a", "feat/a", None),
+            archived,
+            task("b", "feat/b", None),
+        ]);
+        assert!(project.move_task("b", true));
+        assert_eq!(names(&project), vec!["b", "a", "hidden"]);
+        assert!(!project.move_task("hidden", false));
+    }
+
+    #[test]
+    fn set_task_group_normalizes_and_rename_group_updates_members() {
+        let mut cfg = empty_config();
+        cfg.add_project("App".into(), "/tmp/app".into());
+        cfg.add_task("App", "a".into(), "feat/a".into());
+        cfg.add_task("App", "b".into(), "feat/b".into());
+
+        cfg.set_task_group("App", "a", Some(" auth ".into()));
+        cfg.set_task_group("App", "b", Some("auth".into()));
+        assert_eq!(cfg.projects[0].tasks[0].group.as_deref(), Some("auth"));
+
+        cfg.rename_group("App", "auth", Some("login".into()));
+        assert!(
+            cfg.projects[0]
+                .tasks
+                .iter()
+                .all(|t| t.group.as_deref() == Some("login"))
+        );
+
+        cfg.set_task_group("App", "a", Some("  ".into()));
+        assert_eq!(cfg.projects[0].tasks[0].group, None);
+
+        cfg.rename_group("App", "login", None);
+        assert!(cfg.projects[0].tasks.iter().all(|t| t.group.is_none()));
     }
 
     #[test]

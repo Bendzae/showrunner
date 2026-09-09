@@ -9,6 +9,7 @@ use ratatui::widgets::{
 };
 
 use crate::app::{self, App, InputMode};
+use crate::config::Task;
 use crate::theme::current;
 use crate::tmux::{self, CiStatus, PrInfo, PrReview, PrState, SessionStatus};
 
@@ -204,6 +205,8 @@ fn is_text_input_mode(mode: InputMode) -> bool {
             | InputMode::AddTaskPrompt
             | InputMode::MergeCommitMessage
             | InputMode::SetBaseBranch
+            | InputMode::SetGroup
+            | InputMode::RenameGroup
             | InputMode::Search
             | InputMode::RunCommand
     )
@@ -293,18 +296,70 @@ fn is_project_collapsed(app: &App, name: &str) -> bool {
     app.collapsed.contains(&format!("p:{name}"))
 }
 
-/// Check if a task is the last task in its project (looking past child sessions).
+/// Check if a task (or task group) is the last top-level task entry in its
+/// project, looking past child sessions and the members of task groups.
 fn is_last_task(items: &[app::ListItem], i: usize, project_name: &str) -> bool {
     for j in (i + 1)..items.len() {
         match &items[j] {
             app::ListItem::Session { .. } => continue,
             app::ListItem::Task {
+                project_name: pn,
+                task,
+                ..
+            } => {
+                if pn != project_name {
+                    return true;
+                }
+                // A grouped task hangs off a preceding group header, not off us.
+                if task.group.is_none() {
+                    return false;
+                }
+            }
+            app::ListItem::TaskGroup {
                 project_name: pn, ..
             } => return pn != project_name,
             _ => return true,
         }
     }
     true
+}
+
+/// Check if the grouped task at `i` is the last member of its group.
+fn is_last_in_group(items: &[app::ListItem], i: usize, project_name: &str, group: &str) -> bool {
+    for item in items.iter().skip(i + 1) {
+        match item {
+            app::ListItem::Session { .. } => continue,
+            app::ListItem::Task {
+                project_name: pn,
+                task,
+                ..
+            } => return pn != project_name || task.group.as_deref() != Some(group),
+            _ => return true,
+        }
+    }
+    true
+}
+
+/// Tree prefix for a task row: one continuation column per enclosing group
+/// header, then the branch connector.
+fn task_tree_prefix(items: &[app::ListItem], i: usize, project_name: &str, task: &Task) -> String {
+    let group_last = is_last_task(items, i, project_name);
+    match task.group.as_deref() {
+        Some(group) => format!(
+            "{}{}",
+            continuation(group_last),
+            connector(is_last_in_group(items, i, project_name, group))
+        ),
+        None => connector(group_last).to_string(),
+    }
+}
+
+fn continuation(last: bool) -> &'static str {
+    if last { "   " } else { "│  " }
+}
+
+fn connector(last: bool) -> &'static str {
+    if last { "└─ " } else { "├─ " }
 }
 
 /// Check if a session is the last session under its task.
@@ -325,6 +380,9 @@ fn is_last_adhoc_group(items: &[app::ListItem], i: usize, project_name: &str) ->
     for item in items.iter().skip(i + 1) {
         match item {
             app::ListItem::Task {
+                project_name: pn, ..
+            }
+            | app::ListItem::TaskGroup {
                 project_name: pn, ..
             } if pn == project_name => return false,
             app::ListItem::Project { .. } => return true,
@@ -363,26 +421,30 @@ fn is_last_adhoc_group_lookup(
     true
 }
 
-/// Find whether the parent task of a session is the last task in the project.
-fn parent_task_is_last(
+/// Continuation columns for a session row: one per ancestor (group header,
+/// task), blank where that ancestor is the last of its siblings.
+fn session_tree_continuation(
     items: &[app::ListItem],
     session_idx: usize,
     project_name: &str,
-    task_name: &str,
-) -> bool {
-    for j in (0..session_idx).rev() {
-        if let app::ListItem::Task {
-            project_name: pn,
-            task: t,
-            ..
-        } = &items[j]
-        {
-            if pn == project_name && t.name == task_name {
-                return is_last_task(items, j, project_name);
-            }
-        }
+    task: &Task,
+) -> String {
+    let parent = (0..session_idx).rev().find(|&j| {
+        matches!(&items[j], app::ListItem::Task { project_name: pn, task: t, .. }
+            if pn == project_name && t.name == task.name)
+    });
+    let Some(j) = parent else {
+        return continuation(true).to_string();
+    };
+    let group_last = is_last_task(items, j, project_name);
+    match task.group.as_deref() {
+        Some(group) => format!(
+            "{}{}",
+            continuation(group_last),
+            continuation(is_last_in_group(items, j, project_name, group))
+        ),
+        None => continuation(group_last).to_string(),
     }
-    true
 }
 
 /// Extract the trailing PR number from a GitHub PR URL (`.../pull/123` → `123`).
@@ -864,8 +926,7 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
                 project_name, task, ..
             } => {
                 let indicator = if is_selected { " ▸ " } else { "   " };
-                let last = is_last_task(&app.items, i, project_name);
-                let branch_char = if last { "└─ " } else { "├─ " };
+                let tree = task_tree_prefix(&app.items, i, project_name, task);
                 let base_color = if task.archived {
                     current().muted
                 } else {
@@ -878,7 +939,7 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
                 };
                 let mut left = vec![
                     Span::styled(indicator, indicator_style),
-                    Span::styled(branch_char, tree_style),
+                    Span::styled(tree, tree_style),
                     Span::styled(&task.name, style),
                 ];
 
@@ -950,6 +1011,42 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
                     rail: None,
                     selected: is_selected,
                     has_meta: true,
+                });
+            }
+            app::ListItem::TaskGroup {
+                project_name,
+                group,
+                task_count,
+                ..
+            } => {
+                let indicator = if is_selected { " ▸ " } else { "   " };
+                let last = is_last_task(&app.items, i, project_name);
+                let collapsed = app.collapsed.contains(&format!("g:{project_name}:{group}"));
+                let chevron = if collapsed { "▶ " } else { "▼ " };
+                let mut style = Style::default().fg(current().magenta);
+                if is_selected {
+                    style = style.add_modifier(Modifier::BOLD);
+                }
+                let mut spans = vec![
+                    Span::styled(indicator, indicator_style),
+                    Span::styled(connector(last), tree_style),
+                    Span::styled(chevron, Style::default().fg(current().muted)),
+                    Span::styled(format!("▣ {group}"), style),
+                ];
+                if collapsed {
+                    spans.push(Span::styled(
+                        format!("  [{task_count}]"),
+                        Style::default().fg(current().green),
+                    ));
+                }
+                rows.push(Row::Body {
+                    left: spans,
+                    churn: Vec::new(),
+                    badge: Vec::new(),
+                    branch: None,
+                    rail: None,
+                    selected: is_selected,
+                    has_meta: false,
                 });
             }
             app::ListItem::AdhocGroup {
@@ -1071,16 +1168,14 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
                     .unwrap_or(SessionStatus::Finished);
                 let (status_icon, status_color) = status_glyph(status, app.tick);
 
-                let parent_last = parent_task_is_last(&app.items, i, project_name, &task.name);
+                let continuation = session_tree_continuation(&app.items, i, project_name, task);
                 let session_last = is_last_session(&app.items, i, project_name, &task.name);
-                let continuation = if parent_last { "   " } else { "│  " };
-                let branch_char = if session_last { "└─ " } else { "├─ " };
 
                 let wt = session.worktree_path();
                 let mut left = vec![
                     Span::styled(indicator, indicator_style),
                     Span::styled(continuation, tree_style),
-                    Span::styled(branch_char, tree_style),
+                    Span::styled(connector(session_last), tree_style),
                     Span::styled(format!("{status_icon} "), Style::default().fg(status_color)),
                 ];
                 if is_main {
@@ -1543,10 +1638,16 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
                     (&key_display(kb.quit), "quit"),
                 ])
             } else {
+                let move_keys = format!(
+                    "{}/{}",
+                    key_display(kb.move_task_down),
+                    key_display(kb.move_task_up)
+                );
                 help_bar(&[
                     ("⏎", enter_label),
                     (&key_display(kb.toggle_collapse), "collapse"),
                     (&key_display(kb.context_menu), "actions"),
+                    (&move_keys, "move"),
                     (&key_display(kb.search), "filter"),
                     (
                         &key_display(kb.toggle_archive_view),
@@ -1586,6 +1687,8 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         | InputMode::AddTaskName
         | InputMode::AddTaskBranch
         | InputMode::SetBaseBranch
+        | InputMode::SetGroup
+        | InputMode::RenameGroup
         | InputMode::RunCommand => help_bar(&[("⏎", "confirm"), ("Esc", "cancel")]),
         InputMode::ConfirmDelete | InputMode::ConfirmCreatePr => {
             help_bar(&[("y", "confirm"), ("n/Esc", "cancel")])

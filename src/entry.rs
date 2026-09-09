@@ -29,6 +29,8 @@ fn is_text_input_mode(mode: InputMode) -> bool {
             | InputMode::AddTaskPrompt
             | InputMode::MergeCommitMessage
             | InputMode::SetBaseBranch
+            | InputMode::SetGroup
+            | InputMode::RenameGroup
             | InputMode::Search
             | InputMode::RunCommand
     )
@@ -135,6 +137,8 @@ fn run_tui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
                         }
                         KeyCode::Char(c) if c == kb.search => app.start_search(),
                         KeyCode::Char(c) if c == kb.cycle_theme => app.cycle_theme(),
+                        KeyCode::Char(c) if c == kb.move_task_up => app.move_selected_task(true),
+                        KeyCode::Char(c) if c == kb.move_task_down => app.move_selected_task(false),
                         _ => {}
                     },
                     InputMode::ContextMenu => match key.code {
@@ -287,6 +291,24 @@ fn run_tui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
                     },
                     InputMode::SetBaseBranch => match key.code {
                         KeyCode::Enter => app.confirm_set_base_branch(),
+                        KeyCode::Esc => app.cancel_input(),
+                        KeyCode::Backspace => {
+                            app.input_buffer.pop();
+                        }
+                        KeyCode::Char(c) => app.input_buffer.push(c),
+                        _ => {}
+                    },
+                    InputMode::SetGroup => match key.code {
+                        KeyCode::Enter => app.confirm_set_group(),
+                        KeyCode::Esc => app.cancel_input(),
+                        KeyCode::Backspace => {
+                            app.input_buffer.pop();
+                        }
+                        KeyCode::Char(c) => app.input_buffer.push(c),
+                        _ => {}
+                    },
+                    InputMode::RenameGroup => match key.code {
+                        KeyCode::Enter => app.confirm_rename_group(),
                         KeyCode::Esc => app.cancel_input(),
                         KeyCode::Backspace => {
                             app.input_buffer.pop();

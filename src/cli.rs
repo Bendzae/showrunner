@@ -278,7 +278,7 @@ fn cmd_list(args: &[String]) -> Result<()> {
             .map(|p| {
                 let stacks = p.stack_positions();
                 let tasks: Vec<Value> = p
-                    .tasks_stack_ordered()
+                    .tasks_ordered()
                     .into_iter()
                     .map(|t| {
                         json!({
@@ -286,6 +286,7 @@ fn cmd_list(args: &[String]) -> Result<()> {
                             "branch": t.branch,
                             "base_branch": t.base_branch(),
                             "archived": t.archived,
+                            "group": t.group,
                             "stack": stacks.get(&t.branch).map(|(pos, total)| {
                                 json!({ "position": pos, "size": total })
                             }),
@@ -341,14 +342,19 @@ fn cmd_list(args: &[String]) -> Result<()> {
     for project in projects {
         println!("{}  ({})", project.name, project.path);
         let stacks = project.stack_positions();
-        for task in project.tasks_stack_ordered() {
+        for task in project.tasks_ordered() {
             let archived = if task.archived { "  [archived]" } else { "" };
+            let group = task
+                .group
+                .as_deref()
+                .map(|g| format!("  group={g}"))
+                .unwrap_or_default();
             let stack = stacks
                 .get(&task.branch)
                 .map(|(pos, total)| format!("  stack={pos}/{total}"))
                 .unwrap_or_default();
             println!(
-                "  task {}  branch={} base={}{stack}{archived}",
+                "  task {}  branch={} base={}{group}{stack}{archived}",
                 task.name,
                 task.branch,
                 task.base_branch()

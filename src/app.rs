@@ -34,6 +34,13 @@ pub enum ListItem {
         project_path: String,
         session_count: usize,
     },
+    /// Header of a manual task group.
+    TaskGroup {
+        project_name: String,
+        project_path: String,
+        group: String,
+        task_count: usize,
+    },
     AdhocSession {
         project_name: String,
         project_path: String,
@@ -57,6 +64,10 @@ pub enum InputMode {
     MergeCommitMessage,
     ConfirmCreatePr,
     SetBaseBranch,
+    /// Prompt for the group a task belongs to (empty removes it).
+    SetGroup,
+    /// Prompt for a group's new name.
+    RenameGroup,
     Search,
     /// Fuzzy branch picker for project-level checkout.
     CheckoutBranch,
@@ -124,6 +135,17 @@ pub enum ContextAction {
     RunKill,
     /// An agent chosen in the agent picker.
     PickAgent(AgentKind),
+    /// Set (or clear) the selected task's group.
+    SetGroup,
+    /// Rename the selected group.
+    RenameGroup,
+    /// Dissolve the selected group, leaving its tasks ungrouped.
+    Ungroup,
+}
+
+enum MoveTarget {
+    Task(String),
+    Group(String),
 }
 
 /// Where a "Run" action should execute: the owning project (whose `run_command`
@@ -148,7 +170,7 @@ pub fn run_label(item: &ListItem) -> Option<String> {
         ListItem::Session { session, .. } | ListItem::AdhocSession { session, .. } => {
             Some(session.name.clone())
         }
-        ListItem::AdhocGroup { .. } => None,
+        ListItem::AdhocGroup { .. } | ListItem::TaskGroup { .. } => None,
     }
 }
 
@@ -305,6 +327,8 @@ pub struct App {
     pub pending_project_path: Option<String>,
     pub pending_task_name: Option<String>,
     pub pending_task_branch: Option<String>,
+    /// Group a task being created joins (set when adding from a group header).
+    pub pending_task_group: Option<String>,
     pub pending_session_name: Option<String>,
     /// Agent chosen in the agent picker, consumed by the next create flow.
     pub pending_agent: Option<AgentKind>,
@@ -431,6 +455,10 @@ fn task_key(project: &str, task: &str) -> String {
 
 fn adhoc_group_key(project: &str) -> String {
     format!("a:{project}")
+}
+
+fn task_group_key(project: &str, group: &str) -> String {
+    format!("g:{project}:{group}")
 }
 
 /// Expand a leading `~` to the user's home directory.
@@ -577,6 +605,7 @@ impl App {
             pending_project_path: None,
             pending_task_name: None,
             pending_task_branch: None,
+            pending_task_group: None,
             pending_session_name: None,
             pending_agent: None,
             agent_picker_target: None,
@@ -845,7 +874,7 @@ impl App {
             // Determine which tasks of this project match the current view + filter.
             // Stack-ordered so chained tasks sit together instead of in creation order.
             let visible_tasks: Vec<&Task> = project
-                .tasks_stack_ordered()
+                .tasks_ordered()
                 .into_iter()
                 .filter(|t| t.archived == want_archived)
                 .filter(|t| {
@@ -853,6 +882,9 @@ impl App {
                         || project.name.to_lowercase().contains(needle)
                         || t.name.to_lowercase().contains(needle)
                         || t.branch.to_lowercase().contains(needle)
+                        || t.group
+                            .as_ref()
+                            .is_some_and(|g| g.to_lowercase().contains(needle))
                 })
                 .collect();
 
@@ -889,11 +921,33 @@ impl App {
                 }
             }
 
-            for task in visible_tasks {
+            let mut open_group: Option<&str> = None;
+            for task in &visible_tasks {
+                if let Some(group) = task.group.as_deref()
+                    && open_group != Some(group)
+                {
+                    open_group = Some(group);
+                    self.items.push(ListItem::TaskGroup {
+                        project_name: project.name.clone(),
+                        project_path: project.path.clone(),
+                        group: group.to_string(),
+                        task_count: visible_tasks
+                            .iter()
+                            .filter(|t| t.group.as_deref() == Some(group))
+                            .count(),
+                    });
+                }
+                if let Some(group) = task.group.as_deref()
+                    && self
+                        .collapsed
+                        .contains(&task_group_key(&project.name, group))
+                {
+                    continue;
+                }
                 self.items.push(ListItem::Task {
                     project_name: project.name.clone(),
                     project_path: project.path.clone(),
-                    task: task.clone(),
+                    task: (*task).clone(),
                 });
 
                 if self
@@ -912,7 +966,7 @@ impl App {
                     self.items.push(ListItem::Session {
                         project_name: project.name.clone(),
                         project_path: project.path.clone(),
-                        task: task.clone(),
+                        task: (*task).clone(),
                         session,
                     });
                 }
@@ -947,6 +1001,11 @@ impl App {
                 ..
             } => Some((project_name, project_path)),
             ListItem::AdhocSession {
+                project_name,
+                project_path,
+                ..
+            } => Some((project_name, project_path)),
+            ListItem::TaskGroup {
                 project_name,
                 project_path,
                 ..
@@ -1015,7 +1074,75 @@ impl App {
                 }
                 self.rebuild_items();
             }
+            Some(ListItem::TaskGroup {
+                project_name,
+                group,
+                ..
+            }) => {
+                let key = task_group_key(project_name, group);
+                if !self.collapsed.remove(&key) {
+                    self.collapsed.insert(key);
+                }
+                self.rebuild_items();
+            }
             _ => {}
+        }
+    }
+
+    /// Move the selected task (or group) one step up or down and keep it selected.
+    pub fn move_selected_task(&mut self, up: bool) {
+        let (project_name, target) = match self.selected_item() {
+            Some(ListItem::Task {
+                project_name, task, ..
+            }) => (project_name.clone(), MoveTarget::Task(task.name.clone())),
+            Some(ListItem::TaskGroup {
+                project_name,
+                group,
+                ..
+            }) => (project_name.clone(), MoveTarget::Group(group.clone())),
+            _ => {
+                self.status_message = Some("Select a task or group to move".into());
+                return;
+            }
+        };
+        self.config.reload();
+        let Some(project) = self
+            .config
+            .projects
+            .iter_mut()
+            .find(|p| p.name == project_name)
+        else {
+            return;
+        };
+        let moved = match &target {
+            MoveTarget::Task(name) => project.move_task(name, up),
+            MoveTarget::Group(group) => project.move_group(group, up, self.view_archived),
+        };
+        if !moved {
+            return;
+        }
+        let _ = self.config.save();
+        self.rebuild_items();
+        if let Some(idx) = self.items.iter().position(|item| match (item, &target) {
+            (
+                ListItem::Task {
+                    project_name: pn,
+                    task,
+                    ..
+                },
+                MoveTarget::Task(name),
+            ) => *pn == project_name && task.name == *name,
+            (
+                ListItem::TaskGroup {
+                    project_name: pn,
+                    group,
+                    ..
+                },
+                MoveTarget::Group(name),
+            ) => *pn == project_name && group == name,
+            _ => false,
+        }) {
+            self.selected = idx;
         }
     }
 
@@ -1090,6 +1217,23 @@ impl App {
                 label: "New adhoc session",
                 action: ContextAction::NewAdhocSession,
             }],
+            Some(ListItem::TaskGroup { .. }) => vec![
+                ContextMenuItem {
+                    key: cm.add_task,
+                    label: "Add task to group",
+                    action: ContextAction::AddTask,
+                },
+                ContextMenuItem {
+                    key: cm.group,
+                    label: "Rename group",
+                    action: ContextAction::RenameGroup,
+                },
+                ContextMenuItem {
+                    key: cm.ungroup,
+                    label: "Ungroup tasks",
+                    action: ContextAction::Ungroup,
+                },
+            ],
             Some(ListItem::AdhocSession { .. }) => vec![
                 ContextMenuItem {
                     key: cm.run,
@@ -1167,6 +1311,11 @@ impl App {
                             key: cm.open_pr,
                             label: "Open PR",
                             action: ContextAction::OpenPr,
+                        },
+                        ContextMenuItem {
+                            key: cm.group,
+                            label: "Set group",
+                            action: ContextAction::SetGroup,
                         },
                     ];
                     items.extend([
@@ -1275,6 +1424,9 @@ impl App {
             ContextAction::RunRestart => self.run_restart(),
             ContextAction::RunKill => self.run_kill(),
             ContextAction::PickAgent(agent) => self.confirm_agent_picker(agent),
+            ContextAction::SetGroup => self.start_set_group(),
+            ContextAction::RenameGroup => self.start_rename_group(),
+            ContextAction::Ungroup => self.ungroup_selected(),
         }
     }
 
@@ -1648,7 +1800,7 @@ impl App {
                 (project_name, cwd)
             }
             // run_label already returned None for any other variant.
-            ListItem::AdhocGroup { .. } => return None,
+            ListItem::AdhocGroup { .. } | ListItem::TaskGroup { .. } => return None,
         };
         Some(RunContext {
             project_name,
@@ -1914,6 +2066,125 @@ impl App {
         self.sync_worker_hints();
     }
 
+    pub fn start_set_group(&mut self) {
+        let task = match self.selected_item() {
+            Some(ListItem::Task { task, .. }) => task.clone(),
+            _ => {
+                self.status_message = Some("Select a task to set its group".into());
+                return;
+            }
+        };
+        self.input_mode = InputMode::SetGroup;
+        self.input_buffer = task.group.clone().unwrap_or_default();
+        self.status_message = Some("Group (empty to ungroup): ".into());
+    }
+
+    pub fn confirm_set_group(&mut self) {
+        let (project_name, task_name) = match self.selected_item() {
+            Some(ListItem::Task {
+                project_name, task, ..
+            }) => (project_name.clone(), task.name.clone()),
+            _ => {
+                self.cancel_input();
+                return;
+            }
+        };
+        let group = config::normalize_group(&self.input_buffer);
+
+        self.config.reload();
+        self.config
+            .set_task_group(&project_name, &task_name, group.clone());
+        let _ = self.config.save();
+        if let Some(group) = &group {
+            self.collapsed.remove(&task_group_key(&project_name, group));
+        }
+
+        self.status_message = Some(match &group {
+            Some(g) => format!("'{task_name}' moved to group '{g}'"),
+            None => format!("'{task_name}' removed from its group"),
+        });
+        self.input_buffer.clear();
+        self.input_mode = InputMode::Normal;
+        self.rebuild_items();
+        self.select_task(&project_name, &task_name);
+    }
+
+    pub fn start_rename_group(&mut self) {
+        let group = match self.selected_item() {
+            Some(ListItem::TaskGroup { group, .. }) => group.clone(),
+            _ => {
+                self.status_message = Some("Select a group to rename".into());
+                return;
+            }
+        };
+        self.input_mode = InputMode::RenameGroup;
+        self.input_buffer = group;
+        self.status_message = Some("Group name: ".into());
+    }
+
+    pub fn confirm_rename_group(&mut self) {
+        let (project_name, group) = match self.selected_item() {
+            Some(ListItem::TaskGroup {
+                project_name,
+                group,
+                ..
+            }) => (project_name.clone(), group.clone()),
+            _ => {
+                self.cancel_input();
+                return;
+            }
+        };
+        let Some(new_name) = config::normalize_group(&self.input_buffer) else {
+            self.status_message = Some("Group name cannot be empty".into());
+            return;
+        };
+        self.config.reload();
+        self.config
+            .rename_group(&project_name, &group, Some(new_name.clone()));
+        let _ = self.config.save();
+        if self
+            .collapsed
+            .remove(&task_group_key(&project_name, &group))
+        {
+            self.collapsed
+                .insert(task_group_key(&project_name, &new_name));
+        }
+        self.status_message = Some(format!("Group '{group}' renamed to '{new_name}'"));
+        self.input_buffer.clear();
+        self.input_mode = InputMode::Normal;
+        self.rebuild_items();
+    }
+
+    pub fn ungroup_selected(&mut self) {
+        let (project_name, group) = match self.selected_item() {
+            Some(ListItem::TaskGroup {
+                project_name,
+                group,
+                ..
+            }) => (project_name.clone(), group.clone()),
+            _ => {
+                self.status_message = Some("Select a group to ungroup".into());
+                return;
+            }
+        };
+        self.config.reload();
+        self.config.rename_group(&project_name, &group, None);
+        let _ = self.config.save();
+        self.collapsed
+            .remove(&task_group_key(&project_name, &group));
+        self.status_message = Some(format!("Group '{group}' dissolved"));
+        self.rebuild_items();
+    }
+
+    fn select_task(&mut self, project_name: &str, task_name: &str) {
+        if let Some(idx) = self.items.iter().position(|item| {
+            matches!(item, ListItem::Task { project_name: pn, task, .. }
+                if pn == project_name && task.name == task_name)
+        }) {
+            self.selected = idx;
+        }
+    }
+
     pub fn copy_worktree_path(&mut self) {
         let session = match self.selected_item() {
             Some(ListItem::Session { session, .. }) => session,
@@ -2007,6 +2278,10 @@ impl App {
 
     pub fn start_add_task(&mut self) {
         if self.selected_project_info().is_some() {
+            self.pending_task_group = match self.selected_item() {
+                Some(ListItem::TaskGroup { group, .. }) => Some(group.clone()),
+                _ => None,
+            };
             self.use_worktree = true;
             self.input_mode = InputMode::AddTaskName;
             self.input_buffer.clear();
@@ -2088,6 +2363,7 @@ impl App {
         self.input_mode = InputMode::Normal;
 
         let use_worktree = self.use_worktree;
+        let group = self.pending_task_group.take();
         let startup_skills = self.config.startup_skills.clone();
         let agent = self
             .pending_agent
@@ -2118,9 +2394,12 @@ impl App {
             if let Err(e) = Config::modify(move |c| {
                 c.add_task(
                     &project_name_for_modify,
-                    task_name_for_modify,
+                    task_name_for_modify.clone(),
                     branch_for_modify,
                 );
+                if group.is_some() {
+                    c.set_task_group(&project_name_for_modify, &task_name_for_modify, group);
+                }
             }) {
                 return OpResult {
                     message: format!("Error saving config: {e}"),
@@ -3039,6 +3318,7 @@ impl App {
         self.status_message = None;
         self.pending_task_name = None;
         self.pending_task_branch = None;
+        self.pending_task_group = None;
         self.pending_session_name = None;
         self.pending_agent = None;
         self.agent_picker_target = None;
