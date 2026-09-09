@@ -10,7 +10,7 @@ use anyhow::{Result, bail};
 use serde_json::{Value, json};
 
 use crate::agent::AgentKind;
-use crate::config::Config;
+use crate::config::{self, Config};
 use crate::ops;
 use crate::server;
 use crate::tmux::{self, SessionStatus, TmuxSession};
@@ -26,9 +26,10 @@ Usage:
 Managing tasks and sessions (usable from inside a session):
   showrunner list [--json] [--project <name>]
   showrunner task create <project> <name> [--branch <b>] [--base <b>]
-                                           [--prompt <text>]
+                                           [--group <g>] [--prompt <text>]
                                            [--agent claude|codex|pi]
   showrunner task set-base <project> <task> <branch>   ('main' resets)
+  showrunner task set-group <project> <task> [<group>]  (omit to ungroup)
   showrunner task delete <project> <task> --yes
   showrunner session create <project> <task> [--prompt <text>] [--no-worktree]
                                               [--agent claude|codex|pi]
@@ -383,23 +384,25 @@ fn cmd_task(args: &[String]) -> Result<()> {
     match args.first().map(String::as_str) {
         Some("create") => cmd_task_create(&args[1..]),
         Some("set-base") => cmd_task_set_base(&args[1..]),
+        Some("set-group") => cmd_task_set_group(&args[1..]),
         Some("delete") => cmd_task_delete(&args[1..]),
         Some(other) => {
-            bail!("unknown task command '{other}' (expected create, set-base or delete)")
+            bail!("unknown task command '{other}' (expected create, set-base, set-group or delete)")
         }
         None => bail!(
             "usage: task create <project> <name> | task set-base <project> <task> <branch> | \
-             task delete <project> <task> --yes"
+             task set-group <project> <task> [<group>] | task delete <project> <task> --yes"
         ),
     }
 }
 
 fn cmd_task_create(args: &[String]) -> Result<()> {
-    let (positional, flags) = parse_args(args, &["branch", "base", "prompt", "agent"], &[])?;
+    let (positional, flags) =
+        parse_args(args, &["branch", "base", "group", "prompt", "agent"], &[])?;
     let [project_name, task_name] = positional.as_slice() else {
         bail!(
-            "usage: task create <project> <name> [--branch <b>] [--base <b>] [--prompt <text>] \
-             [--agent <id>]"
+            "usage: task create <project> <name> [--branch <b>] [--base <b>] [--group <g>] \
+             [--prompt <text>] [--agent <id>]"
         );
     };
 
@@ -413,6 +416,7 @@ fn cmd_task_create(args: &[String]) -> Result<()> {
         task_name,
         flags.get("branch").map(String::as_str),
         base,
+        flags.get("group").map(String::as_str),
         flags
             .get("prompt")
             .map(String::as_str)
@@ -461,6 +465,36 @@ fn cmd_task_set_base(args: &[String]) -> Result<()> {
         c.set_task_base_branch(&project_name, &task_name, new_base);
     })?;
     println!("base branch for '{task_for_msg}' set to {label}");
+    Ok(())
+}
+
+fn cmd_task_set_group(args: &[String]) -> Result<()> {
+    let (positional, _) = parse_args(args, &[], &[])?;
+    let (project_name, task_name, group) = match positional.as_slice() {
+        [project_name, task_name] => (project_name, task_name, None),
+        [project_name, task_name, group] => (project_name, task_name, Some(group.clone())),
+        _ => {
+            bail!("usage: task set-group <project> <task> [<group>]   (omit the group to ungroup)")
+        }
+    };
+
+    let cfg = Config::load()?;
+    let project = ops::find_project(&cfg, project_name)?;
+    if !project.tasks.iter().any(|t| t.name == *task_name) {
+        bail!("task '{task_name}' not found in project '{project_name}'");
+    }
+
+    let group = group.as_deref().and_then(config::normalize_group);
+    let (project_name, task_name) = (project_name.clone(), task_name.clone());
+    let task_for_msg = task_name.clone();
+    let group_for_msg = group.clone();
+    Config::modify(move |c| {
+        c.set_task_group(&project_name, &task_name, group);
+    })?;
+    match group_for_msg {
+        Some(g) => println!("'{task_for_msg}' moved to group '{g}'"),
+        None => println!("'{task_for_msg}' removed from its group"),
+    }
     Ok(())
 }
 

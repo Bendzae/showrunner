@@ -69,6 +69,7 @@ pub fn create_task(
     task_name: &str,
     branch: Option<&str>,
     base: Option<&str>,
+    group: Option<&str>,
     prompt: Option<&str>,
     agent: AgentKind,
 ) -> Result<(String, String)> {
@@ -118,9 +119,11 @@ pub fn create_task(
     let (project_name, task, branch_for_config) =
         (project.name.clone(), task_name.to_string(), branch.clone());
     let base_for_config = base.map(str::to_string);
+    let group_for_config = group.map(str::to_string);
     Config::modify(move |c| {
         c.add_task(&project_name, task.clone(), branch_for_config);
         c.set_task_base_branch(&project_name, &task, base_for_config);
+        c.set_task_group(&project_name, &task, group_for_config);
     })?;
 
     let tmux_name = create_task_session(

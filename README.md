@@ -247,7 +247,7 @@ Most of these fields are set for you through the TUI (`run_command` on first Run
 
 Tasks are listed in the order they appear in the config. `K` / `J` move the selected task up / down within its project (the change is saved to the config, so the CLI and web UI see the same order). Members of a [stack](#stacked-prs) move together as one unit.
 
-Tasks can also be grouped by hand: `g` on a task prompts for a group name, and every task in a project sharing that name is listed under a collapsible `▣ group` header (an empty name removes the task from its group). A grouped task moves within its group; selecting the header moves the whole group, and its context menu adds a task straight into the group, renames it or dissolves it. The group is stored as `group = "..."` on each `[[projects.tasks]]` entry and shows up as `group=...` in `showrunner list` (a `group` field in `--json`).
+Tasks can also be grouped by hand: `g` on a task prompts for a group name, and every task in a project sharing that name is listed under a collapsible `▣ group` header (an empty name removes the task from its group). A grouped task moves within its group; selecting the header moves the whole group, and its context menu adds a task straight into the group, renames it or dissolves it. The group is stored as `group = "..."` on each `[[projects.tasks]]` entry and shows up as `group=...` in `showrunner list` (a `group` field in `--json`); from the CLI, `task create --group` and `task set-group` set it.
 
 #### Stacked PRs
 
@@ -331,8 +331,9 @@ Besides the TUI and `serve`, the binary exposes the same task/session operations
 
 ```sh
 showrunner list [--json] [--project <name>]      # projects, tasks, live sessions + status
-showrunner task create <project> <name> [--branch <b>] [--base <b>] [--prompt <text>] [--agent claude|codex|pi]
+showrunner task create <project> <name> [--branch <b>] [--base <b>] [--group <g>] [--prompt <text>] [--agent claude|codex|pi]
 showrunner task set-base <project> <task> <branch>   # 'main' resets to the default
+showrunner task set-group <project> <task> [<group>] # omit the group to ungroup
 showrunner task delete <project> <task> --yes
 showrunner session create <project> <task> [--prompt <text>] [--no-worktree] [--agent claude|codex|pi]
 showrunner session kill <session> --yes
@@ -343,7 +344,7 @@ showrunner output <session> [--lines <n>]
 
 Sessions are addressed by the refs `list` prints — `<project>/<task>/<session>` (e.g. `myapp/fix-auth/2`), `<project>/<task>` for that task's main session, or a raw tmux name. `list` marks the session you're calling from as `(this session)`, and reports the same statuses as the TUI (`running`, `waiting_input`, `waiting_permission`, `finished`); it samples each pane twice, so it takes a moment.
 
-`task create` and `session create` mirror the TUI's flows exactly — branch, worktree, setup commands, startup skills and initial prompt included. `--base` sets the task's base branch so it joins a [stack](#stacked-prs); a newly created task branch then starts from that base instead of main. `task set-base` changes it later (the same thing the TUI's set-base-branch key does). `task delete` and `session kill` are destructive (worktrees removed, branches deleted) and require `--yes`; a task's main session can only go away with its task.
+`task create` and `session create` mirror the TUI's flows exactly — branch, worktree, setup commands, startup skills and initial prompt included. `--base` sets the task's base branch so it joins a [stack](#stacked-prs); a newly created task branch then starts from that base instead of main. `task set-base` changes it later (the same thing the TUI's set-base-branch key does). `--group` puts the new task into a [task group](#task-groups-and-ordering), and `task set-group` moves an existing task into one (or out of its group, when the name is omitted). `task delete` and `session kill` are destructive (worktrees removed, branches deleted) and require `--yes`; a task's main session can only go away with its task.
 
 **`ask`** sends a question to another session, waits until that agent finishes its turn, and prints its reply on stdout:
 
