@@ -136,11 +136,11 @@ Run sessions are independent per item, so running on a different item starts a s
 | `P` | Push branch | `push` |
 | `b` | Checkout branch in project dir | `checkout` |
 | `o` | Open/create PR | `open_pr` |
-| `g` | Set group (empty to ungroup) | `group` |
+| `g` | Set group (fuzzy picker over existing groups; type a new name to create one) | `group` |
 | `A` | Archive | `archive` |
 | `d` | Delete | `delete` |
 
-**Task group actions** (on a `▣ group` header):
+**Task group actions** (on a group header):
 
 | Key | Action | Config key |
 |-----|--------|------------|
@@ -247,7 +247,7 @@ Most of these fields are set for you through the TUI (`run_command` on first Run
 
 Tasks are listed in the order they appear in the config. `K` / `J` move the selected task up / down within its project (the change is saved to the config, so the CLI and web UI see the same order). Members of a [stack](#stacked-prs) move together as one unit.
 
-Tasks can also be grouped by hand: `g` on a task prompts for a group name, and every task in a project sharing that name is listed under a collapsible `▣ group` header (an empty name removes the task from its group). A grouped task moves within its group; selecting the header moves the whole group, and its context menu adds a task straight into the group, renames it or dissolves it. The group is stored as `group = "..."` on each `[[projects.tasks]]` entry and shows up as `group=...` in `showrunner list` (a `group` field in `--json`); from the CLI, `task create --group` and `task set-group` set it.
+Tasks can also be grouped by hand: `g` on a task opens a fuzzy picker over the project's existing groups (typing a name that matches none offers to create it; `(no group)` removes the task from its group), and every task in a project sharing that name is listed under a collapsible group header, its members marked with a `┆` rail. A grouped task moves within its group; selecting the header moves the whole group, and its context menu adds a task straight into the group, renames it or dissolves it. The group is stored as `group = "..."` on each `[[projects.tasks]]` entry and shows up as `group=...` in `showrunner list` (a `group` field in `--json`); from the CLI, `task create --group` and `task set-group` set it.
 
 #### Stacked PRs
 

@@ -29,7 +29,6 @@ fn is_text_input_mode(mode: InputMode) -> bool {
             | InputMode::AddTaskPrompt
             | InputMode::MergeCommitMessage
             | InputMode::SetBaseBranch
-            | InputMode::SetGroup
             | InputMode::RenameGroup
             | InputMode::Search
             | InputMode::RunCommand
@@ -301,10 +300,16 @@ fn run_tui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
                     InputMode::SetGroup => match key.code {
                         KeyCode::Enter => app.confirm_set_group(),
                         KeyCode::Esc => app.cancel_input(),
+                        KeyCode::Up => app.picker_move_up(),
+                        KeyCode::Down => app.picker_move_down(),
                         KeyCode::Backspace => {
                             app.input_buffer.pop();
+                            app.update_picker_filter();
                         }
-                        KeyCode::Char(c) => app.input_buffer.push(c),
+                        KeyCode::Char(c) => {
+                            app.input_buffer.push(c);
+                            app.update_picker_filter();
+                        }
                         _ => {}
                     },
                     InputMode::RenameGroup => match key.code {
@@ -332,15 +337,15 @@ fn run_tui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
                     InputMode::CheckoutBranch => match key.code {
                         KeyCode::Enter => app.confirm_checkout_branch(),
                         KeyCode::Esc => app.cancel_input(),
-                        KeyCode::Up => app.branch_picker_move_up(),
-                        KeyCode::Down => app.branch_picker_move_down(),
+                        KeyCode::Up => app.picker_move_up(),
+                        KeyCode::Down => app.picker_move_down(),
                         KeyCode::Backspace => {
                             app.input_buffer.pop();
-                            app.update_branch_filter();
+                            app.update_picker_filter();
                         }
                         KeyCode::Char(c) => {
                             app.input_buffer.push(c);
-                            app.update_branch_filter();
+                            app.update_picker_filter();
                         }
                         _ => {}
                     },

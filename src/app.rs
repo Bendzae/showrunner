@@ -148,6 +148,18 @@ enum MoveTarget {
     Group(String),
 }
 
+/// Picker entry offered to remove a task from its group.
+pub const NO_GROUP: &str = "(no group)";
+
+/// One row of the fuzzy picker.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PickerEntry {
+    /// An existing candidate.
+    Item(String),
+    /// The typed query, offered as a new group.
+    Create(String),
+}
+
 /// Where a "Run" action should execute: the owning project (whose `run_command`
 /// is read/saved), the working directory, and a label used to name the tmux run
 /// session.
@@ -370,12 +382,12 @@ pub struct App {
     pub view_archived: bool,
     /// Active filter substring; tasks/projects/sessions are matched case-insensitively.
     pub search_query: String,
-    /// Branches offered by the fuzzy checkout picker (project-level).
-    pub branch_picker_all: Vec<String>,
+    /// Candidates offered by the fuzzy picker (branches, group names).
+    pub picker_items: Vec<String>,
     /// Project path the branch picker checks out into.
     pub branch_picker_project: String,
-    /// Selected index into the *filtered* branch list.
-    pub branch_picker_selected: usize,
+    /// Selected index into the *filtered* picker list.
+    pub picker_selected: usize,
     /// Context awaiting a run command entered via the `RunCommand` prompt.
     pub pending_run: Option<RunContext>,
     /// Live "Run" sessions keyed by tmux name; value true while the command is
@@ -632,9 +644,9 @@ impl App {
             context_menu_selected: 0,
             view_archived: false,
             search_query: String::new(),
-            branch_picker_all: Vec::new(),
+            picker_items: Vec::new(),
             branch_picker_project: String::new(),
-            branch_picker_selected: 0,
+            picker_selected: 0,
             pending_run: None,
             run_sessions: HashMap::new(),
             theme_index: config::load_theme()
@@ -2066,17 +2078,38 @@ impl App {
         self.sync_worker_hints();
     }
 
+    /// Open the group picker for the selected task: existing groups of its
+    /// project (plus "no group"), with a typed name creating a new group.
     pub fn start_set_group(&mut self) {
-        let task = match self.selected_item() {
-            Some(ListItem::Task { task, .. }) => task.clone(),
+        let (project_name, task) = match self.selected_item() {
+            Some(ListItem::Task {
+                project_name, task, ..
+            }) => (project_name.clone(), task.clone()),
             _ => {
                 self.status_message = Some("Select a task to set its group".into());
                 return;
             }
         };
+        let mut groups: Vec<String> = self
+            .config
+            .projects
+            .iter()
+            .filter(|p| p.name == project_name)
+            .flat_map(|p| p.tasks.iter().filter_map(|t| t.group.clone()))
+            .collect();
+        groups.sort();
+        groups.dedup();
+        self.picker_items = std::iter::once(NO_GROUP.to_string())
+            .chain(groups)
+            .collect();
+        self.picker_selected = self
+            .picker_items
+            .iter()
+            .position(|g| Some(g) == task.group.as_ref())
+            .unwrap_or(0);
+        self.input_buffer.clear();
         self.input_mode = InputMode::SetGroup;
-        self.input_buffer = task.group.clone().unwrap_or_default();
-        self.status_message = Some("Group (empty to ungroup): ".into());
+        self.status_message = Some("Set group (type to filter or create)".into());
     }
 
     pub fn confirm_set_group(&mut self) {
@@ -2089,7 +2122,15 @@ impl App {
                 return;
             }
         };
-        let group = config::normalize_group(&self.input_buffer);
+        let group = match self.picker_matches().get(self.picker_selected) {
+            Some(PickerEntry::Item(g)) if g == NO_GROUP => None,
+            Some(PickerEntry::Item(g)) | Some(PickerEntry::Create(g)) => config::normalize_group(g),
+            None => {
+                self.cancel_input();
+                return;
+            }
+        };
+        self.picker_items.clear();
 
         self.config.reload();
         self.config
@@ -3084,55 +3125,66 @@ impl App {
             self.status_message = Some("No branches found in this project".into());
             return;
         }
-        self.branch_picker_all = branches;
+        self.picker_items = branches;
         self.branch_picker_project = project_path;
-        self.branch_picker_selected = 0;
+        self.picker_selected = 0;
         self.input_buffer.clear();
         self.input_mode = InputMode::CheckoutBranch;
         self.status_message = Some("Checkout branch (type to filter)".into());
     }
 
-    /// Branches matching the current picker query, best match first. With an
-    /// empty query, returns every branch in list order.
-    pub fn filtered_branches(&self) -> Vec<&String> {
+    /// Picker entries matching the current query, best match first. With an
+    /// empty query, returns every candidate in list order. In the group picker
+    /// a query naming no existing group is offered as a new group on top.
+    pub fn picker_matches(&self) -> Vec<PickerEntry> {
         let query = self.input_buffer.trim();
         let mut scored: Vec<(i64, usize, &String)> = self
-            .branch_picker_all
+            .picker_items
             .iter()
             .enumerate()
             .filter_map(|(i, b)| fuzzy_score(query, b).map(|s| (s, i, b)))
             .collect();
         // Sort by score, then original order to keep ranking stable.
         scored.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-        scored.into_iter().map(|(_, _, b)| b).collect()
+        let mut entries: Vec<PickerEntry> = scored
+            .into_iter()
+            .map(|(_, _, b)| PickerEntry::Item(b.clone()))
+            .collect();
+        if self.input_mode == InputMode::SetGroup
+            && !query.is_empty()
+            && !self.picker_items.iter().any(|g| g == query)
+        {
+            entries.insert(0, PickerEntry::Create(query.to_string()));
+        }
+        entries
     }
 
     /// Re-clamp the picker selection after the filter changes.
-    pub fn update_branch_filter(&mut self) {
-        let len = self.filtered_branches().len();
-        if self.branch_picker_selected >= len {
-            self.branch_picker_selected = len.saturating_sub(1);
+    pub fn update_picker_filter(&mut self) {
+        let len = self.picker_matches().len();
+        if self.picker_selected >= len {
+            self.picker_selected = len.saturating_sub(1);
         }
     }
 
-    pub fn branch_picker_move_up(&mut self) {
-        if self.branch_picker_selected > 0 {
-            self.branch_picker_selected -= 1;
+    pub fn picker_move_up(&mut self) {
+        if self.picker_selected > 0 {
+            self.picker_selected -= 1;
         }
     }
 
-    pub fn branch_picker_move_down(&mut self) {
-        let len = self.filtered_branches().len();
-        if self.branch_picker_selected + 1 < len {
-            self.branch_picker_selected += 1;
+    pub fn picker_move_down(&mut self) {
+        let len = self.picker_matches().len();
+        if self.picker_selected + 1 < len {
+            self.picker_selected += 1;
         }
     }
 
     /// Check out the branch highlighted in the picker.
     pub fn confirm_checkout_branch(&mut self) {
-        let branch = match self.filtered_branches().get(self.branch_picker_selected) {
-            Some(b) => (*b).clone(),
-            None => {
+        let branch = match self.picker_matches().get(self.picker_selected) {
+            Some(PickerEntry::Item(b)) => b.clone(),
+            _ => {
                 self.cancel_input();
                 return;
             }
@@ -3140,7 +3192,7 @@ impl App {
         let project_path = self.branch_picker_project.clone();
         self.input_mode = InputMode::Normal;
         self.input_buffer.clear();
-        self.branch_picker_all.clear();
+        self.picker_items.clear();
         self.start_op(&format!("Checking out {branch}…"), move || {
             let output = std::process::Command::new("git")
                 .args(["-C", &project_path, "checkout", &branch])

@@ -107,8 +107,11 @@ pub fn draw(f: &mut Frame, app: &App) {
         draw_floating_input(f, app, list_area);
     }
 
-    if app.input_mode == InputMode::CheckoutBranch {
-        draw_branch_picker(f, app, list_area);
+    if matches!(
+        app.input_mode,
+        InputMode::CheckoutBranch | InputMode::SetGroup
+    ) {
+        draw_picker(f, app, list_area);
     }
 
     if app.input_mode == InputMode::ReviewSessionPicker {
@@ -205,7 +208,6 @@ fn is_text_input_mode(mode: InputMode) -> bool {
             | InputMode::AddTaskPrompt
             | InputMode::MergeCommitMessage
             | InputMode::SetBaseBranch
-            | InputMode::SetGroup
             | InputMode::RenameGroup
             | InputMode::Search
             | InputMode::RunCommand
@@ -324,35 +326,9 @@ fn is_last_task(items: &[app::ListItem], i: usize, project_name: &str) -> bool {
     true
 }
 
-/// Check if the grouped task at `i` is the last member of its group.
-fn is_last_in_group(items: &[app::ListItem], i: usize, project_name: &str, group: &str) -> bool {
-    for item in items.iter().skip(i + 1) {
-        match item {
-            app::ListItem::Session { .. } => continue,
-            app::ListItem::Task {
-                project_name: pn,
-                task,
-                ..
-            } => return pn != project_name || task.group.as_deref() != Some(group),
-            _ => return true,
-        }
-    }
-    true
-}
-
-/// Tree prefix for a task row: one continuation column per enclosing group
-/// header, then the branch connector.
-fn task_tree_prefix(items: &[app::ListItem], i: usize, project_name: &str, task: &Task) -> String {
-    let group_last = is_last_task(items, i, project_name);
-    match task.group.as_deref() {
-        Some(group) => format!(
-            "{}{}",
-            continuation(group_last),
-            connector(is_last_in_group(items, i, project_name, group))
-        ),
-        None => connector(group_last).to_string(),
-    }
-}
+/// Rail drawn in front of a group's member tasks (and their sessions) in
+/// place of the tree connector, so their names line up with ungrouped tasks.
+const GROUP_RAIL: &str = "┆  ";
 
 fn continuation(last: bool) -> &'static str {
     if last { "   " } else { "│  " }
@@ -421,29 +397,24 @@ fn is_last_adhoc_group_lookup(
     true
 }
 
-/// Continuation columns for a session row: one per ancestor (group header,
-/// task), blank where that ancestor is the last of its siblings.
+/// Continuation column for a session row: the group rail for a grouped
+/// parent task, otherwise a tree line unless the parent is the last task.
 fn session_tree_continuation(
     items: &[app::ListItem],
     session_idx: usize,
     project_name: &str,
     task: &Task,
-) -> String {
+) -> &'static str {
+    if task.group.is_some() {
+        return GROUP_RAIL;
+    }
     let parent = (0..session_idx).rev().find(|&j| {
         matches!(&items[j], app::ListItem::Task { project_name: pn, task: t, .. }
             if pn == project_name && t.name == task.name)
     });
-    let Some(j) = parent else {
-        return continuation(true).to_string();
-    };
-    let group_last = is_last_task(items, j, project_name);
-    match task.group.as_deref() {
-        Some(group) => format!(
-            "{}{}",
-            continuation(group_last),
-            continuation(is_last_in_group(items, j, project_name, group))
-        ),
-        None => continuation(group_last).to_string(),
+    match parent {
+        Some(j) => continuation(is_last_task(items, j, project_name)),
+        None => continuation(true),
     }
 }
 
@@ -847,6 +818,7 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
         .fg(current().accent)
         .add_modifier(Modifier::BOLD);
     let tree_style = Style::default().fg(current().border);
+    let group_rail_style = Style::default().fg(current().magenta);
 
     // Stacked-task positions (⧉ n/m) per project, keyed by task branch.
     let stacks: HashMap<&str, HashMap<String, (usize, usize)>> = app
@@ -926,7 +898,14 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
                 project_name, task, ..
             } => {
                 let indicator = if is_selected { " ▸ " } else { "   " };
-                let tree = task_tree_prefix(&app.items, i, project_name, task);
+                let tree = if task.group.is_some() {
+                    Span::styled(GROUP_RAIL, group_rail_style)
+                } else {
+                    Span::styled(
+                        connector(is_last_task(&app.items, i, project_name)),
+                        tree_style,
+                    )
+                };
                 let base_color = if task.archived {
                     current().muted
                 } else {
@@ -939,7 +918,7 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
                 };
                 let mut left = vec![
                     Span::styled(indicator, indicator_style),
-                    Span::styled(tree, tree_style),
+                    tree,
                     Span::styled(&task.name, style),
                 ];
 
@@ -1022,7 +1001,7 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
                 let indicator = if is_selected { " ▸ " } else { "   " };
                 let last = is_last_task(&app.items, i, project_name);
                 let collapsed = app.collapsed.contains(&format!("g:{project_name}:{group}"));
-                let chevron = if collapsed { "▶ " } else { "▼ " };
+                let chevron = if collapsed { " ▸" } else { " ▾" };
                 let mut style = Style::default().fg(current().magenta);
                 if is_selected {
                     style = style.add_modifier(Modifier::BOLD);
@@ -1030,8 +1009,8 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
                 let mut spans = vec![
                     Span::styled(indicator, indicator_style),
                     Span::styled(connector(last), tree_style),
+                    Span::styled(group.as_str(), style),
                     Span::styled(chevron, Style::default().fg(current().muted)),
-                    Span::styled(format!("▣ {group}"), style),
                 ];
                 if collapsed {
                     spans.push(Span::styled(
@@ -1169,12 +1148,17 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
                 let (status_icon, status_color) = status_glyph(status, app.tick);
 
                 let continuation = session_tree_continuation(&app.items, i, project_name, task);
+                let continuation_style = if task.group.is_some() {
+                    group_rail_style
+                } else {
+                    tree_style
+                };
                 let session_last = is_last_session(&app.items, i, project_name, &task.name);
 
                 let wt = session.worktree_path();
                 let mut left = vec![
                     Span::styled(indicator, indicator_style),
-                    Span::styled(continuation, tree_style),
+                    Span::styled(continuation, continuation_style),
                     Span::styled(connector(session_last), tree_style),
                     Span::styled(format!("{status_icon} "), Style::default().fg(status_color)),
                 ];
@@ -1420,8 +1404,12 @@ fn draw_context_menu(f: &mut Frame, app: &App, area: Rect) {
 
 /// Floating fuzzy branch picker: a filter line plus a scrolling, highlighted
 /// list of matching branches. Centered within the list area.
-fn draw_branch_picker(f: &mut Frame, app: &App, area: Rect) {
-    let matches = app.filtered_branches();
+fn draw_picker(f: &mut Frame, app: &App, area: Rect) {
+    let matches = app.picker_matches();
+    let (title, empty_label) = match app.input_mode {
+        InputMode::SetGroup => ("Set group", "no matching groups"),
+        _ => ("Checkout branch", "no matching branches"),
+    };
 
     let width = (area.width.saturating_mul(2) / 3).max(40).min(area.width);
     // Reserve rows for: border (2) + filter line (1) + separator (1).
@@ -1444,7 +1432,7 @@ fn draw_branch_picker(f: &mut Frame, app: &App, area: Rect) {
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(current().accent))
         .title(Span::styled(
-            format!(" Checkout branch ({} matches) ", matches.len()),
+            format!(" {title} ({} matches) ", matches.len()),
             Style::default()
                 .fg(current().accent)
                 .add_modifier(Modifier::BOLD),
@@ -1481,7 +1469,7 @@ fn draw_branch_picker(f: &mut Frame, app: &App, area: Rect) {
         };
         f.render_widget(
             Paragraph::new(Span::styled(
-                "no matching branches",
+                empty_label,
                 Style::default().fg(current().muted),
             )),
             none_area,
@@ -1490,14 +1478,14 @@ fn draw_branch_picker(f: &mut Frame, app: &App, area: Rect) {
     }
 
     // Scroll so the selection stays visible.
-    let selected = app.branch_picker_selected.min(matches.len() - 1);
+    let selected = app.picker_selected.min(matches.len() - 1);
     let offset = if selected >= visible {
         selected + 1 - visible
     } else {
         0
     };
 
-    for (row, branch) in matches.iter().skip(offset).take(visible).enumerate() {
+    for (row, entry) in matches.iter().skip(offset).take(visible).enumerate() {
         let idx = offset + row;
         let is_selected = idx == selected;
         let row_area = Rect {
@@ -1516,11 +1504,18 @@ fn draw_branch_picker(f: &mut Frame, app: &App, area: Rect) {
         } else {
             ("  ", Style::default().fg(current().white))
         };
-        let line = Line::from(vec![
-            Span::styled(marker, Style::default().fg(current().accent)),
-            Span::styled((*branch).clone(), style),
-        ]);
-        f.render_widget(Paragraph::new(line), row_area);
+        let mut spans = vec![Span::styled(marker, Style::default().fg(current().accent))];
+        match entry {
+            app::PickerEntry::Item(label) if label == app::NO_GROUP => {
+                spans.push(Span::styled(label.clone(), style.fg(current().muted)));
+            }
+            app::PickerEntry::Item(label) => spans.push(Span::styled(label.clone(), style)),
+            app::PickerEntry::Create(name) => {
+                spans.push(Span::styled("+ ", Style::default().fg(current().green)));
+                spans.push(Span::styled(format!("new group \"{name}\""), style));
+            }
+        }
+        f.render_widget(Paragraph::new(Line::from(spans)), row_area);
     }
 }
 
@@ -1687,7 +1682,6 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         | InputMode::AddTaskName
         | InputMode::AddTaskBranch
         | InputMode::SetBaseBranch
-        | InputMode::SetGroup
         | InputMode::RenameGroup
         | InputMode::RunCommand => help_bar(&[("⏎", "confirm"), ("Esc", "cancel")]),
         InputMode::ConfirmDelete | InputMode::ConfirmCreatePr => {
@@ -1700,6 +1694,7 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         InputMode::CheckoutBranch => {
             help_bar(&[("⏎", "checkout"), ("↑/↓", "navigate"), ("Esc", "cancel")])
         }
+        InputMode::SetGroup => help_bar(&[("⏎", "select"), ("↑/↓", "navigate"), ("Esc", "cancel")]),
         InputMode::ReviewSessionPicker => {
             help_bar(&[("⏎", "send"), ("↑/↓", "navigate"), ("Esc", "cancel")])
         }
