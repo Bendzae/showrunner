@@ -55,6 +55,18 @@ fn agent_icon_span(app: &App, tmux_name: &str) -> Option<Span<'static>> {
     ))
 }
 
+/// Rolled-up status for a collapsed task: a permission prompt anywhere wins,
+/// then a running session; idle or finished sessions show nothing.
+fn aggregate_status(statuses: &[SessionStatus]) -> Option<SessionStatus> {
+    if statuses.contains(&SessionStatus::WaitingForPermission) {
+        Some(SessionStatus::WaitingForPermission)
+    } else if statuses.contains(&SessionStatus::Running) {
+        Some(SessionStatus::Running)
+    } else {
+        None
+    }
+}
+
 fn status_glyph(status: SessionStatus, tick: usize) -> (&'static str, Color) {
     match status {
         SessionStatus::Running => (SPINNER[tick % SPINNER.len()], current().yellow),
@@ -945,13 +957,20 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
                     .contains(&format!("t:{project_name}:{}", task.name))
                 {
                     let sessions = tmux::sessions_for_task(project_name, &task.name, &app.sessions);
-                    let active = sessions
+                    let statuses: Vec<SessionStatus> = sessions
                         .iter()
-                        .filter(|s| {
-                            app.session_statuses
-                                .get(&s.name)
-                                .map_or(false, |st| *st != SessionStatus::Finished)
-                        })
+                        .filter_map(|s| app.session_statuses.get(&s.name).copied())
+                        .collect();
+                    if let Some(status) = aggregate_status(&statuses) {
+                        let (icon, color) = status_glyph(status, app.tick);
+                        left.push(Span::styled(
+                            format!("  {icon}"),
+                            Style::default().fg(color),
+                        ));
+                    }
+                    let active = statuses
+                        .iter()
+                        .filter(|st| **st != SessionStatus::Finished)
                         .count();
                     if active > 0 {
                         left.push(Span::styled(
