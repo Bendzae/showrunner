@@ -1165,7 +1165,19 @@ impl App {
             | Some(ListItem::AdhocSession { session, .. }) => {
                 self.should_attach = Some(session.name.clone());
             }
-            // Enter on a collapsible item (project/task/adhoc group) toggles it.
+            // Enter on a task attaches to its main session when live.
+            Some(ListItem::Task {
+                project_name, task, ..
+            }) if !task.archived => {
+                let main = tmux::sessions_for_task(project_name, &task.name, &self.sessions)
+                    .into_iter()
+                    .find(|s| tmux::is_main_session(&s.session_name));
+                match main {
+                    Some(session) => self.should_attach = Some(session.name),
+                    None => self.toggle_collapse(),
+                }
+            }
+            // Enter on a collapsible item (project/task group/adhoc group) toggles it.
             _ => self.toggle_collapse(),
         }
     }

@@ -77,7 +77,7 @@ All keybindings are customizable via `~/.showrunner/keybindings.toml`. The table
 | Key | Action | Config key |
 |-----|--------|------------|
 | `j/k` or `Up/Down` | Navigate | `move_down` / `move_up` |
-| `Enter` | Attach to session, or collapse/expand project or task | — |
+| `Enter` | Attach to session (on a task: its main session), or collapse/expand project or group | — |
 | `Space` | Collapse/expand project or task | `toggle_collapse` |
 | `a` | Open context menu | `context_menu` |
 | `p` | Add project | `add_project` |
