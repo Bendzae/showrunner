@@ -506,7 +506,9 @@ pub fn recreate_adhoc_session(
     record: &crate::config::SessionRecord,
 ) -> Result<String> {
     let agent = record.agent_kind();
-    let agent_cmd = build_agent_command(agent, &record.project_path, None, None, true);
+    ensure_agent_installed(agent)?;
+    let resume = has_resumable_session(agent, &record.project_path);
+    let agent_cmd = build_agent_command(agent, &record.project_path, None, None, resume);
 
     let output = Command::new("tmux")
         .args([
@@ -539,30 +541,84 @@ pub fn recreate_adhoc_session(
     Ok(tmux_name.to_string())
 }
 
+fn record_worktree_dir(record: &crate::config::SessionRecord) -> PathBuf {
+    worktree_dir(
+        &record.project_name,
+        &record.task_name,
+        &record.session_name,
+    )
+}
+
+/// A worktree-backed record whose worktree is gone can never be recreated;
+/// callers drop such records instead of retrying on every startup.
+pub fn record_worktree_missing(record: &crate::config::SessionRecord) -> bool {
+    record.use_worktree && !record_worktree_dir(record).exists()
+}
+
+fn ensure_agent_installed(agent: AgentKind) -> Result<()> {
+    let found = Command::new("which")
+        .arg(agent.id())
+        .stdout(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if !found {
+        bail!("'{}' not found in PATH", agent.id());
+    }
+    Ok(())
+}
+
+/// Whether the agent has a prior conversation for `work_dir` that its resume
+/// flag can pick up. Resuming without one makes the agent exit right away,
+/// which takes the tmux session down with it.
+fn has_resumable_session(agent: AgentKind, work_dir: &str) -> bool {
+    let Some(home) = dirs::home_dir() else {
+        return false;
+    };
+    match agent {
+        AgentKind::Claude => {
+            let key: String = work_dir
+                .chars()
+                .map(|c| if c.is_alphanumeric() { c } else { '-' })
+                .collect();
+            dir_has_jsonl(&home.join(".claude/projects").join(key))
+        }
+        AgentKind::Pi => {
+            let key = format!("-{}-", format!("{work_dir}/").replace('/', "-"));
+            dir_has_jsonl(&home.join(".pi/agent/sessions").join(key))
+        }
+        AgentKind::Codex => Command::new("grep")
+            .args([
+                "-rlF",
+                "--include=*.jsonl",
+                &format!("\"cwd\":\"{work_dir}\""),
+            ])
+            .arg(home.join(".codex/sessions"))
+            .output()
+            .is_ok_and(|o| !o.stdout.is_empty()),
+    }
+}
+
+fn dir_has_jsonl(dir: &Path) -> bool {
+    fs::read_dir(dir).is_ok_and(|mut entries| {
+        entries.any(|e| e.is_ok_and(|e| e.path().extension().is_some_and(|x| x == "jsonl")))
+    })
+}
+
 /// Recreate a tmux session from a saved record (e.g. after tmux dies) under the
 /// record's own `tmux_name`. Reuses the existing worktree if present; does NOT
 /// send an initial prompt.
 pub fn recreate_session(tmux_name: &str, record: &crate::config::SessionRecord) -> Result<String> {
+    if record_worktree_missing(record) {
+        bail!("worktree no longer exists");
+    }
     let work_dir = if record.use_worktree {
-        let wt_path = worktree_dir(
-            &record.project_name,
-            &record.task_name,
-            &record.session_name,
-        );
-        if wt_path.exists() {
-            wt_path.to_string_lossy().to_string()
-        } else {
-            // Worktree is gone — cannot recreate this session
-            bail!(
-                "Worktree no longer exists for session {}",
-                record.session_name
-            );
-        }
+        record_worktree_dir(record).to_string_lossy().to_string()
     } else {
         record.project_path.clone()
     };
 
     let agent = record.agent_kind();
+    ensure_agent_installed(agent)?;
 
     // Always install the showrunner skills
     install_agent_skills(agent, &work_dir);
@@ -584,7 +640,8 @@ pub fn recreate_session(tmux_name: &str, record: &crate::config::SessionRecord) 
         is_main_session(&record.session_name),
     );
 
-    let agent_cmd = build_agent_command(agent, &work_dir, Some(&system_prompt), None, true);
+    let resume = has_resumable_session(agent, &work_dir);
+    let agent_cmd = build_agent_command(agent, &work_dir, Some(&system_prompt), None, resume);
 
     let output = Command::new("tmux")
         .args([

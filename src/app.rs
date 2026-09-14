@@ -548,6 +548,7 @@ impl App {
 
         // Recreate any saved sessions that are no longer in tmux (e.g. tmux died)
         let saved = config::load_sessions();
+        let mut restore_failures = Vec::new();
         if !saved.is_empty() {
             let live_names: HashSet<_> = sessions.iter().map(|s| s.name.as_str()).collect();
             for (tmux_name, record) in &saved {
@@ -569,8 +570,11 @@ impl App {
                     // project exists; otherwise the project is gone — prune.
                     if !config.project_exists(&record.project_path) {
                         config::remove_session_record(tmux_name);
-                    } else if tmux::recreate_adhoc_session(tmux_name, record).is_err() {
-                        config::remove_session_record(tmux_name);
+                    } else if let Err(e) = tmux::recreate_adhoc_session(tmux_name, record) {
+                        restore_failures.push(format!(
+                            "{}/{}: {e}",
+                            record.project_name, record.session_name
+                        ));
                     }
                     continue;
                 }
@@ -580,9 +584,11 @@ impl App {
                 // is edited by hand.
                 match config.find_task_by_branch(&record.project_path, &record.task_branch) {
                     Some(_) => {
-                        if tmux::recreate_session(tmux_name, record).is_err() {
-                            // Could not recreate (e.g. worktree gone) — remove stale record
+                        if tmux::record_worktree_missing(record) {
                             config::remove_session_record(tmux_name);
+                        } else if let Err(e) = tmux::recreate_session(tmux_name, record) {
+                            restore_failures
+                                .push(format!("{}/{}: {e}", record.task_name, record.session_name));
                         }
                     }
                     None => {
@@ -667,6 +673,13 @@ impl App {
         }
         app.rebuild_items();
         app.check_cwd();
+        if !restore_failures.is_empty() {
+            app.status_message = Some(format!(
+                "Could not restore {} session(s): {}",
+                restore_failures.len(),
+                restore_failures.join("; ")
+            ));
+        }
         Ok(app)
     }
 
@@ -1547,22 +1560,24 @@ impl App {
         self.start_op("Unarchiving task...", move || {
             let records = config::load_sessions();
             let mut recreated = 0;
-            let mut failed = 0;
+            let mut failed = Vec::new();
             for (tmux_name, record) in &records {
                 if record.project_name == project_name && record.task_name == task_name {
+                    if tmux::record_worktree_missing(record) {
+                        // Stale record (e.g. worktree removed externally) — drop it.
+                        config::remove_session_record(tmux_name);
+                        continue;
+                    }
                     match tmux::recreate_session(tmux_name, record) {
                         Ok(_) => recreated += 1,
-                        Err(_) => {
-                            failed += 1;
-                            // Stale record (e.g. worktree removed externally) — drop it.
-                            config::remove_session_record(tmux_name);
-                        }
+                        Err(e) => failed.push(format!("{}: {e}", record.session_name)),
                     }
                 }
             }
-            let msg = if failed > 0 {
+            let msg = if !failed.is_empty() {
                 format!(
-                    "Unarchived '{task_name}' — {recreated} session(s) restored, {failed} dropped"
+                    "Unarchived '{task_name}' — {recreated} session(s) restored, failed: {}",
+                    failed.join("; ")
                 )
             } else {
                 format!("Unarchived '{task_name}' — {recreated} session(s) restored")
