@@ -22,6 +22,27 @@ Sessions are addressed as `<project>/<task>/<session>`:
 Raw tmux names (`cm__myapp__fix-auth__main`) also work. Always take refs from `list` rather than
 guessing — project and task names are sanitized in refs (spaces and symbols become `-`).
 
+## Remote host
+
+When `list` ends with a `host <name> (…)` section, another machine runs Showrunner too (a remote
+box, or the laptop that linked to this one). Its refs are printed already prefixed
+(`ec2:myapp/fix-auth/2`, `mac:myapp/fix-auth`); every command below accepts them and runs on that
+host: `ask ec2:myapp/fix-auth "…"`, `session create ec2:myapp fix-auth --prompt "…"`, `list ec2:`
+(that host only). Sessions there work in that machine's clone and worktrees, so they cannot see
+your files — share work via branches (commit and push), not paths. If the section says
+`unreachable`, that machine is offline or not linked right now; try again later rather than
+retrying in a loop.
+
+A session can be moved to another host and back:
+
+```
+showrunner session move <session> --to <host>     # e.g. --to ec2, or --to local from a prefixed ref
+```
+
+This asks that session's agent for a handoff note, commits and pushes its branch, recreates it on
+the destination with the note as its first prompt, and removes it here (branch kept). Only move
+sessions the user asked you to move.
+
 ## Viewing
 
 ```

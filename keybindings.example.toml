@@ -15,6 +15,7 @@ search              = "/"
 cycle_theme         = "t"
 move_task_up        = "K"
 move_task_down      = "J"
+add_remote_project  = "P"
 
 # Context menu action keybindings
 [context_menu_keys]
@@ -39,3 +40,4 @@ fetch_pull              = "f"
 run                     = "x"
 group                   = "g"
 ungroup                 = "G"
+move_session            = "M"

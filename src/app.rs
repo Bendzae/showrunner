@@ -10,6 +10,7 @@ use anyhow::Result;
 
 use crate::agent::AgentKind;
 use crate::config::{self, Config, KeyBindings, Project, ReviewTool, Task};
+use crate::remote::{self, HostPoller, HostSnapshot, Link, Target};
 use crate::tmux::{self, DiffStats, PrInfo, SessionStatus, TmuxSession};
 use crate::worker::{TaskInfo, Worker};
 
@@ -81,6 +82,8 @@ pub enum InputMode {
     ReviewSessionPicker,
     /// Pick the agent harness before an add-task / new-session flow.
     AgentPicker,
+    /// Fuzzy picker over the remote's projects not yet in this list.
+    AddRemoteProject,
 }
 
 /// What the agent picker feeds into once an agent is chosen.
@@ -141,11 +144,15 @@ pub enum ContextAction {
     RenameGroup,
     /// Dissolve the selected group, leaving its tasks ungrouped.
     Ungroup,
+    /// Move the selected session (or a task's main session) to the other machine.
+    MoveSession,
 }
 
 enum MoveTarget {
     Task(String),
     Group(String),
+    /// A project, identified by its path.
+    Project(String),
 }
 
 /// Picker entry offered to remove a task from its group.
@@ -328,6 +335,8 @@ pub struct App {
     pub should_attach: Option<String>,
     /// Attach to a specific (session, window index) — used for terminals.
     pub should_attach_window: Option<(String, usize)>,
+    /// Attach over ssh to `(host name, tmux session name)` on the remote.
+    pub should_attach_remote: Option<(String, String)>,
     /// Pending foreground hunk review: `(cwd, hunk args, candidate sessions)`.
     /// Set by the review action when the configured tool is `hunk`; the main loop
     /// suspends the TUI, runs hunk on the real terminal, then resumes. Unlike
@@ -342,6 +351,8 @@ pub struct App {
     /// Group a task being created joins (set when adding from a group header).
     pub pending_task_group: Option<String>,
     pub pending_session_name: Option<String>,
+    /// Host the task being created goes to; `None` for this machine.
+    pub pending_task_host: Option<String>,
     /// Agent chosen in the agent picker, consumed by the next create flow.
     pub pending_agent: Option<AgentKind>,
     /// Flow the agent picker was opened for.
@@ -376,6 +387,17 @@ pub struct App {
     pub review_selected: usize,
     pub tick: usize,
     pub worker: Worker,
+    /// Latest listing of every other host (the configured remote, a linked
+    /// peer): their projects and sessions are shown alongside local ones.
+    pub hosts: Vec<HostSnapshot>,
+    pub host_poller: HostPoller,
+    /// Host tasks already shown once (collapsed on first sight only).
+    pub seen_host_tasks: HashSet<String>,
+    /// Remote projects offered by the add-remote-project picker, parallel to
+    /// `picker_items`.
+    pub remote_project_candidates: Vec<Project>,
+    /// Reverse link to the configured remote, held for the TUI's lifetime.
+    pub link: Option<Link>,
     pub context_menu_items: Vec<ContextMenuItem>,
     pub context_menu_selected: usize,
     /// When true, the task list shows only archived tasks instead of active ones.
@@ -459,6 +481,15 @@ pub fn detect_hostname() -> String {
 
 fn project_key(name: &str) -> String {
     format!("p:{name}")
+}
+
+/// Identity a project's collapse keys are scoped by: `<host>:<name>` for a
+/// remote project, so it never shares state with a local namesake.
+pub fn scoped_project(name: &str, path: &str) -> String {
+    match remote::host_of_path(path) {
+        Some((host, _)) => format!("{host}:{name}"),
+        None => name.to_string(),
+    }
 }
 
 fn task_key(project: &str, task: &str) -> String {
@@ -606,6 +637,7 @@ impl App {
         }
         let (tx, rx) = mpsc::channel();
         let (review_tx, review_rx) = mpsc::channel();
+        let link = config.remote.as_ref().and_then(|r| Link::start(r).ok());
         let mut app = App {
             config,
             keybindings,
@@ -619,12 +651,14 @@ impl App {
             should_quit: false,
             should_attach: None,
             should_attach_window: None,
+            should_attach_remote: None,
             should_review_hunk: None,
             pending_project_path: None,
             pending_task_name: None,
             pending_task_branch: None,
             pending_task_group: None,
             pending_session_name: None,
+            pending_task_host: None,
             pending_agent: None,
             agent_picker_target: None,
             collapsed: HashSet::new(),
@@ -646,6 +680,11 @@ impl App {
             review_selected: 0,
             tick: 0,
             worker: Worker::spawn(),
+            hosts: Vec::new(),
+            host_poller: HostPoller::spawn(),
+            seen_host_tasks: HashSet::new(),
+            remote_project_candidates: Vec::new(),
+            link,
             context_menu_items: vec![],
             context_menu_selected: 0,
             view_archived: false,
@@ -662,13 +701,16 @@ impl App {
             hostname: detect_hostname(),
             list_offset: std::cell::Cell::new(0),
         };
-        // Start with all tasks collapsed, and projects with no tasks collapsed
+        // Everything starts collapsed: projects, adhoc groups, task groups, tasks.
         for project in &app.config.projects {
-            if project.tasks.is_empty() {
-                app.collapsed.insert(project_key(&project.name));
-            }
+            let pid = scoped_project(&project.name, &project.path);
+            app.collapsed.insert(project_key(&pid));
+            app.collapsed.insert(adhoc_group_key(&pid));
             for task in &project.tasks {
-                app.collapsed.insert(task_key(&project.name, &task.name));
+                app.collapsed.insert(task_key(&pid, &task.name));
+                if let Some(group) = &task.group {
+                    app.collapsed.insert(task_group_key(&pid, group));
+                }
             }
         }
         app.rebuild_items();
@@ -695,6 +737,10 @@ impl App {
     /// Apply any pending updates from the background worker.
     pub fn apply_worker_updates(&mut self) {
         let latest = self.worker.latest.lock().unwrap().take();
+        let hosts = self.host_poller.latest.lock().unwrap().take();
+        if latest.is_none() && hosts.is_none() {
+            return;
+        }
         if let Some(update) = latest {
             self.sessions = update.sessions;
             self.session_statuses = update.statuses;
@@ -715,8 +761,152 @@ impl App {
                 self.project_branches = update.project_branches;
             }
             self.run_sessions = update.run_sessions;
-            self.rebuild_items();
         }
+        if let Some(hosts) = hosts {
+            // Tasks and groups start collapsed, like local ones do at startup.
+            for project in hosts.iter().flat_map(|h| h.projects.iter()) {
+                let pid = scoped_project(&project.name, &project.path);
+                let keys = project.tasks.iter().flat_map(|task| {
+                    std::iter::once(task_key(&pid, &task.name))
+                        .chain(task.group.as_deref().map(|g| task_group_key(&pid, g)))
+                });
+                for key in keys {
+                    if self.seen_host_tasks.insert(key.clone()) {
+                        self.collapsed.insert(key);
+                    }
+                }
+            }
+            self.hosts = hosts;
+        }
+        // Host sessions are keyed by `<host>:<tmux name>`, so they can share
+        // the per-session maps with local ones.
+        for host in &self.hosts {
+            self.session_statuses
+                .extend(host.statuses.iter().map(|(k, v)| (k.clone(), *v)));
+            self.session_agents
+                .extend(host.agents.iter().map(|(k, v)| (k.clone(), v.clone())));
+        }
+        self.rebuild_items();
+    }
+
+    /// The sessions living where the project at `project_path` lives: on a
+    /// host for `<host>:` paths, else here.
+    pub fn sessions_at(&self, project_path: &str) -> &[TmuxSession] {
+        match remote::host_of_path(project_path) {
+            Some((host, _)) => self
+                .hosts
+                .iter()
+                .find(|h| h.host == host)
+                .map(|h| h.sessions.as_slice())
+                .unwrap_or(&[]),
+            None => &self.sessions,
+        }
+    }
+
+    /// The host's own listing of the project at a `<host>:<path>` path.
+    fn host_project(&self, project_path: &str) -> Option<&Project> {
+        let (host, _) = remote::host_of_path(project_path)?;
+        self.hosts
+            .iter()
+            .find(|h| h.host == host)?
+            .projects
+            .iter()
+            .find(|p| p.path == project_path)
+    }
+
+    /// Open a picker over the remote's projects that aren't listed here yet;
+    /// choosing one adds it to the config like a local project.
+    pub fn start_add_remote_project(&mut self) {
+        let Some(remote) = self.remote_name() else {
+            self.status_message = Some("No [remote] configured".into());
+            return;
+        };
+        let Some(snapshot) = self.hosts.iter().find(|h| h.host == remote) else {
+            self.status_message = Some(format!("{remote} has not answered yet"));
+            return;
+        };
+        if let Some(e) = &snapshot.error {
+            self.status_message = Some(format!("{remote} is unreachable: {e}"));
+            return;
+        }
+        let candidates: Vec<Project> = snapshot
+            .projects
+            .iter()
+            .filter(|p| !self.config.has_project_at(&p.path))
+            .cloned()
+            .collect();
+        if candidates.is_empty() {
+            self.status_message = Some(format!("Every project on {remote} is already listed"));
+            return;
+        }
+        self.picker_items = candidates
+            .iter()
+            .map(|p| {
+                let path = remote::host_of_path(&p.path)
+                    .map(|(_, p)| p)
+                    .unwrap_or(&p.path);
+                format!("{}  {path}", p.name)
+            })
+            .collect();
+        self.remote_project_candidates = candidates;
+        self.picker_selected = 0;
+        self.input_buffer.clear();
+        self.input_mode = InputMode::AddRemoteProject;
+        self.status_message = Some(format!("Add project from {remote} (type to filter)"));
+    }
+
+    pub fn confirm_add_remote_project(&mut self) {
+        let label = match self.picker_matches().get(self.picker_selected) {
+            Some(PickerEntry::Item(label)) => label.clone(),
+            _ => {
+                self.cancel_input();
+                return;
+            }
+        };
+        let picked = self
+            .picker_items
+            .iter()
+            .position(|l| *l == label)
+            .and_then(|i| self.remote_project_candidates.get(i).cloned());
+        self.input_mode = InputMode::Normal;
+        self.input_buffer.clear();
+        self.picker_items.clear();
+        self.remote_project_candidates.clear();
+        let Some(project) = picked else {
+            return;
+        };
+        let (name, path) = (project.name.clone(), project.path.clone());
+        match Config::modify(move |c| c.add_project(name, path)) {
+            Ok(_) => {
+                self.config.reload();
+                self.status_message = Some(format!(
+                    "Added {}",
+                    remote::host_of_path(&project.path)
+                        .map(|(h, _)| format!("{h}:{}", project.name))
+                        .unwrap_or(project.name.clone())
+                ));
+                self.rebuild_items();
+            }
+            Err(e) => self.status_message = Some(format!("Error: {e}")),
+        }
+    }
+
+    /// Host of the selected item's project, `None` for a local one.
+    fn selected_host(&self) -> Option<String> {
+        self.selected_project_info()
+            .and_then(|(_, path)| remote::host_of_path(path))
+            .map(|(host, _)| host.to_string())
+    }
+
+    fn host_named(&self, name: &str) -> Option<remote::Host> {
+        remote::hosts(&self.config)
+            .into_iter()
+            .find(|h| h.name() == name)
+    }
+
+    /// The other machine a local session can move to.
+    fn remote_name(&self) -> Option<String> {
+        self.config.remote.as_ref().map(|r| r.name.clone())
     }
 
     /// Poll for completed background operations.
@@ -863,10 +1053,14 @@ impl App {
 
     /// Tell the worker what is selected.
     pub fn sync_worker_hints(&self) {
-        let tasks: Vec<TaskInfo> = self
-            .config
-            .projects
-            .iter()
+        // Remote projects have no local checkout for the worker to inspect.
+        let local = || {
+            self.config
+                .projects
+                .iter()
+                .filter(|p| remote::host_of_path(&p.path).is_none())
+        };
+        let tasks: Vec<TaskInfo> = local()
             .flat_map(|p| {
                 p.tasks.iter().map(|t| TaskInfo {
                     project_name: p.name.clone(),
@@ -877,12 +1071,8 @@ impl App {
             })
             .collect();
 
-        let project_paths: Vec<(String, String)> = self
-            .config
-            .projects
-            .iter()
-            .map(|p| (p.name.clone(), p.path.clone()))
-            .collect();
+        let project_paths: Vec<(String, String)> =
+            local().map(|p| (p.name.clone(), p.path.clone())).collect();
 
         if let Ok(mut hints) = self.worker.hints.lock() {
             hints.tasks = tasks;
@@ -895,7 +1085,27 @@ impl App {
         let needle = self.search_query.to_lowercase();
         let needle = needle.trim();
         let want_archived = self.view_archived;
-        for project in &self.config.projects {
+        // A remote project entry only names the project; its tasks are what
+        // the host currently lists.
+        let projects: Vec<Project> = self
+            .config
+            .projects
+            .iter()
+            .map(|p| match self.host_project(&p.path) {
+                Some(listed) => Project {
+                    tasks: listed.tasks.clone(),
+                    ..p.clone()
+                },
+                None => p.clone(),
+            })
+            .collect();
+        for project in &projects {
+            let pool = self.sessions_at(&project.path).to_vec();
+            // The filter sees remote projects by their displayed `host:name`.
+            let project_label = match remote::host_of_path(&project.path) {
+                Some((host, _)) => format!("{host}:{}", project.name).to_lowercase(),
+                None => project.name.to_lowercase(),
+            };
             // Determine which tasks of this project match the current view + filter.
             // Stack-ordered so chained tasks sit together instead of in creation order.
             let visible_tasks: Vec<&Task> = project
@@ -904,7 +1114,7 @@ impl App {
                 .filter(|t| t.archived == want_archived)
                 .filter(|t| {
                     needle.is_empty()
-                        || project.name.to_lowercase().contains(needle)
+                        || project_label.contains(needle)
                         || t.name.to_lowercase().contains(needle)
                         || t.branch.to_lowercase().contains(needle)
                         || t.group
@@ -923,19 +1133,20 @@ impl App {
                 project: project.clone(),
             });
 
-            if self.collapsed.contains(&project_key(&project.name)) {
+            let pid = scoped_project(&project.name, &project.path);
+            if self.collapsed.contains(&project_key(&pid)) {
                 continue;
             }
 
             // Adhoc group: only rendered when the project has at least one adhoc session.
-            let adhoc_sessions = tmux::adhoc_sessions_for_project(&project.name, &self.sessions);
+            let adhoc_sessions = tmux::adhoc_sessions_for_project(&project.name, &pool);
             if !adhoc_sessions.is_empty() {
                 self.items.push(ListItem::AdhocGroup {
                     project_name: project.name.clone(),
                     project_path: project.path.clone(),
                     session_count: adhoc_sessions.len(),
                 });
-                if !self.collapsed.contains(&adhoc_group_key(&project.name)) {
+                if !self.collapsed.contains(&adhoc_group_key(&pid)) {
                     for session in adhoc_sessions {
                         self.items.push(ListItem::AdhocSession {
                             project_name: project.name.clone(),
@@ -963,9 +1174,7 @@ impl App {
                     });
                 }
                 if let Some(group) = task.group.as_deref()
-                    && self
-                        .collapsed
-                        .contains(&task_group_key(&project.name, group))
+                    && self.collapsed.contains(&task_group_key(&pid, group))
                 {
                     continue;
                 }
@@ -975,10 +1184,7 @@ impl App {
                     task: (*task).clone(),
                 });
 
-                if self
-                    .collapsed
-                    .contains(&task_key(&project.name, &task.name))
-                {
+                if self.collapsed.contains(&task_key(&pid, &task.name)) {
                     continue;
                 }
 
@@ -987,7 +1193,7 @@ impl App {
                     continue;
                 }
 
-                for session in tmux::sessions_for_task(&project.name, &task.name, &self.sessions) {
+                for session in tmux::sessions_for_task(&project.name, &task.name, &pool) {
                     self.items.push(ListItem::Session {
                         project_name: project.name.clone(),
                         project_path: project.path.clone(),
@@ -1075,43 +1281,32 @@ impl App {
     }
 
     pub fn toggle_collapse(&mut self) {
-        match self.selected_item() {
+        let key = match self.selected_item() {
             Some(ListItem::Project { project }) => {
-                let key = project_key(&project.name);
-                if !self.collapsed.remove(&key) {
-                    self.collapsed.insert(key);
-                }
-                self.rebuild_items();
+                project_key(&scoped_project(&project.name, &project.path))
             }
             Some(ListItem::Task {
-                project_name, task, ..
-            }) => {
-                let key = task_key(project_name, &task.name);
-                if !self.collapsed.remove(&key) {
-                    self.collapsed.insert(key);
-                }
-                self.rebuild_items();
-            }
-            Some(ListItem::AdhocGroup { project_name, .. }) => {
-                let key = adhoc_group_key(project_name);
-                if !self.collapsed.remove(&key) {
-                    self.collapsed.insert(key);
-                }
-                self.rebuild_items();
-            }
+                project_name,
+                project_path,
+                task,
+            }) => task_key(&scoped_project(project_name, project_path), &task.name),
+            Some(ListItem::AdhocGroup {
+                project_name,
+                project_path,
+                ..
+            }) => adhoc_group_key(&scoped_project(project_name, project_path)),
             Some(ListItem::TaskGroup {
                 project_name,
+                project_path,
                 group,
                 ..
-            }) => {
-                let key = task_group_key(project_name, group);
-                if !self.collapsed.remove(&key) {
-                    self.collapsed.insert(key);
-                }
-                self.rebuild_items();
-            }
-            _ => {}
+            }) => task_group_key(&scoped_project(project_name, project_path), group),
+            _ => return,
+        };
+        if !self.collapsed.remove(&key) {
+            self.collapsed.insert(key);
         }
+        self.rebuild_items();
     }
 
     /// Move the selected task (or group) one step up or down and keep it selected.
@@ -1125,23 +1320,33 @@ impl App {
                 group,
                 ..
             }) => (project_name.clone(), MoveTarget::Group(group.clone())),
+            Some(ListItem::Project { project }) => (
+                project.name.clone(),
+                MoveTarget::Project(project.path.clone()),
+            ),
             _ => {
-                self.status_message = Some("Select a task or group to move".into());
+                self.status_message = Some("Select a project, task or group to move".into());
                 return;
             }
         };
         self.config.reload();
-        let Some(project) = self
-            .config
-            .projects
-            .iter_mut()
-            .find(|p| p.name == project_name)
-        else {
-            return;
-        };
         let moved = match &target {
-            MoveTarget::Task(name) => project.move_task(name, up),
-            MoveTarget::Group(group) => project.move_group(group, up, self.view_archived),
+            MoveTarget::Project(path) => self.config.move_project(path, up),
+            MoveTarget::Task(_) | MoveTarget::Group(_) => {
+                let Some(project) = self
+                    .config
+                    .projects
+                    .iter_mut()
+                    .find(|p| p.name == project_name)
+                else {
+                    return;
+                };
+                match &target {
+                    MoveTarget::Task(name) => project.move_task(name, up),
+                    MoveTarget::Group(group) => project.move_group(group, up, self.view_archived),
+                    MoveTarget::Project(_) => false,
+                }
+            }
         };
         if !moved {
             return;
@@ -1165,6 +1370,7 @@ impl App {
                 },
                 MoveTarget::Group(name),
             ) => *pn == project_name && group == name,
+            (ListItem::Project { project }, MoveTarget::Project(path)) => project.path == *path,
             _ => false,
         }) {
             self.selected = idx;
@@ -1176,22 +1382,46 @@ impl App {
             // Enter on a session attaches to it.
             Some(ListItem::Session { session, .. })
             | Some(ListItem::AdhocSession { session, .. }) => {
-                self.should_attach = Some(session.name.clone());
+                let session = session.clone();
+                self.attach_to(&session);
             }
             // Enter on a task attaches to its main session when live.
             Some(ListItem::Task {
-                project_name, task, ..
+                project_name,
+                project_path,
+                task,
             }) if !task.archived => {
-                let main = tmux::sessions_for_task(project_name, &task.name, &self.sessions)
-                    .into_iter()
-                    .find(|s| tmux::is_main_session(&s.session_name));
+                let main = tmux::sessions_for_task(
+                    project_name,
+                    &task.name,
+                    self.sessions_at(project_path),
+                )
+                .into_iter()
+                .find(|s| tmux::is_main_session(&s.session_name));
                 match main {
-                    Some(session) => self.should_attach = Some(session.name),
+                    Some(session) => self.attach_to(&session),
                     None => self.toggle_collapse(),
                 }
             }
             // Enter on a collapsible item (project/task group/adhoc group) toggles it.
             _ => self.toggle_collapse(),
+        }
+    }
+
+    fn attach_to(&mut self, session: &TmuxSession) {
+        match &session.host {
+            Some(host) => match self.host_named(host) {
+                Some(remote::Host::Ssh(_)) => {
+                    self.should_attach_remote = Some((host.clone(), session.name.clone()));
+                }
+                _ => {
+                    self.status_message = Some(format!(
+                        "Can't attach to {}: {host} is only reachable through its link, not over ssh",
+                        session.reference()
+                    ));
+                }
+            },
+            None => self.should_attach = Some(session.name.clone()),
         }
     }
 
@@ -1203,9 +1433,88 @@ impl App {
         }
     }
 
+    /// Actions available on an item that lives on another host: everything
+    /// goes through that host's CLI, so only the operations it exposes.
+    fn host_context_menu(&self) -> Vec<ContextMenuItem> {
+        let cm = &self.keybindings.context_menu_keys;
+        match self.selected_item() {
+            Some(ListItem::Project { .. }) => vec![
+                ContextMenuItem {
+                    key: cm.add_task,
+                    label: "Add task",
+                    action: ContextAction::AddTask,
+                },
+                ContextMenuItem {
+                    key: cm.add_task_with_agent,
+                    label: "Add task (choose agent)",
+                    action: ContextAction::AddTaskWithAgent,
+                },
+                ContextMenuItem {
+                    key: cm.delete,
+                    label: "Remove from list",
+                    action: ContextAction::Delete,
+                },
+            ],
+            Some(ListItem::Task { task, .. }) if !task.archived => vec![
+                ContextMenuItem {
+                    key: cm.new_session,
+                    label: "New session",
+                    action: ContextAction::NewSession,
+                },
+                ContextMenuItem {
+                    key: cm.new_session_with_agent,
+                    label: "New session (choose agent)",
+                    action: ContextAction::NewSessionWithAgent,
+                },
+                ContextMenuItem {
+                    key: cm.move_session,
+                    label: "Move main session here",
+                    action: ContextAction::MoveSession,
+                },
+                ContextMenuItem {
+                    key: cm.delete,
+                    label: "Delete",
+                    action: ContextAction::Delete,
+                },
+            ],
+            Some(ListItem::Session { session, .. }) => {
+                let mut items = vec![ContextMenuItem {
+                    key: cm.move_session,
+                    label: "Move session here",
+                    action: ContextAction::MoveSession,
+                }];
+                if !tmux::is_main_session(&session.session_name) {
+                    items.push(ContextMenuItem {
+                        key: cm.delete,
+                        label: "Delete",
+                        action: ContextAction::Delete,
+                    });
+                }
+                items
+            }
+            Some(ListItem::AdhocSession { .. }) => vec![ContextMenuItem {
+                key: cm.delete,
+                label: "Delete",
+                action: ContextAction::Delete,
+            }],
+            _ => Vec::new(),
+        }
+    }
+
     pub fn open_context_menu(&mut self) {
         let cm = self.keybindings.context_menu_keys.clone();
         let review_label = self.review_label();
+        if self.selected_host().is_some() {
+            let items = self.host_context_menu();
+            if items.is_empty() {
+                return;
+            }
+            self.context_menu_items = items;
+            self.context_menu_selected = 0;
+            self.input_mode = InputMode::ContextMenu;
+            return;
+        }
+        let remote_name = self.remote_name();
         let items = match self.selected_item() {
             Some(ListItem::Project { .. }) => vec![
                 ContextMenuItem {
@@ -1355,6 +1664,13 @@ impl App {
                             action: ContextAction::SetGroup,
                         },
                     ];
+                    if remote_name.is_some() {
+                        items.push(ContextMenuItem {
+                            key: cm.move_session,
+                            label: "Move main session to remote",
+                            action: ContextAction::MoveSession,
+                        });
+                    }
                     items.extend([
                         ContextMenuItem {
                             key: cm.archive,
@@ -1410,6 +1726,13 @@ impl App {
                         action: ContextAction::CopyWorktreePath,
                     },
                 ]);
+                if remote_name.is_some() {
+                    items.push(ContextMenuItem {
+                        key: cm.move_session,
+                        label: "Move session to remote",
+                        action: ContextAction::MoveSession,
+                    });
+                }
                 if !is_main {
                     items.push(ContextMenuItem {
                         key: cm.delete,
@@ -1464,7 +1787,59 @@ impl App {
             ContextAction::SetGroup => self.start_set_group(),
             ContextAction::RenameGroup => self.start_rename_group(),
             ContextAction::Ungroup => self.ungroup_selected(),
+            ContextAction::MoveSession => self.move_session(),
         }
+    }
+
+    /// Move the selected session (a task's main session when a task is
+    /// selected) to the other machine: local ones go to the remote, remote
+    /// ones come here. Runs `session move`, which handles the handoff.
+    fn move_session(&mut self) {
+        let session = match self.selected_item() {
+            Some(ListItem::Session { session, .. }) => Some(session.clone()),
+            Some(ListItem::Task {
+                project_name,
+                project_path,
+                task,
+            }) => tmux::sessions_for_task(project_name, &task.name, self.sessions_at(project_path))
+                .into_iter()
+                .find(|s| tmux::is_main_session(&s.session_name)),
+            _ => None,
+        };
+        let Some(session) = session else {
+            self.status_message = Some("No live session to move".into());
+            return;
+        };
+        let destination = match &session.host {
+            Some(_) => "local".to_string(),
+            None => match self.remote_name() {
+                Some(name) => name,
+                None => {
+                    self.status_message = Some("No [remote] configured to move to".into());
+                    return;
+                }
+            },
+        };
+        let reference = session.reference();
+        let label = format!("Moving {reference} to {destination}...");
+        self.start_op(&label, move || {
+            let args: Vec<String> = ["session", "move", &reference, "--to", &destination]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            match Target::Local.output(&args) {
+                Ok(out) => OpResult {
+                    message: out.trim().to_string(),
+                    rebuild: true,
+                    reload_config: true,
+                },
+                Err(e) => OpResult {
+                    message: format!("Move failed: {e}"),
+                    rebuild: true,
+                    reload_config: true,
+                },
+            }
+        })
     }
 
     /// Open a floating picker listing the available agent harnesses; the
@@ -2345,6 +2720,11 @@ impl App {
     }
 
     pub fn start_add_task(&mut self) {
+        let host = self.selected_host();
+        self.begin_add_task(host);
+    }
+
+    fn begin_add_task(&mut self, host: Option<String>) {
         if self.selected_project_info().is_some() {
             self.pending_task_group = match self.selected_item() {
                 Some(ListItem::TaskGroup { group, .. }) => Some(group.clone()),
@@ -2353,7 +2733,11 @@ impl App {
             self.use_worktree = true;
             self.input_mode = InputMode::AddTaskName;
             self.input_buffer.clear();
-            self.status_message = Some("Task name: ".into());
+            self.status_message = Some(match &host {
+                Some(host) => format!("Task name (on {host}): "),
+                None => "Task name: ".into(),
+            });
+            self.pending_task_host = host;
         }
     }
 
@@ -2426,7 +2810,8 @@ impl App {
             Some(self.input_buffer.trim().to_string())
         };
 
-        self.collapsed.remove(&project_key(&project_name));
+        self.collapsed
+            .remove(&project_key(&scoped_project(&project_name, &project_path)));
         self.input_buffer.clear();
         self.input_mode = InputMode::Normal;
 
@@ -2437,6 +2822,46 @@ impl App {
             .pending_agent
             .take()
             .unwrap_or_else(|| self.default_agent());
+
+        if let Some(host_name) = self.pending_task_host.take() {
+            let Some(host) = self.host_named(&host_name) else {
+                self.status_message = Some(format!("Host '{host_name}' is not available"));
+                return;
+            };
+            let label = format!("Creating task on {host_name}...");
+            self.start_op(&label, move || {
+                let mut args = vec![
+                    "task".to_string(),
+                    "create".to_string(),
+                    project_name,
+                    task_name,
+                    "--branch".to_string(),
+                    branch,
+                    "--agent".to_string(),
+                    agent.id().to_string(),
+                ];
+                if let Some(group) = group {
+                    args.extend(["--group".to_string(), group]);
+                }
+                if let Some(prompt) = prompt {
+                    args.extend(["--prompt".to_string(), prompt]);
+                }
+                match host.output(&args) {
+                    Ok(out) => OpResult {
+                        message: format!("{host_name}: {}", out.lines().next().unwrap_or_default()),
+                        rebuild: true,
+                        reload_config: false,
+                    },
+                    Err(e) => OpResult {
+                        message: format!("Error: {e}"),
+                        rebuild: false,
+                        reload_config: false,
+                    },
+                }
+            });
+            return;
+        }
+
         let project = self.config.projects.iter().find(|p| p.name == project_name);
         let copy_patterns = project.map(|p| p.copy_patterns.clone()).unwrap_or_default();
         let setup_commands = project
@@ -2617,8 +3042,15 @@ impl App {
 
         if let Some((project_name, task_name)) = info {
             self.use_worktree = use_worktree;
-            self.input_mode = InputMode::AddSessionName;
             self.input_buffer.clear();
+            if let Some(host) = self.selected_host() {
+                // The host numbers its own sessions; go straight to the prompt.
+                self.pending_session_name = Some(String::new());
+                self.input_mode = InputMode::AddSessionPrompt;
+                self.status_message = Some(format!("Initial prompt on {host} (empty to skip): "));
+                return;
+            }
+            self.input_mode = InputMode::AddSessionName;
             let next = tmux::next_session_number(&project_name, &task_name, &self.sessions);
             self.status_message = Some(format!(
                 "Session name (default: {next}){}:",
@@ -2685,18 +3117,54 @@ impl App {
         let use_worktree = self.use_worktree;
         let task_name = task.name.clone();
         let task_branch = task.branch.clone();
-        let project = self.config.projects.iter().find(|p| p.name == project_name);
-        let copy_patterns = project.map(|p| p.copy_patterns.clone()).unwrap_or_default();
-        let setup_commands = project
-            .map(|p| p.setup_commands.clone())
-            .unwrap_or_default();
-        let startup_skills = self.config.startup_skills.clone();
         let agent = self
             .pending_agent
             .take()
             .unwrap_or_else(|| self.default_agent());
         self.input_buffer.clear();
         self.input_mode = InputMode::Normal;
+
+        if let Some((host_name, _)) = remote::host_of_path(&project_path) {
+            let host_name = host_name.to_string();
+            let Some(host) = self.host_named(&host_name) else {
+                self.status_message = Some(format!("Host '{host_name}' is not available"));
+                return;
+            };
+            let label = format!("Creating session on {host_name}...");
+            self.start_op(&label, move || {
+                let mut args = vec![
+                    "session".to_string(),
+                    "create".to_string(),
+                    project_name,
+                    task_name,
+                    "--agent".to_string(),
+                    agent.id().to_string(),
+                ];
+                if let Some(prompt) = prompt {
+                    args.extend(["--prompt".to_string(), prompt]);
+                }
+                match host.output(&args) {
+                    Ok(out) => OpResult {
+                        message: format!("{host_name}: {}", out.lines().next().unwrap_or_default()),
+                        rebuild: true,
+                        reload_config: false,
+                    },
+                    Err(e) => OpResult {
+                        message: format!("Error: {e}"),
+                        rebuild: false,
+                        reload_config: false,
+                    },
+                }
+            });
+            return;
+        }
+
+        let project = self.config.projects.iter().find(|p| p.name == project_name);
+        let copy_patterns = project.map(|p| p.copy_patterns.clone()).unwrap_or_default();
+        let setup_commands = project
+            .map(|p| p.setup_commands.clone())
+            .unwrap_or_default();
+        let startup_skills = self.config.startup_skills.clone();
 
         self.start_op("Creating session...", move || {
             match tmux::create_session(
@@ -2743,6 +3211,15 @@ impl App {
 
     pub fn start_delete(&mut self) {
         match self.selected_item() {
+            Some(ListItem::Project { project })
+                if remote::host_of_path(&project.path).is_some() =>
+            {
+                self.input_mode = InputMode::ConfirmDelete;
+                self.status_message = Some(
+                    "Remove this remote project from the list? (nothing is deleted on the host) (y/n)"
+                        .into(),
+                );
+            }
             Some(ListItem::Project { project }) => {
                 let session_count = self
                     .sessions
@@ -2776,9 +3253,15 @@ impl App {
                 self.status_message = Some("Delete this adhoc session? (y/n)".into());
             }
             Some(ListItem::Task {
-                project_name, task, ..
+                project_name,
+                project_path,
+                task,
             }) => {
-                let active = tmux::sessions_for_task(project_name, &task.name, &self.sessions);
+                let active = tmux::sessions_for_task(
+                    project_name,
+                    &task.name,
+                    self.sessions_at(project_path),
+                );
                 self.input_mode = InputMode::ConfirmDelete;
                 if active.is_empty() {
                     self.status_message = Some("Delete this task? (y/n)".into());
@@ -2793,7 +3276,82 @@ impl App {
         }
     }
 
+    /// Delete on a host goes through its CLI: `session kill` for a session,
+    /// `task delete` for a task.
+    fn confirm_delete_on_host(&mut self, host_name: &str, args: Vec<String>, what: String) {
+        self.input_mode = InputMode::Normal;
+        let Some(host) = self.host_named(host_name) else {
+            self.status_message = Some(format!("Host '{host_name}' is not available"));
+            return;
+        };
+        let label = format!("Deleting {what}...");
+        self.start_op(&label, move || match host.output(&args) {
+            Ok(out) => OpResult {
+                message: out.trim().to_string(),
+                rebuild: true,
+                reload_config: false,
+            },
+            Err(e) => OpResult {
+                message: format!("Error: {e}"),
+                rebuild: false,
+                reload_config: false,
+            },
+        });
+    }
+
     pub fn confirm_delete(&mut self) {
+        match self.selected_item().cloned() {
+            Some(ListItem::Project { project })
+                if remote::host_of_path(&project.path).is_some() =>
+            {
+                self.input_mode = InputMode::Normal;
+                let path = project.path.clone();
+                if let Err(e) = Config::modify(move |c| c.remove_project(&path)) {
+                    self.status_message = Some(format!("Error: {e}"));
+                    return;
+                }
+                self.config.reload();
+                self.status_message = Some(format!("Removed {} from the list", project.name));
+                self.rebuild_items();
+                return;
+            }
+            Some(ListItem::Session { session, .. })
+            | Some(ListItem::AdhocSession { session, .. })
+                if session.host.is_some() =>
+            {
+                let host = session.host.clone().unwrap_or_default();
+                let bare = format!(
+                    "{}/{}/{}",
+                    session.project_name, session.task_name, session.session_name
+                );
+                let args = ["session", "kill", &bare, "--yes"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect();
+                self.confirm_delete_on_host(&host, args, session.reference());
+                return;
+            }
+            Some(ListItem::Task {
+                project_name,
+                project_path,
+                task,
+            }) if remote::host_of_path(&project_path).is_some() => {
+                let host = remote::host_of_path(&project_path)
+                    .map(|(h, _)| h.to_string())
+                    .unwrap_or_default();
+                let args = ["task", "delete", &project_name, &task.name, "--yes"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect();
+                self.confirm_delete_on_host(
+                    &host,
+                    args,
+                    format!("{host}:{project_name}/{}", task.name),
+                );
+                return;
+            }
+            _ => {}
+        }
         match self.selected_item().cloned() {
             Some(ListItem::Project { project }) => {
                 let project_name = project.name.clone();

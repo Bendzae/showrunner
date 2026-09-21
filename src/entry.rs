@@ -64,6 +64,17 @@ pub fn run() -> Result<()> {
 
         if let Some(session_name) = app.should_attach.take() {
             tmux::attach_session(&session_name)?;
+        } else if let Some((host, session_name)) = app.should_attach_remote.take() {
+            let remote = app.config.remote.clone().filter(|r| r.name == host);
+            let result = match remote {
+                Some(remote) => crate::remote::attach(&remote, &session_name),
+                None => Err(anyhow::anyhow!(
+                    "host '{host}' is not the configured remote"
+                )),
+            };
+            if let Err(e) = result {
+                app.status_message = Some(format!("Attach failed: {e}"));
+            }
         } else if let Some((session_name, window_idx)) = app.should_attach_window.take() {
             tmux::attach_session_window(&session_name, window_idx)?;
         } else if let Some((cwd, args, candidates)) = app.should_review_hunk.take() {
@@ -124,13 +135,16 @@ fn run_tui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
                         KeyCode::Char(c) if c == kb.move_down => app.move_down(),
                         KeyCode::Enter => {
                             app.enter_selected();
-                            if app.should_attach.is_some() {
+                            if app.should_attach.is_some() || app.should_attach_remote.is_some() {
                                 return Ok(());
                             }
                         }
                         KeyCode::Char(c) if c == kb.toggle_collapse => app.toggle_collapse(),
                         KeyCode::Char(c) if c == kb.context_menu => app.open_context_menu(),
                         KeyCode::Char(c) if c == kb.add_project => app.start_add_project(),
+                        KeyCode::Char(c) if c == kb.add_remote_project => {
+                            app.start_add_remote_project()
+                        }
                         KeyCode::Char(c) if c == kb.toggle_archive_view => {
                             app.toggle_archive_view()
                         }
@@ -334,6 +348,21 @@ fn run_tui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
                         }
                         _ => {}
                     },
+                    InputMode::AddRemoteProject => match key.code {
+                        KeyCode::Enter => app.confirm_add_remote_project(),
+                        KeyCode::Esc => app.cancel_input(),
+                        KeyCode::Up => app.picker_move_up(),
+                        KeyCode::Down => app.picker_move_down(),
+                        KeyCode::Backspace => {
+                            app.input_buffer.pop();
+                            app.update_picker_filter();
+                        }
+                        KeyCode::Char(c) => {
+                            app.input_buffer.push(c);
+                            app.update_picker_filter();
+                        }
+                        _ => {}
+                    },
                     InputMode::CheckoutBranch => match key.code {
                         KeyCode::Enter => app.confirm_checkout_branch(),
                         KeyCode::Esc => app.cancel_input(),
@@ -447,6 +476,7 @@ fn run_tui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
         // A context-menu action may request attaching to a session/terminal;
         // suspend the TUI so the main loop can run it.
         if app.should_attach.is_some()
+            || app.should_attach_remote.is_some()
             || app.should_attach_window.is_some()
             || app.should_review_hunk.is_some()
         {

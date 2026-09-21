@@ -121,7 +121,7 @@ pub fn draw(f: &mut Frame, app: &App) {
 
     if matches!(
         app.input_mode,
-        InputMode::CheckoutBranch | InputMode::SetGroup
+        InputMode::CheckoutBranch | InputMode::SetGroup | InputMode::AddRemoteProject
     ) {
         draw_picker(f, app, list_area);
     }
@@ -175,12 +175,30 @@ fn draw_dashboard(f: &mut Frame, app: &App, area: Rect) {
             format!("@{}", app.hostname),
             Style::default().fg(current().muted),
         ),
+    ];
+    // Other hosts: green when their listing came through, red when not; ⇄
+    // marks the reverse link (sessions there can reach this machine).
+    for host in &app.hosts {
+        let (glyph, color) = match &host.error {
+            None => ("⇅", current().green),
+            Some(_) => ("⇅ ✗", current().magenta),
+        };
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            format!("{glyph} {}", host.host),
+            Style::default().fg(color),
+        ));
+    }
+    if app.link.as_ref().is_some_and(|l| l.connected()) {
+        spans.push(Span::styled(" ⇄", Style::default().fg(current().green)));
+    }
+    spans.extend([
         Span::raw(if compact { "  " } else { "   " }),
         Span::styled(
             label("\u{25c6}", projects, "proj"),
             Style::default().fg(current().muted),
         ),
-    ];
+    ]);
     let sep = Style::default().fg(current().border);
     if waiting > 0 {
         spans.push(Span::styled(sep_str, sep));
@@ -845,7 +863,8 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
 
         match item {
             app::ListItem::Project { project } => {
-                let collapsed = is_project_collapsed(app, &project.name);
+                let collapsed =
+                    is_project_collapsed(app, &app::scoped_project(&project.name, &project.path));
                 let chevron = if collapsed { "▶ " } else { "▼ " };
                 let name_style = if is_selected {
                     Style::default()
@@ -856,7 +875,11 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
                         .fg(current().white)
                         .add_modifier(Modifier::BOLD)
                 };
-                let name = Span::styled(project.name.as_str(), name_style);
+                let host = crate::remote::host_of_path(&project.path).map(|(h, _)| h);
+                let name = match host {
+                    Some(host) => Span::styled(format!("{host}:{}", project.name), name_style),
+                    None => Span::styled(project.name.clone(), name_style),
+                };
 
                 // Show task/session counts when project is collapsed.
                 let mut meta: Vec<Span> = Vec::new();
@@ -864,13 +887,13 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
                     let task_count = project.tasks.len();
                     let sanitized = tmux::sanitize(&project.name);
                     let active_sessions = app
-                        .sessions
+                        .sessions_at(&project.path)
                         .iter()
                         .filter(|s| {
                             s.project_name == sanitized
                                 && app
                                     .session_statuses
-                                    .get(&s.name)
+                                    .get(&s.key())
                                     .map_or(false, |st| *st != SessionStatus::Finished)
                         })
                         .count();
@@ -895,8 +918,24 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
                 if let Some(ind) = run_indicator(app, item) {
                     meta.push(ind);
                 }
+                if let Some(host) = host
+                    && app
+                        .hosts
+                        .iter()
+                        .find(|h| h.host == host)
+                        .is_none_or(|h| h.error.is_some())
+                {
+                    meta.push(Span::styled(
+                        "  unreachable",
+                        Style::default().fg(current().magenta),
+                    ));
+                }
 
-                let branch = app.project_branches.get(&project.name).cloned();
+                // Branch names are tracked for local projects only.
+                let branch = host
+                    .is_none()
+                    .then(|| app.project_branches.get(&project.name).cloned())
+                    .flatten();
                 rows.push(Row::CardTop {
                     chevron,
                     name,
@@ -907,7 +946,9 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
                 });
             }
             app::ListItem::Task {
-                project_name, task, ..
+                project_name,
+                project_path,
+                task,
             } => {
                 let indicator = if is_selected { " ▸ " } else { "   " };
                 let tree = if task.group.is_some() {
@@ -952,14 +993,19 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
                 }
 
                 // Show active session count when task is collapsed
-                if app
-                    .collapsed
-                    .contains(&format!("t:{project_name}:{}", task.name))
-                {
-                    let sessions = tmux::sessions_for_task(project_name, &task.name, &app.sessions);
+                if app.collapsed.contains(&format!(
+                    "t:{}:{}",
+                    app::scoped_project(project_name, project_path),
+                    task.name
+                )) {
+                    let sessions = tmux::sessions_for_task(
+                        project_name,
+                        &task.name,
+                        app.sessions_at(project_path),
+                    );
                     let statuses: Vec<SessionStatus> = sessions
                         .iter()
-                        .filter_map(|s| app.session_statuses.get(&s.name).copied())
+                        .filter_map(|s| app.session_statuses.get(&s.key()).copied())
                         .collect();
                     if let Some(status) = aggregate_status(&statuses) {
                         let (icon, color) = status_glyph(status, app.tick);
@@ -1013,13 +1059,16 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
             }
             app::ListItem::TaskGroup {
                 project_name,
+                project_path,
                 group,
                 task_count,
-                ..
             } => {
                 let indicator = if is_selected { " ▸ " } else { "   " };
                 let last = is_last_task(&app.items, i, project_name);
-                let collapsed = app.collapsed.contains(&format!("g:{project_name}:{group}"));
+                let collapsed = app.collapsed.contains(&format!(
+                    "g:{}:{group}",
+                    app::scoped_project(project_name, project_path)
+                ));
                 let chevron = if collapsed { " ▸" } else { " ▾" };
                 let mut style = Style::default().fg(current().magenta);
                 if is_selected {
@@ -1049,13 +1098,16 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
             }
             app::ListItem::AdhocGroup {
                 project_name,
+                project_path,
                 session_count,
-                ..
             } => {
                 let indicator = if is_selected { " ▸ " } else { "   " };
                 let last = is_last_adhoc_group(&app.items, i, project_name);
                 let branch_char = if last { "└─ " } else { "├─ " };
-                let collapsed = app.collapsed.contains(&format!("a:{project_name}"));
+                let collapsed = app.collapsed.contains(&format!(
+                    "a:{}",
+                    app::scoped_project(project_name, project_path)
+                ));
                 let chevron = if collapsed { "▶ " } else { "▼ " };
                 let style = if is_selected {
                     Style::default()
@@ -1106,7 +1158,7 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
 
                 let status = app
                     .session_statuses
-                    .get(&session.name)
+                    .get(&session.key())
                     .copied()
                     .unwrap_or(SessionStatus::Finished);
                 let (status_icon, status_color) = status_glyph(status, app.tick);
@@ -1124,7 +1176,7 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
                     Span::styled("⌂ ", Style::default().fg(current().accent)),
                     Span::styled(&session.session_name, style),
                 ];
-                if let Some(icon) = agent_icon_span(app, &session.name) {
+                if let Some(icon) = agent_icon_span(app, &session.key()) {
                     spans.push(icon);
                 }
                 if let Some(ind) = run_indicator(app, item) {
@@ -1161,7 +1213,7 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
 
                 let status = app
                     .session_statuses
-                    .get(&session.name)
+                    .get(&session.key())
                     .copied()
                     .unwrap_or(SessionStatus::Finished);
                 let (status_icon, status_color) = status_glyph(status, app.tick);
@@ -1174,7 +1226,8 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
                 };
                 let session_last = is_last_session(&app.items, i, project_name, &task.name);
 
-                let wt = session.worktree_path();
+                // Host sessions always have a worktree over there.
+                let has_worktree = session.host.is_some() || session.worktree_path().is_some();
                 let mut left = vec![
                     Span::styled(indicator, indicator_style),
                     Span::styled(continuation, continuation_style),
@@ -1183,7 +1236,7 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
                 ];
                 if is_main {
                     left.push(Span::styled("◆ ", Style::default().fg(current().accent)));
-                } else if wt.is_some() {
+                } else if has_worktree {
                     left.push(Span::styled(
                         "\u{e0a0} ",
                         Style::default().fg(current().border),
@@ -1192,7 +1245,7 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
                     left.push(Span::styled("⌂ ", Style::default().fg(current().accent)));
                 }
                 left.push(Span::styled(&session.session_name, style));
-                if let Some(icon) = agent_icon_span(app, &session.name) {
+                if let Some(icon) = agent_icon_span(app, &session.key()) {
                     left.push(icon);
                 }
                 if let Some(ind) = run_indicator(app, item) {
@@ -1202,11 +1255,11 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
                 // --- right-hand metadata columns: churn | branch ---
                 let churn = app
                     .diff_stats
-                    .get(&session.name)
+                    .get(&session.key())
                     .filter(|s| !s.is_empty())
                     .map(|s| churn_spans(s.added, s.removed))
                     .unwrap_or_default();
-                let branch = app.session_branches.get(&session.name).cloned();
+                let branch = app.session_branches.get(&session.key()).cloned();
                 rows.push(Row::Body {
                     left,
                     churn,
@@ -1427,6 +1480,7 @@ fn draw_picker(f: &mut Frame, app: &App, area: Rect) {
     let matches = app.picker_matches();
     let (title, empty_label) = match app.input_mode {
         InputMode::SetGroup => ("Set group", "no matching groups"),
+        InputMode::AddRemoteProject => ("Add remote project", "no matching projects"),
         _ => ("Checkout branch", "no matching branches"),
     };
 
@@ -1657,23 +1711,34 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
                     key_display(kb.move_task_down),
                     key_display(kb.move_task_up)
                 );
-                help_bar(&[
-                    ("⏎", enter_label),
-                    (&key_display(kb.toggle_collapse), "collapse"),
-                    (&key_display(kb.context_menu), "actions"),
-                    (&move_keys, "move"),
-                    (&key_display(kb.search), "filter"),
+                let move_label = match app.selected_item() {
+                    Some(app::ListItem::Project { .. }) => "move project",
+                    Some(app::ListItem::TaskGroup { .. }) => "move group",
+                    _ => "move task",
+                };
+                let mut entries: Vec<(String, &str)> = vec![
+                    ("⏎".into(), enter_label),
+                    (key_display(kb.toggle_collapse), "collapse"),
+                    (key_display(kb.context_menu), "actions"),
+                    (move_keys, move_label),
+                    (key_display(kb.search), "filter"),
                     (
-                        &key_display(kb.toggle_archive_view),
+                        key_display(kb.toggle_archive_view),
                         if app.view_archived {
                             "active"
                         } else {
                             "archived"
                         },
                     ),
-                    (&key_display(kb.add_project), "add project"),
-                    (&key_display(kb.quit), "quit"),
-                ])
+                    (key_display(kb.add_project), "add project"),
+                ];
+                if app.config.remote.is_some() {
+                    entries.push((key_display(kb.add_remote_project), "add remote project"));
+                }
+                entries.push((key_display(kb.quit), "quit"));
+                let entries: Vec<(&str, &str)> =
+                    entries.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+                help_bar(&entries)
             }
         }
         InputMode::ContextMenu => {
@@ -1713,7 +1778,9 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         InputMode::CheckoutBranch => {
             help_bar(&[("⏎", "checkout"), ("↑/↓", "navigate"), ("Esc", "cancel")])
         }
-        InputMode::SetGroup => help_bar(&[("⏎", "select"), ("↑/↓", "navigate"), ("Esc", "cancel")]),
+        InputMode::SetGroup | InputMode::AddRemoteProject => {
+            help_bar(&[("⏎", "select"), ("↑/↓", "navigate"), ("Esc", "cancel")])
+        }
         InputMode::ReviewSessionPicker => {
             help_bar(&[("⏎", "send"), ("↑/↓", "navigate"), ("Esc", "cancel")])
         }

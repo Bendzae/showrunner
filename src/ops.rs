@@ -2,6 +2,7 @@
 //! headless entry points create and delete things exactly like the TUI does.
 
 use anyhow::{Result, bail};
+use serde::{Deserialize, Serialize};
 
 use crate::agent::AgentKind;
 use crate::config::{self, Config, Project};
@@ -230,4 +231,140 @@ pub fn find_project<'a>(cfg: &'a Config, name: &str) -> Result<&'a Project> {
         .iter()
         .find(|p| p.name == name)
         .ok_or_else(|| anyhow::anyhow!("project '{name}' not found"))
+}
+
+/// What another machine needs to pick a session up: its task (recreated there
+/// if missing) and the branch it works on, which `export_session` has pushed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionExport {
+    pub project_name: String,
+    pub task_name: String,
+    pub task_branch: String,
+    pub base_branch: Option<String>,
+    pub group: Option<String>,
+    pub session_name: String,
+    pub agent: String,
+    pub branch: String,
+}
+
+/// Commit whatever the session's worktree holds and push its branch, so the
+/// session can be recreated from origin elsewhere.
+pub fn export_session(cfg: &Config, tmux_name: &str) -> Result<SessionExport> {
+    let record = config::load_sessions()
+        .remove(tmux_name)
+        .ok_or_else(|| anyhow::anyhow!("no session record for {tmux_name}"))?;
+    if !record.use_worktree {
+        bail!("sessions without a worktree can't be moved");
+    }
+    let worktree = tmux::worktree_dir(
+        &record.project_name,
+        &record.task_name,
+        &record.session_name,
+    )
+    .to_string_lossy()
+    .to_string();
+    let branch = tmux::current_branch(&worktree)
+        .ok_or_else(|| anyhow::anyhow!("could not read the branch of {worktree}"))?;
+
+    if tmux::worktree_is_dirty(&worktree) {
+        let message = format!(
+            "Handoff: {}",
+            tmux::next_commit_message(&worktree, &record.session_name)
+        );
+        tmux::commit_all(&worktree, &message)?;
+    }
+    tmux::push_branch(&record.project_path, &branch)?;
+
+    let task = cfg.find_task(&record.project_name, &record.task_name);
+    Ok(SessionExport {
+        project_name: record.project_name,
+        task_name: record.task_name,
+        task_branch: record.task_branch,
+        base_branch: task.and_then(|t| t.base_branch.clone()),
+        group: task.and_then(|t| t.group.clone()),
+        session_name: record.session_name,
+        agent: record.agent,
+        branch,
+    })
+}
+
+/// Recreate an exported session here: register its task if needed, check out
+/// its pushed branch in a fresh worktree and start the agent with `prompt`.
+pub fn import_session(cfg: &Config, export: &SessionExport, prompt: &str) -> Result<String> {
+    let project = find_project(cfg, &export.project_name)?;
+    let agent = crate::agent::parse_agent_id(&export.agent)?;
+    let sessions = tmux::list_sessions().unwrap_or_default();
+    if !tmux::sessions_for_task(&project.name, &export.task_name, &sessions)
+        .iter()
+        .all(|s| s.session_name != tmux::sanitize(&export.session_name))
+    {
+        bail!(
+            "session {}/{}/{} already exists here",
+            project.name,
+            export.task_name,
+            export.session_name
+        );
+    }
+
+    if !project.tasks.iter().any(|t| t.name == export.task_name) {
+        let (project_name, task_name) = (project.name.clone(), export.task_name.clone());
+        let (branch, base, group) = (
+            export.task_branch.clone(),
+            export.base_branch.clone(),
+            export.group.clone(),
+        );
+        Config::modify(move |c| {
+            c.add_task(&project_name, task_name.clone(), branch);
+            c.set_task_base_branch(&project_name, &task_name, base);
+            c.set_task_group(&project_name, &task_name, group);
+        })?;
+    }
+
+    let tmux_name = tmux::create_session_with(
+        &project.name,
+        &project.path,
+        &export.task_name,
+        &export.task_branch,
+        &export.session_name,
+        true,
+        &project.copy_patterns,
+        &project.setup_commands,
+        Some(prompt),
+        &cfg.startup_skills,
+        agent,
+        tmux::Checkout::PushedBranch,
+    )?;
+    config::add_session_record(
+        &tmux_name,
+        config::SessionRecord {
+            project_name: project.name.clone(),
+            project_path: project.path.clone(),
+            task_name: export.task_name.clone(),
+            task_branch: export.task_branch.clone(),
+            session_name: export.session_name.clone(),
+            use_worktree: true,
+            archived: false,
+            agent: agent.id().to_string(),
+        },
+    );
+    Ok(tmux_name)
+}
+
+/// Drop a session that now lives on another machine: kill it and remove its
+/// worktree and record, but keep the branch (origin has it; a later move back
+/// fast-forwards it).
+pub fn release_session(tmux_name: &str) -> Result<()> {
+    let record = config::load_sessions()
+        .remove(tmux_name)
+        .ok_or_else(|| anyhow::anyhow!("no session record for {tmux_name}"))?;
+    let worktree = tmux::worktree_dir(
+        &record.project_name,
+        &record.task_name,
+        &record.session_name,
+    )
+    .to_string_lossy()
+    .to_string();
+    tmux::remove_session_keep_branch(tmux_name, &record.project_path, &worktree);
+    config::remove_session_record(tmux_name);
+    Ok(())
 }

@@ -12,6 +12,7 @@ use serde_json::{Value, json};
 use crate::agent::AgentKind;
 use crate::config::{self, Config};
 use crate::ops;
+use crate::remote;
 use crate::server;
 use crate::tmux::{self, SessionStatus, TmuxSession};
 
@@ -22,6 +23,8 @@ Usage:
   showrunner                                    launch the TUI
   showrunner serve [--bind <addr:port>]         serve the mobile web UI
                                                     (default 127.0.0.1:7878)
+  showrunner link                               keep the remote linked back to
+                                                    this machine (the TUI does this)
 
 Managing tasks and sessions (usable from inside a session):
   showrunner list [--json] [--project <name>]
@@ -34,6 +37,7 @@ Managing tasks and sessions (usable from inside a session):
   showrunner session create <project> <task> [--prompt <text>] [--no-worktree]
                                               [--agent claude|codex|pi]
   showrunner session kill <session> --yes
+  showrunner session move <session> --to <host|local> [--no-handoff]
 
 Talking to another session:
   showrunner ask <session> <question> [--timeout <secs>]
@@ -42,14 +46,24 @@ Talking to another session:
 
 <session> is a ref from `list` — `<project>/<task>/<session>`, `<project>/<task>`
 for that task's main session, or a raw tmux session name.
+
+With a [remote] configured, prefix a project or session ref with `<name>:` to
+run the command on that host (`showrunner ask ec2:myapp/fix-auth <question>`).
+`list` shows the remote's sessions too; `list ec2:` shows only those. While the
+TUI (or `link`) runs here, sessions on the remote address this machine the same
+way, as `<local_name>:` (default: this hostname).
 ";
 
 /// Handle non-TUI CLI invocations. Returns `Some(result)` when an argument was
 /// recognized (the process should exit), or `None` to fall through to the TUI.
 pub fn dispatch(args: &[String]) -> Option<Result<()>> {
+    if let Some(result) = dispatch_remote(args) {
+        return Some(result);
+    }
     let rest = args.get(1..).unwrap_or_default();
     match args.first().map(String::as_str) {
         Some("serve") => Some(cmd_serve(rest)),
+        Some("link") => Some(cmd_link(rest)),
         Some("list") => Some(cmd_list(rest)),
         Some("task") => Some(cmd_task(rest)),
         Some("session") => Some(cmd_session(rest)),
@@ -65,6 +79,50 @@ pub fn dispatch(args: &[String]) -> Option<Result<()>> {
             Some(Ok(()))
         }
         _ => None,
+    }
+}
+
+/// A command with any arg addressed to the remote (`<name>:...`) runs there as
+/// a whole, prefixes stripped, and this process exits with its status.
+fn dispatch_remote(args: &[String]) -> Option<Result<()>> {
+    // `session move` orchestrates both machines itself.
+    if args.len() >= 2 && args[0] == "session" && args[1] == "move" {
+        return None;
+    }
+    let cfg = Config::load().ok()?;
+    let (host, mut host_args) = remote::hosts(&cfg).into_iter().find_map(|host| {
+        let stripped = remote::strip_prefixes(host.name(), args)?;
+        Some((host, stripped))
+    })?;
+    if host_args.is_empty() {
+        return None;
+    }
+    if host_args[0] == "list" {
+        host_args.push(format!("--ref-prefix={}:", host.name()));
+    }
+    Some(host.run(&host_args).map(|status| {
+        if !status.success() {
+            std::process::exit(status.code().unwrap_or(1));
+        }
+    }))
+}
+
+fn cmd_link(args: &[String]) -> Result<()> {
+    if let Some(extra) = args.first() {
+        bail!("unexpected argument '{extra}' (usage: link)");
+    }
+    let remote = Config::load()?
+        .remote
+        .ok_or_else(|| anyhow::anyhow!("no [remote] configured"))?;
+    let _link = remote::Link::start(&remote)?;
+    eprintln!(
+        "linking to {} ({}); sessions there reach this machine as `{}:` — Ctrl-C to stop",
+        remote.name,
+        remote.ssh,
+        remote.local_name.as_deref().unwrap_or("<hostname>")
+    );
+    loop {
+        sleep(Duration::from_secs(3600));
     }
 }
 
@@ -242,7 +300,7 @@ fn sample_statuses(sessions: &[TmuxSession]) -> HashMap<String, SessionStatus> {
 }
 
 fn cmd_list(args: &[String]) -> Result<()> {
-    let (positional, flags) = parse_args(args, &["project"], &["json"])?;
+    let (positional, flags) = parse_args(args, &["project", "ref-prefix"], &["json"])?;
     if let Some(extra) = positional.first() {
         bail!("unexpected argument '{extra}' (usage: list [--json] [--project <name>])");
     }
@@ -252,6 +310,23 @@ fn cmd_list(args: &[String]) -> Result<()> {
     let statuses = sample_statuses(&sessions);
     let current = current_session_name();
     let project_filter = flags.get("project");
+    // Set when a remote lists on behalf of the caller, so printed refs are
+    // usable as-is from the caller's side.
+    let ref_prefix = flags.get("ref-prefix").cloned().unwrap_or_default();
+    let session_ref = |s: &TmuxSession| format!("{ref_prefix}{}", session_ref(s));
+    // `--project` names a local project, so a filtered list stays local.
+    let host_listings: Vec<(remote::Host, Result<String>)> =
+        if ref_prefix.is_empty() && project_filter.is_none() {
+            remote::hosts(&cfg)
+                .into_iter()
+                .map(|host| {
+                    let listing = list_host(&host, args);
+                    (host, listing)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
     let projects: Vec<&crate::config::Project> = cfg
         .projects
@@ -309,10 +384,23 @@ fn cmd_list(args: &[String]) -> Result<()> {
                 })
             })
             .collect();
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({ "projects": projects }))?
-        );
+        let mut out = json!({ "projects": projects });
+        let hosts: Vec<Value> = host_listings
+            .into_iter()
+            .map(|(host, listing)| {
+                match listing.and_then(|text| Ok(serde_json::from_str::<Value>(&text)?)) {
+                    Ok(mut host_out) => {
+                        host_out["name"] = json!(host.name());
+                        host_out
+                    }
+                    Err(e) => json!({ "name": host.name(), "error": e.to_string() }),
+                }
+            })
+            .collect();
+        if !hosts.is_empty() {
+            out["hosts"] = json!(hosts);
+        }
+        println!("{}", serde_json::to_string_pretty(&out)?);
         return Ok(());
     }
 
@@ -377,7 +465,28 @@ fn cmd_list(args: &[String]) -> Result<()> {
         }
     }
 
+    for (host, listing) in host_listings {
+        println!(
+            "\nhost {} ({})  — refs are prefixed `{}:`",
+            host.name(),
+            host.location(),
+            host.name()
+        );
+        match listing {
+            Ok(text) => print!("{text}"),
+            Err(e) => println!("  unreachable: {e}"),
+        }
+    }
+
     Ok(())
+}
+
+/// The host's own `list` output for the same args, refs prefixed with its name.
+fn list_host(host: &remote::Host, args: &[String]) -> Result<String> {
+    let mut host_args = vec!["list".to_string()];
+    host_args.extend(args.iter().cloned());
+    host_args.push(format!("--ref-prefix={}:", host.name()));
+    host.output(&host_args)
 }
 
 fn cmd_task(args: &[String]) -> Result<()> {
@@ -521,9 +630,174 @@ fn cmd_session(args: &[String]) -> Result<()> {
     match args.first().map(String::as_str) {
         Some("create") => cmd_session_create(&args[1..]),
         Some("kill") => cmd_session_kill(&args[1..]),
-        Some(other) => bail!("unknown session command '{other}' (expected create or kill)"),
-        None => bail!("usage: session create <project> <task> | session kill <session> --yes"),
+        Some("move") => cmd_session_move(&args[1..]),
+        Some("export") => cmd_session_export(&args[1..]),
+        Some("import") => cmd_session_import(&args[1..]),
+        Some("release") => cmd_session_release(&args[1..]),
+        Some(other) => bail!("unknown session command '{other}' (expected create, kill or move)"),
+        None => bail!(
+            "usage: session create <project> <task> | session kill <session> --yes | \
+             session move <session> --to <host>"
+        ),
     }
+}
+
+const HANDOFF_QUESTION: &str = "Your session is being moved to another machine, where a fresh \
+agent continues in a new worktree on your branch. Reply with a handoff note for it: the goal, \
+what is done, what is in progress, and concrete next steps. Uncommitted changes are committed and \
+pushed for you — don't change anything further.";
+
+/// Move a session to another machine: collect a handoff note, commit and push
+/// its branch, recreate it on the destination, then remove it here.
+fn cmd_session_move(args: &[String]) -> Result<()> {
+    let (positional, flags) = parse_args(args, &["to"], &["no-handoff"])?;
+    let ([reference], Some(to)) = (positional.as_slice(), flags.get("to")) else {
+        bail!("usage: session move <session> --to <host|local> [--no-handoff]");
+    };
+
+    let cfg = Config::load()?;
+    let (source, source_ref) = remote::Target::split_ref(&cfg, reference);
+    let dest = remote::Target::by_name(&cfg, to)?;
+    if source.name() == dest.name() {
+        bail!("session '{reference}' is already on {}", dest.name());
+    }
+    let arg = |items: &[&str]| -> Vec<String> { items.iter().map(|s| s.to_string()).collect() };
+
+    let note = if flags.contains_key("no-handoff") {
+        None
+    } else {
+        eprintln!("asking {reference} for a handoff note…");
+        match source.output(&arg(&[
+            "ask",
+            &source_ref,
+            HANDOFF_QUESTION,
+            "--timeout",
+            "300",
+        ])) {
+            Ok(reply) => Some(reply),
+            Err(e) => {
+                eprintln!("no handoff note ({e}); moving without one");
+                None
+            }
+        }
+    };
+
+    eprintln!("committing and pushing…");
+    let export_json = source.output(&arg(&["session", "export", &source_ref]))?;
+    let export: ops::SessionExport = serde_json::from_str(export_json.trim())?;
+
+    let from = match &source {
+        remote::Target::Local => cfg
+            .remote
+            .as_ref()
+            .and_then(|r| r.local_name.clone())
+            .unwrap_or_else(crate::app::detect_hostname),
+        remote::Target::Host(h) => h.name().to_string(),
+    };
+    let prompt = handoff_prompt(&export, &from, note.as_deref());
+
+    eprintln!("creating the session on {}…", dest.name());
+    let created = dest.output(&arg(&[
+        "session",
+        "import",
+        "--spec",
+        export_json.trim(),
+        "--prompt",
+        &prompt,
+    ]))?;
+
+    source.output(&arg(&["session", "release", &source_ref, "--yes"]))?;
+    let created_ref = created
+        .trim()
+        .strip_prefix("created session: ")
+        .unwrap_or(created.trim());
+    let dest_prefix = match &dest {
+        remote::Target::Local => String::new(),
+        remote::Target::Host(h) => format!("{}:", h.name()),
+    };
+    println!("moved {reference} → {dest_prefix}{created_ref}");
+    Ok(())
+}
+
+fn handoff_prompt(export: &ops::SessionExport, from: &str, note: Option<&str>) -> String {
+    let mut prompt = format!(
+        "You continue the session {}/{}/{} that was moved here from {from}. Its branch \
+         `{}` was committed and pushed; this worktree has it checked out.",
+        export.project_name, export.task_name, export.session_name, export.branch
+    );
+    match note {
+        Some(note) => prompt.push_str(&format!(
+            "\n\nHandoff note from the previous agent:\n\n{}",
+            note.trim()
+        )),
+        None => prompt.push_str(" No handoff note was recorded."),
+    }
+    prompt.push_str(
+        "\n\nStart with `git log --oneline -10` and `git status` to see where things stand, then \
+         continue the work.",
+    );
+    prompt
+}
+
+/// Resolve a session ref to the tmux name of a *recorded* session, live or
+/// not — a session whose agent died can still be moved.
+fn resolve_recorded_session(reference: &str) -> Result<String> {
+    let reference = reference.trim().trim_matches('/');
+    let tmux_name = if reference.starts_with("cm__") {
+        reference.to_string()
+    } else {
+        match reference.split('/').collect::<Vec<_>>().as_slice() {
+            [project, task, session] => tmux::build_tmux_name(project, task, session),
+            [project, task] => tmux::build_tmux_name(project, task, tmux::MAIN_SESSION),
+            _ => bail!("'{reference}' is not a session ref"),
+        }
+    };
+    if !config::load_sessions().contains_key(&tmux_name) {
+        bail!("no session matching '{reference}' (see `showrunner list`)");
+    }
+    Ok(tmux_name)
+}
+
+fn cmd_session_export(args: &[String]) -> Result<()> {
+    let (positional, _) = parse_args(args, &[], &[])?;
+    let [reference] = positional.as_slice() else {
+        bail!("usage: session export <session>");
+    };
+    let cfg = Config::load()?;
+    let tmux_name = resolve_recorded_session(reference)?;
+    let export = ops::export_session(&cfg, &tmux_name)?;
+    println!("{}", serde_json::to_string(&export)?);
+    Ok(())
+}
+
+fn cmd_session_import(args: &[String]) -> Result<()> {
+    let (positional, flags) = parse_args(args, &["spec", "prompt"], &[])?;
+    let (None, Some(spec)) = (positional.first(), flags.get("spec")) else {
+        bail!("usage: session import --spec <json> [--prompt <text>]");
+    };
+    let cfg = Config::load()?;
+    let export: ops::SessionExport = serde_json::from_str(spec)?;
+    let prompt = flags.get("prompt").cloned().unwrap_or_default();
+    let tmux_name = ops::import_session(&cfg, &export, &prompt)?;
+    let session = TmuxSession::from_tmux_name(&tmux_name)
+        .map(|s| session_ref(&s))
+        .unwrap_or(tmux_name);
+    println!("created session: {session}");
+    Ok(())
+}
+
+fn cmd_session_release(args: &[String]) -> Result<()> {
+    let (positional, flags) = parse_args(args, &[], &["yes"])?;
+    let ([reference], true) = (positional.as_slice(), flags.contains_key("yes")) else {
+        bail!("usage: session release <session> --yes");
+    };
+    let tmux_name = resolve_recorded_session(reference)?;
+    if current_session_name().as_deref() == Some(tmux_name.as_str()) {
+        bail!("that is this session");
+    }
+    ops::release_session(&tmux_name)?;
+    println!("released session: {reference}");
+    Ok(())
 }
 
 fn cmd_session_create(args: &[String]) -> Result<()> {

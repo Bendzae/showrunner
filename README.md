@@ -81,9 +81,10 @@ All keybindings are customizable via `~/.showrunner/keybindings.toml`. The table
 | `Space` | Collapse/expand project or task | `toggle_collapse` |
 | `a` | Open context menu | `context_menu` |
 | `p` | Add project | `add_project` |
+| `P` | Add one of the remote's projects (with a `[remote]` configured) | `add_remote_project` |
 | `/` | Filter projects/tasks/sessions | `search` |
 | `Z` | Toggle archived view | `toggle_archive_view` |
-| `K` / `J` | Move the selected task or group up / down | `move_task_up` / `move_task_down` |
+| `K` / `J` | Move the selected project, task or group up / down (order is saved) | `move_task_up` / `move_task_down` |
 | `t` | Cycle color theme | `cycle_theme` |
 | `q` | Quit | `quit` |
 
@@ -245,7 +246,7 @@ Most of these fields are set for you through the TUI (`run_command` on first Run
 
 #### Task groups and ordering
 
-Tasks are listed in the order they appear in the config. `K` / `J` move the selected task up / down within its project (the change is saved to the config, so the CLI and web UI see the same order). Members of a [stack](#stacked-prs) move together as one unit.
+Projects and tasks are listed in the order they appear in the config. `K` / `J` move the selected task up / down within its project, or the selected project up / down in the list — local and remote projects alike, so a remote project can sit right under its local counterpart (the change is saved to the config, so the CLI and web UI see the same order). Members of a [stack](#stacked-prs) move together as one unit.
 
 Tasks can also be grouped by hand: `g` on a task opens a fuzzy picker over the project's existing groups (typing a name that matches none offers to create it; `(no group)` removes the task from its group), and every task in a project sharing that name is listed under a collapsible group header, its members marked with a `┆` rail. A grouped task moves within its group; selecting the header moves the whole group, and its context menu adds a task straight into the group, renames it or dissolves it. The group is stored as `group = "..."` on each `[[projects.tasks]]` entry and shows up as `group=...` in `showrunner list` (a `group` field in `--json`); from the CLI, `task create --group` and `task set-group` set it.
 
@@ -354,6 +355,42 @@ $ showrunner ask myapp/fix-auth/2 "which module owns token refresh?"
 ```
 
 A busy session queues the question and answers when it gets there, so `ask` blocks for as long as that takes (default timeout 300s). On timeout, or when the target stops on a permission/question dialog, whatever it printed still goes to stdout and the exit status is non-zero. Use `send` to drop a message without waiting for a reply, and `output` to read a session's screen directly.
+
+### Remote host
+
+Showrunner on a second machine (a dev box, an EC2 instance behind a VPN) can be driven from the CLI by adding a `[remote]` block to `~/.showrunner/config.toml`:
+
+```toml
+[remote]
+name = "ec2"                                  # prefix for its refs: ec2:myapp/fix-auth/2
+ssh = "ben@box.internal"                      # any ssh destination or ~/.ssh/config alias
+bin = "/home/ben/.cargo/bin/showrunner"       # non-interactive ssh shells rarely have the full PATH
+```
+
+Any command whose project or session ref carries the `ec2:` prefix runs on that host through its own `showrunner` binary — `showrunner ask ec2:myapp/fix-auth "…"`, `showrunner session create ec2:myapp fix-auth --prompt "…"`, `showrunner session kill ec2:myapp/fix-auth/2 --yes`. `showrunner list` appends the remote's projects and sessions, refs already prefixed, so they can be pasted straight back into a command; `showrunner list ec2:` shows only the remote. The connection is shared (`ControlMaster`), so a polling `ask` costs one ssh handshake, not one per poll. Plain ssh with key auth is all that's needed; when the host is unreachable, `list` says so and other commands fail fast.
+
+The other direction needs no inbound route to your machine. While the TUI runs (or `showrunner link`, for a headless setup), it keeps an ssh connection to the remote that reverse-forwards a loopback port there to a loopback listener here, and writes `~/.showrunner/peer.json` on the remote. Sessions on the remote then address this machine as `mac:…` (`local_name`, defaulting to the hostname) with the same commands, and their `list` shows your sessions under `host mac`. The listener only executes `showrunner` subcommands from the CLI set above (`list`, `ask`, `send`, `output`, `task`, `session`). The link reconnects with backoff when the remote drops (VPN down, box asleep); commands addressed to a machine that isn't linked right now fail fast with "not linked".
+
+#### In the TUI
+
+With a `[remote]` configured, `P` opens a picker over the remote's projects; the one you choose joins your list as a remote project — a config entry like any other, just with a host-prefixed path:
+
+```toml
+[[projects]]
+name = "Showrunner"
+path = "ec2:/home/ben/code/showrunner"
+```
+
+It shows as `ec2:Showrunner` with the tasks and sessions the remote currently has and their live statuses (polled every few seconds; the header shows `⇅ ec2` in green while the host answers, `⇄` while the reverse link is up, and the project row says `unreachable` when it isn't). Enter on a remote session attaches over ssh. The action menu on remote items offers what the remote's CLI does: add task, new session, delete, "Move … here", and "Remove from list" on the project (nothing is deleted on the host). Local tasks and sessions gain "Move … to remote". A remote task is created with the same name/branch/prompt flow, from the remote project's own menu.
+
+#### Moving a session between machines
+
+```sh
+showrunner session move myapp/fix-auth --to ec2        # laptop → remote
+showrunner session move ec2:myapp/fix-auth --to local   # and back
+```
+
+`move` asks the session's agent for a handoff note, commits whatever is uncommitted in its worktree, pushes its branch, recreates the session on the destination (registering the task there if needed, checking the pushed branch out in a fresh worktree, and starting the agent with the handoff note as its first prompt), and finally removes the source session and worktree — keeping its branch, so a later move back just fast-forwards it. Origin is the source of truth: the destination refuses if its local copy of the branch has diverged or is checked out elsewhere. The project must be registered under the same name on both machines; ignored files (dependencies, `.env`) are not carried over — that's what `setup_commands` are for. `--no-handoff` skips the note (use it when the agent is stuck), and a session whose agent has died can still be moved.
 
 ## Agent skills
 

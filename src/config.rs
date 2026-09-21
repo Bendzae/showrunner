@@ -106,11 +106,17 @@ fn kb_move_task_up() -> char {
 fn kb_move_task_down() -> char {
     'J'
 }
+fn kb_add_remote_project() -> char {
+    'P'
+}
 fn cm_group() -> char {
     'g'
 }
 fn cm_ungroup() -> char {
     'G'
+}
+fn cm_move_session() -> char {
+    'M'
 }
 
 fn is_false(b: &bool) -> bool {
@@ -184,6 +190,9 @@ pub struct ContextMenuKeyBindings {
     /// Dissolve a group (default: G)
     #[serde(default = "cm_ungroup")]
     pub ungroup: char,
+    /// Move a session to the other machine (default: M)
+    #[serde(default = "cm_move_session")]
+    pub move_session: char,
 }
 
 impl Default for ContextMenuKeyBindings {
@@ -210,6 +219,7 @@ impl Default for ContextMenuKeyBindings {
             new_session_with_agent: cm_new_session_with_agent(),
             group: cm_group(),
             ungroup: cm_ungroup(),
+            move_session: cm_move_session(),
         }
     }
 }
@@ -252,6 +262,9 @@ pub struct KeyBindings {
     /// Move the selected task or group down in the list (default: J)
     #[serde(default = "kb_move_task_down")]
     pub move_task_down: char,
+    /// Add one of the remote host's projects to this list (default: P)
+    #[serde(default = "kb_add_remote_project")]
+    pub add_remote_project: char,
     /// Context menu action keybindings
     #[serde(default)]
     pub context_menu_keys: ContextMenuKeyBindings,
@@ -271,6 +284,7 @@ impl Default for KeyBindings {
             cycle_theme: kb_cycle_theme(),
             move_task_up: kb_move_task_up(),
             move_task_down: kb_move_task_down(),
+            add_remote_project: kb_add_remote_project(),
             context_menu_keys: ContextMenuKeyBindings::default(),
         }
     }
@@ -623,6 +637,28 @@ fn default_agent_id() -> String {
     crate::agent::AgentKind::default().id().to_string()
 }
 
+fn default_remote_bin() -> String {
+    "showrunner".to_string()
+}
+
+/// A second machine running showrunner, reachable over ssh. Refs prefixed with
+/// `<name>:` are proxied to the `showrunner` binary installed there.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Remote {
+    /// Prefix used to address the remote in refs (e.g. `ec2` → `ec2:myapp/task/2`).
+    pub name: String,
+    /// ssh destination: `user@host` or a `~/.ssh/config` alias.
+    pub ssh: String,
+    /// Path of the showrunner binary on the remote. Non-interactive ssh shells
+    /// often lack the interactive PATH, so an absolute path is usually needed.
+    #[serde(default = "default_remote_bin")]
+    pub bin: String,
+    /// How sessions on the remote address this machine (`<local_name>:<ref>`).
+    /// Defaults to this machine's hostname.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_name: Option<String>,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Config {
     /// Diff review tool launched by the review action (default: hunk).
@@ -635,6 +671,9 @@ pub struct Config {
     /// before `projects`.
     #[serde(default = "default_agent_id")]
     pub default_agent: String,
+    /// Optional remote host whose sessions are addressed as `<name>:<ref>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<Remote>,
     #[serde(default)]
     pub projects: Vec<Project>,
     /// Startup skills/commands to run before the initial prompt (e.g. ["/prime", "/caveman ultra"])
@@ -1091,6 +1130,27 @@ impl Config {
 
     pub fn remove_project(&mut self, path: &str) {
         self.projects.retain(|p| p.path != path);
+    }
+
+    /// Swap the project at `path` with its neighbour above or below. The list
+    /// order is the display order, so local and remote projects can be
+    /// interleaved as the user likes.
+    pub fn move_project(&mut self, path: &str, up: bool) -> bool {
+        let Some(idx) = self.projects.iter().position(|p| p.path == path) else {
+            return false;
+        };
+        let target = if up {
+            idx.checked_sub(1)
+        } else {
+            (idx + 1 < self.projects.len()).then_some(idx + 1)
+        };
+        match target {
+            Some(t) => {
+                self.projects.swap(idx, t);
+                true
+            }
+            None => false,
+        }
     }
 }
 
@@ -1584,6 +1644,45 @@ mod tests {
         assert_eq!(deserialized.projects.len(), 1);
         assert_eq!(deserialized.projects[0].tasks.len(), 1);
         assert_eq!(deserialized.projects[0].tasks[0].name, "task1");
+    }
+
+    #[test]
+    fn move_project_swaps_neighbours_and_stops_at_the_ends() {
+        let mut cfg = empty_config();
+        cfg.add_project("A".into(), "/a".into());
+        cfg.add_project("B".into(), "ec2:/b".into());
+        cfg.add_project("C".into(), "/c".into());
+        assert!(!cfg.move_project("/a", true));
+        assert!(cfg.move_project("ec2:/b", true));
+        assert_eq!(
+            cfg.projects
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            ["B", "A", "C"]
+        );
+        assert!(!cfg.move_project("/c", false));
+        assert!(!cfg.move_project("/missing", true));
+    }
+
+    #[test]
+    fn remote_roundtrips_and_defaults_bin() {
+        let parsed: Config = toml::from_str(
+            "[remote]\nname = \"ec2\"\nssh = \"ben@box\"\n\n[[projects]]\nname = \"App\"\npath = \"/tmp/app\"\n",
+        )
+        .unwrap();
+        let remote = parsed.remote.clone().unwrap();
+        assert_eq!(remote.bin, "showrunner");
+
+        let serialized = toml::to_string_pretty(&parsed).unwrap();
+        let back: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(back.remote.unwrap(), remote);
+        assert_eq!(back.projects.len(), 1);
+        assert!(
+            !toml::to_string_pretty(&empty_config())
+                .unwrap()
+                .contains("remote")
+        );
     }
 }
 

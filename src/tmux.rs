@@ -27,6 +27,16 @@ pub enum SessionStatus {
 }
 
 impl SessionStatus {
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "running" => SessionStatus::Running,
+            "waiting_input" => SessionStatus::WaitingForInput,
+            "waiting_permission" => SessionStatus::WaitingForPermission,
+            "finished" => SessionStatus::Finished,
+            _ => return None,
+        })
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             SessionStatus::Running => "running",
@@ -43,6 +53,8 @@ pub struct TmuxSession {
     pub project_name: String,
     pub task_name: String,
     pub session_name: String,
+    /// Host the session lives on; `None` for this machine.
+    pub host: Option<String>,
 }
 
 impl TmuxSession {
@@ -57,7 +69,29 @@ impl TmuxSession {
             project_name: project_name.to_string(),
             task_name: task_name.to_string(),
             session_name: session_name.to_string(),
+            host: None,
         })
+    }
+
+    /// Key for per-session maps: the tmux name, prefixed by the host for
+    /// remote sessions so equally named sessions on two machines don't collide.
+    pub fn key(&self) -> String {
+        match &self.host {
+            Some(host) => format!("{host}:{}", self.name),
+            None => self.name.clone(),
+        }
+    }
+
+    /// `<project>/<task>/<session>` ref, host-prefixed for remote sessions.
+    pub fn reference(&self) -> String {
+        let bare = format!(
+            "{}/{}/{}",
+            self.project_name, self.task_name, self.session_name
+        );
+        match &self.host {
+            Some(host) => format!("{host}:{bare}"),
+            None => bare,
+        }
     }
 
     /// Returns the worktree path if this session has one.
@@ -124,7 +158,7 @@ fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-fn build_tmux_name(project: &str, task: &str, session: &str) -> String {
+pub fn build_tmux_name(project: &str, task: &str, session: &str) -> String {
     format!(
         "cm{sep}{}{sep}{}{sep}{}",
         sanitize(project),
@@ -305,6 +339,17 @@ pub fn create_task_branch(project_path: &str, branch_name: &str, base: Option<&s
     Ok(())
 }
 
+/// Where a new session's worktree branch comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Checkout {
+    /// Fork a fresh `<task-branch>-<session>` off the local task branch (the
+    /// main session checks out the task branch itself).
+    ForkFromTask,
+    /// Check out the session's branch as pushed to origin — a session moved
+    /// here from another machine.
+    PushedBranch,
+}
+
 pub fn create_session(
     project_name: &str,
     project_path: &str,
@@ -317,6 +362,36 @@ pub fn create_session(
     initial_prompt: Option<&str>,
     startup_skills: &[String],
     agent: AgentKind,
+) -> Result<String> {
+    create_session_with(
+        project_name,
+        project_path,
+        task_name,
+        task_branch,
+        session_name,
+        use_worktree,
+        copy_patterns,
+        setup_commands,
+        initial_prompt,
+        startup_skills,
+        agent,
+        Checkout::ForkFromTask,
+    )
+}
+
+pub fn create_session_with(
+    project_name: &str,
+    project_path: &str,
+    task_name: &str,
+    task_branch: &str,
+    session_name: &str,
+    use_worktree: bool,
+    copy_patterns: &[String],
+    setup_commands: &[String],
+    initial_prompt: Option<&str>,
+    startup_skills: &[String],
+    agent: AgentKind,
+    checkout: Checkout,
 ) -> Result<String> {
     let tmux_name = build_tmux_name(project_name, task_name, session_name);
 
@@ -336,10 +411,23 @@ pub fn create_session(
         // gets its own branch forked off it.
         let mut args = vec!["-C", project_path, "worktree", "add"];
         let session_branch = format!("{task_branch}-{}", sanitize(session_name));
-        if !is_main_session(session_name) {
-            args.extend(["-b", &session_branch]);
+        let own_branch = if is_main_session(session_name) {
+            task_branch
+        } else {
+            &session_branch
+        };
+        match checkout {
+            Checkout::ForkFromTask => {
+                if !is_main_session(session_name) {
+                    args.extend(["-b", &session_branch]);
+                }
+                args.extend([worktree_path_str.as_str(), task_branch]);
+            }
+            Checkout::PushedBranch => {
+                checkout_pushed_branch(project_path, own_branch)?;
+                args.extend([worktree_path_str.as_str(), own_branch]);
+            }
         }
-        args.extend([worktree_path_str.as_str(), task_branch]);
         let status = Command::new("git").args(&args).output()?;
 
         if !status.status.success() {
@@ -394,6 +482,7 @@ pub fn create_session(
         false,
     );
 
+    let agent_cmd = with_server_path(agent_cmd);
     let output = Command::new("tmux")
         .args([
             "new-session",
@@ -447,6 +536,117 @@ pub fn create_session(
     }
 
     Ok(tmux_name)
+}
+
+/// Prefix a session command with the PATH the tmux server was started with. A
+/// new session's command otherwise runs with the *client's* PATH, which for a
+/// non-interactive ssh client (the remote proxy) lacks the agent binaries that
+/// the server's interactive shell had.
+fn with_server_path(cmd: String) -> String {
+    let server_path = Command::new("tmux")
+        .args(["show-environment", "-g", "PATH"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .and_then(|line| line.strip_prefix("PATH=").map(str::to_string));
+    match server_path {
+        Some(path) if !path.is_empty() => format!("export PATH={}; {cmd}", shell_escape(&path)),
+        _ => cmd,
+    }
+}
+
+/// Bring the local `branch` up to `origin/<branch>` so a worktree can check it
+/// out: fetch, refuse if it is already checked out or has diverged locally,
+/// then fast-forward (or create) the local ref.
+fn checkout_pushed_branch(project_path: &str, branch: &str) -> Result<()> {
+    let fetch = Command::new("git")
+        .args(["-C", project_path, "fetch", "origin", branch])
+        .output()?;
+    if !fetch.status.success() {
+        bail!(
+            "Failed to fetch origin/{branch}: {}",
+            String::from_utf8_lossy(&fetch.stderr).trim()
+        );
+    }
+    if let Some(path) = worktree_for_branch(project_path, branch) {
+        bail!("branch {branch} is already checked out at {path}");
+    }
+    let remote_ref = format!("origin/{branch}");
+    if branch_exists(project_path, branch) {
+        let is_ancestor = Command::new("git")
+            .args([
+                "-C",
+                project_path,
+                "merge-base",
+                "--is-ancestor",
+                branch,
+                &remote_ref,
+            ])
+            .status()?
+            .success();
+        if !is_ancestor {
+            bail!("local branch {branch} has commits that are not on origin/{branch}");
+        }
+        let ff = Command::new("git")
+            .args(["-C", project_path, "branch", "-f", branch, &remote_ref])
+            .output()?;
+        if !ff.status.success() {
+            bail!(
+                "Failed to fast-forward {branch}: {}",
+                String::from_utf8_lossy(&ff.stderr).trim()
+            );
+        }
+    } else {
+        let create = Command::new("git")
+            .args(["-C", project_path, "branch", "--track", branch, &remote_ref])
+            .output()?;
+        if !create.status.success() {
+            bail!(
+                "Failed to create {branch} from origin: {}",
+                String::from_utf8_lossy(&create.stderr).trim()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Path of the worktree (or main checkout) that has `branch` checked out.
+fn worktree_for_branch(project_path: &str, branch: &str) -> Option<String> {
+    let out = Command::new("git")
+        .args(["-C", project_path, "worktree", "list", "--porcelain"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let wanted = format!("branch refs/heads/{branch}");
+    text.split("\n\n").find_map(|block| {
+        let path = block.lines().next()?.strip_prefix("worktree ")?;
+        block.lines().any(|l| l == wanted).then(|| path.to_string())
+    })
+}
+
+/// Kill a session and remove its worktree, keeping its branch — the branch
+/// lives on elsewhere (a session moved to another machine).
+pub fn remove_session_keep_branch(name: &str, project_path: &str, worktree_path: &str) {
+    let _ = Command::new("tmux")
+        .args(["kill-session", "-t", name])
+        .output();
+    if Path::new(worktree_path).exists() {
+        let _ = Command::new("git")
+            .args([
+                "-C",
+                project_path,
+                "worktree",
+                "remove",
+                "--force",
+                worktree_path,
+            ])
+            .output();
+    }
+    let _ = Command::new("git")
+        .args(["-C", project_path, "worktree", "prune"])
+        .output();
 }
 
 /// Create an adhoc session: tmux session running Claude in the project directory
@@ -1585,7 +1785,7 @@ pub fn update_task_branch(project_path: &str, branch: &str, base_branch: &str) -
     }
 }
 
-fn current_branch(project_path: &str) -> Option<String> {
+pub fn current_branch(project_path: &str) -> Option<String> {
     let out = Command::new("git")
         .args(["-C", project_path, "rev-parse", "--abbrev-ref", "HEAD"])
         .output()

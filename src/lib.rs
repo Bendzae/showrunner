@@ -4,6 +4,7 @@ pub mod cli;
 pub mod config;
 mod entry;
 pub mod ops;
+pub mod remote;
 pub mod server;
 pub mod theme;
 pub mod tmux;
