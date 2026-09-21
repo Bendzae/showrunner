@@ -556,6 +556,11 @@ impl Link {
     pub fn stop(&self) {
         *self.stopped.lock().unwrap() = true;
         if let Some(mut child) = self.ssh.lock().unwrap().take() {
+            // Killing only the shell watchdog would orphan ssh (and leave its
+            // forward on the remote): signal the whole process group.
+            let _ = Command::new("kill")
+                .args(["-TERM", &format!("-{}", child.id())])
+                .status();
             let _ = child.kill();
             let _ = child.wait();
         }
@@ -636,12 +641,19 @@ fn hold_forward(
     let script = format!(
         "{ssh} & p=$!; while kill -0 $PPID 2>/dev/null && kill -0 $p 2>/dev/null; do sleep 2; done; kill $p 2>/dev/null; wait $p"
     );
-    let child = Command::new("sh")
+    let mut command = Command::new("sh");
+    command
         .args(["-c", &script])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn();
+        .stderr(Stdio::piped());
+    // Own process group, so `stop` can take down the watchdog *and* ssh.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let child = command.spawn();
     let Ok(mut child) = child else {
         return false;
     };
