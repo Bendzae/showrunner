@@ -365,6 +365,9 @@ Showrunner on a second machine (a dev box, an EC2 instance behind a VPN) can be 
 name = "ec2"                                  # prefix for its refs: ec2:myapp/fix-auth/2
 ssh = "ben@box.internal"                      # any ssh destination or ~/.ssh/config alias
 bin = "/home/ben/.cargo/bin/showrunner"       # non-interactive ssh shells rarely have the full PATH
+# optional: run here when the TUI starts and whenever the host is unreachable,
+# e.g. to start a stopped cloud instance (at most once per 90s)
+wake_command = "aws ec2 start-instances --instance-ids i-0123 && aws ec2 wait instance-running --instance-ids i-0123"
 ```
 
 Any command whose project or session ref carries the `ec2:` prefix runs on that host through its own `showrunner` binary — `showrunner ask ec2:myapp/fix-auth "…"`, `showrunner session create ec2:myapp fix-auth --prompt "…"`, `showrunner session kill ec2:myapp/fix-auth/2 --yes`. `showrunner list` appends the remote's projects and sessions, refs already prefixed, so they can be pasted straight back into a command; `showrunner list ec2:` shows only the remote. The connection is shared (`ControlMaster`), so a polling `ask` costs one ssh handshake, not one per poll. Plain ssh with key auth is all that's needed; when the host is unreachable, `list` says so and other commands fail fast.

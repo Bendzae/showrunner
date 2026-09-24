@@ -539,7 +539,9 @@ impl Link {
             .unwrap_or_else(crate::app::detect_hostname);
         thread::spawn(move || {
             let mut backoff = Duration::from_secs(2);
+            let mut waker = Waker::new(remote.wake_command.clone());
             while !*stopped.lock().unwrap() {
+                waker.wake_if_due();
                 let held = hold_forward(&remote, port, &peer_name, &ssh, &stopped, &connected);
                 connected.store(false, Ordering::Relaxed);
                 backoff = if held {
@@ -570,6 +572,42 @@ impl Link {
 impl Drop for Link {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+/// Runs the configured `wake_command` when the link starts and before each
+/// reconnect attempt, at most once every 90 seconds — enough to start a
+/// stopped instance without hammering the API while it boots.
+struct Waker {
+    command: Option<String>,
+    last: Option<std::time::Instant>,
+}
+
+impl Waker {
+    fn new(command: Option<String>) -> Self {
+        Waker {
+            command,
+            last: None,
+        }
+    }
+
+    fn wake_if_due(&mut self) {
+        let Some(command) = &self.command else {
+            return;
+        };
+        if self
+            .last
+            .is_some_and(|t| t.elapsed() < Duration::from_secs(90))
+        {
+            return;
+        }
+        self.last = Some(std::time::Instant::now());
+        let _ = Command::new("sh")
+            .args(["-c", command])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
     }
 }
 
@@ -718,6 +756,7 @@ mod tests {
             ssh: "ben@box".into(),
             bin: "showrunner".into(),
             local_name: None,
+            wake_command: None,
         }
     }
 
