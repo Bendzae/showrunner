@@ -539,9 +539,8 @@ impl Link {
             .unwrap_or_else(crate::app::detect_hostname);
         thread::spawn(move || {
             let mut backoff = Duration::from_secs(2);
-            let mut waker = Waker::new(remote.wake_command.clone());
+            wake(&remote);
             while !*stopped.lock().unwrap() {
-                waker.wake_if_due();
                 let held = hold_forward(&remote, port, &peer_name, &ssh, &stopped, &connected);
                 connected.store(false, Ordering::Relaxed);
                 backoff = if held {
@@ -575,40 +574,18 @@ impl Drop for Link {
     }
 }
 
-/// Runs the configured `wake_command` when the link starts and before each
-/// reconnect attempt, at most once every 90 seconds — enough to start a
-/// stopped instance without hammering the API while it boots.
-struct Waker {
-    command: Option<String>,
-    last: Option<std::time::Instant>,
-}
-
-impl Waker {
-    fn new(command: Option<String>) -> Self {
-        Waker {
-            command,
-            last: None,
-        }
-    }
-
-    fn wake_if_due(&mut self) {
-        let Some(command) = &self.command else {
-            return;
-        };
-        if self
-            .last
-            .is_some_and(|t| t.elapsed() < Duration::from_secs(90))
-        {
-            return;
-        }
-        self.last = Some(std::time::Instant::now());
-        let _ = Command::new("sh")
-            .args(["-c", command])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
+/// Run the configured `wake_command` once, before the first link attempt —
+/// e.g. to start a stopped instance the link would otherwise wait for.
+fn wake(remote: &Remote) {
+    let Some(command) = &remote.wake_command else {
+        return;
+    };
+    let _ = Command::new("sh")
+        .args(["-c", command])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 /// Tell the remote who we are and where its `<name>:` refs come back through.

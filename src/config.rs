@@ -657,8 +657,8 @@ pub struct Remote {
     /// Defaults to this machine's hostname.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_name: Option<String>,
-    /// Shell command run here when the link starts and whenever the remote
-    /// turns out unreachable (e.g. starting a stopped cloud instance).
+    /// Shell command run here once when the link starts (e.g. starting a
+    /// stopped cloud instance).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wake_command: Option<String>,
 }

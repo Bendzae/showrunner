@@ -365,8 +365,7 @@ Showrunner on a second machine (a dev box, an EC2 instance behind a VPN) can be 
 name = "ec2"                                  # prefix for its refs: ec2:myapp/fix-auth/2
 ssh = "ben@box.internal"                      # any ssh destination or ~/.ssh/config alias
 bin = "/home/ben/.cargo/bin/showrunner"       # non-interactive ssh shells rarely have the full PATH
-# optional: run here when the TUI starts and whenever the host is unreachable,
-# e.g. to start a stopped cloud instance (at most once per 90s)
+# optional: run here once when the TUI starts, e.g. to start a stopped cloud instance
 wake_command = "aws ec2 start-instances --instance-ids i-0123 && aws ec2 wait instance-running --instance-ids i-0123"
 ```
 
