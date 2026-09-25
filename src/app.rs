@@ -1438,6 +1438,11 @@ impl App {
                     action: ContextAction::NewSessionWithAgent,
                 },
                 ContextMenuItem {
+                    key: cm.open_pr,
+                    label: "Open PR",
+                    action: ContextAction::OpenPr,
+                },
+                ContextMenuItem {
                     key: cm.move_session,
                     label: "Move main session here",
                     action: ContextAction::MoveSession,
@@ -1449,11 +1454,18 @@ impl App {
                 },
             ],
             Some(ListItem::Session { session, .. }) => {
-                let mut items = vec![ContextMenuItem {
-                    key: cm.move_session,
-                    label: "Move session here",
-                    action: ContextAction::MoveSession,
-                }];
+                let mut items = vec![
+                    ContextMenuItem {
+                        key: cm.open_pr,
+                        label: "Open PR",
+                        action: ContextAction::OpenPr,
+                    },
+                    ContextMenuItem {
+                        key: cm.move_session,
+                        label: "Move session here",
+                        action: ContextAction::MoveSession,
+                    },
+                ];
                 if !tmux::is_main_session(&session.session_name) {
                     items.push(ContextMenuItem {
                         key: cm.delete,
@@ -3844,10 +3856,23 @@ impl App {
     }
 
     pub fn open_pr(&mut self) {
-        if let Some(ListItem::Task { task, .. }) = self.selected_item() {
-            if let Some(pr) = self.prs.get(&task.branch) {
-                open_url(&pr.url);
-            } else {
+        let (task, project_path) = match self.selected_item() {
+            Some(ListItem::Task {
+                task, project_path, ..
+            })
+            | Some(ListItem::Session {
+                task, project_path, ..
+            }) => (task, project_path),
+            _ => return,
+        };
+        let remote = remote::host_of_path(project_path).is_some();
+        match self.prs.get(&scoped_branch(&task.branch, project_path)) {
+            Some(pr) => open_url(&pr.url),
+            // PRs are created from the local checkout only.
+            None if remote => {
+                self.status_message = Some(format!("No PR found for {}", task.branch));
+            }
+            None => {
                 self.input_mode = InputMode::ConfirmCreatePr;
                 self.status_message = Some("No PR found. Create one? (y/n)".into());
             }

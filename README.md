@@ -384,7 +384,7 @@ name = "Showrunner"
 path = "ec2:/home/ben/code/showrunner"
 ```
 
-It shows as `ec2:Showrunner` with the tasks and sessions the remote currently has and their live statuses (polled every few seconds; the header shows `⇅ ec2` in green while the host answers, `⇄` while the reverse link is up, and the project row says `unreachable` when it isn't). Enter on a remote session attaches over ssh. The action menu on remote items offers what the remote's CLI does: add task, new session, delete, "Move … here", and "Remove from list" on the project (nothing is deleted on the host). Local tasks and sessions gain "Move … to remote". A remote task is created with the same name/branch/prompt flow, from the remote project's own menu.
+It shows as `ec2:Showrunner` with the tasks and sessions the remote currently has and their live statuses (polled every few seconds; the header shows `⇅ ec2` in green while the host answers, `⇄` while the reverse link is up, and the project row says `unreachable` when it isn't). Enter on a remote session attaches over ssh. The action menu on remote items offers what the remote's CLI does: add task, new session, open PR, delete, "Move … here", and "Remove from list" on the project (nothing is deleted on the host). Local tasks and sessions gain "Move … to remote". A remote task is created with the same name/branch/prompt flow, from the remote project's own menu.
 
 #### Moving a session between machines
 
