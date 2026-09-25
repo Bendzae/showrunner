@@ -341,6 +341,7 @@ showrunner session kill <session> --yes
 showrunner ask <session> <question> [--timeout <secs>]
 showrunner send <session> <text> [--no-submit]
 showrunner output <session> [--lines <n>]
+showrunner restore                               # recreate saved sessions gone from tmux (after a reboot)
 ```
 
 Sessions are addressed by the refs `list` prints — `<project>/<task>/<session>` (e.g. `myapp/fix-auth/2`), `<project>/<task>` for that task's main session, or a raw tmux name. `list` marks the session you're calling from as `(this session)`, and reports the same statuses as the TUI (`running`, `waiting_input`, `waiting_permission`, `finished`); it samples each pane twice, so it takes a moment.
@@ -369,7 +370,7 @@ bin = "/home/ben/.cargo/bin/showrunner"       # non-interactive ssh shells rarel
 wake_command = "aws ec2 start-instances --instance-ids i-0123 && aws ec2 wait instance-running --instance-ids i-0123"
 ```
 
-Any command whose project or session ref carries the `ec2:` prefix runs on that host through its own `showrunner` binary — `showrunner ask ec2:myapp/fix-auth "…"`, `showrunner session create ec2:myapp fix-auth --prompt "…"`, `showrunner session kill ec2:myapp/fix-auth/2 --yes`. `showrunner list` appends the remote's projects and sessions, refs already prefixed, so they can be pasted straight back into a command; `showrunner list ec2:` shows only the remote. The connection is shared (`ControlMaster`), so a polling `ask` costs one ssh handshake, not one per poll. Plain ssh with key auth is all that's needed; when the host is unreachable, `list` says so and other commands fail fast.
+Any command whose project or session ref carries the `ec2:` prefix runs on that host through its own `showrunner` binary — `showrunner ask ec2:myapp/fix-auth "…"`, `showrunner session create ec2:myapp fix-auth --prompt "…"`, `showrunner session kill ec2:myapp/fix-auth/2 --yes`. `showrunner list` appends the remote's projects and sessions, refs already prefixed, so they can be pasted straight back into a command; `showrunner list ec2:` shows only the remote. The connection is shared (`ControlMaster`), so a polling `ask` costs one ssh handshake, not one per poll. Plain ssh with key auth is all that's needed; when the host is unreachable, `list` says so and other commands fail fast. When a host comes back (a rebooted instance, say), the TUI runs `showrunner restore` there first, so its saved sessions are recreated without anyone opening showrunner on the box.
 
 The other direction needs no inbound route to your machine. While the TUI runs (or `showrunner link`, for a headless setup), it keeps an ssh connection to the remote that reverse-forwards a loopback port there to a loopback listener here, and writes `~/.showrunner/peer.json` on the remote. Sessions on the remote then address this machine as `mac:…` (`local_name`, defaulting to the hostname) with the same commands, and their `list` shows your sessions under `host mac`. The listener only executes `showrunner` subcommands from the CLI set above (`list`, `ask`, `send`, `output`, `task`, `session`). The link reconnects with backoff when the remote drops (VPN down, box asleep); commands addressed to a machine that isn't linked right now fail fast with "not linked".
 

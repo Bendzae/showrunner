@@ -39,6 +39,10 @@ Managing tasks and sessions (usable from inside a session):
   showrunner session kill <session> --yes
   showrunner session move <session> --to <host|local> [--no-handoff]
 
+Housekeeping:
+  showrunner restore                            recreate saved sessions that
+                                                    are gone from tmux (reboot)
+
 Talking to another session:
   showrunner ask <session> <question> [--timeout <secs>]
   showrunner send <session> <text> [--no-submit]
@@ -70,6 +74,7 @@ pub fn dispatch(args: &[String]) -> Option<Result<()>> {
         Some("ask") => Some(cmd_ask(rest)),
         Some("send") => Some(cmd_send(rest)),
         Some("output") => Some(cmd_output(rest)),
+        Some("restore") => Some(cmd_restore(rest)),
         Some("--help" | "-h" | "help") => {
             print!("{HELP}");
             Some(Ok(()))
@@ -105,6 +110,24 @@ fn dispatch_remote(args: &[String]) -> Option<Result<()>> {
             std::process::exit(status.code().unwrap_or(1));
         }
     }))
+}
+
+fn cmd_restore(args: &[String]) -> Result<()> {
+    if let Some(extra) = args.first() {
+        bail!("unexpected argument '{extra}' (usage: restore)");
+    }
+    let cfg = Config::load()?;
+    let report = ops::restore_sessions(&cfg);
+    for reference in &report.restored {
+        println!("restored {reference}");
+    }
+    for failure in &report.failures {
+        eprintln!("could not restore {failure}");
+    }
+    if report.restored.is_empty() && report.failures.is_empty() {
+        println!("nothing to restore");
+    }
+    Ok(())
 }
 
 fn cmd_link(args: &[String]) -> Result<()> {

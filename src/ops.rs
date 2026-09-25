@@ -1,6 +1,8 @@
 //! Task and session operations shared by the HTTP server and the CLI, so both
 //! headless entry points create and delete things exactly like the TUI does.
 
+use std::collections::HashSet;
+
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
@@ -367,4 +369,72 @@ pub fn release_session(tmux_name: &str) -> Result<()> {
     tmux::remove_session_keep_branch(tmux_name, &record.project_path, &worktree);
     config::remove_session_record(tmux_name);
     Ok(())
+}
+
+/// Outcome of [`restore_sessions`]: refs recreated, and `ref: error` for those
+/// that couldn't be.
+#[derive(Debug, Default)]
+pub struct RestoreReport {
+    pub restored: Vec<String>,
+    pub failures: Vec<String>,
+}
+
+/// Recreate saved sessions that are no longer in tmux (tmux died, the machine
+/// rebooted). Whether to recreate or prune depends on the task still existing
+/// in the config — not on tmux liveness — so sessions come back after a
+/// restart, while those of deleted tasks are reaped instead of resurrected.
+pub fn restore_sessions(cfg: &Config) -> RestoreReport {
+    let mut report = RestoreReport::default();
+    let saved = config::load_sessions();
+    if saved.is_empty() {
+        return report;
+    }
+    let live: Vec<tmux::TmuxSession> = tmux::list_sessions().unwrap_or_default();
+    let live_names: HashSet<&str> = live.iter().map(|s| s.name.as_str()).collect();
+
+    for (tmux_name, record) in &saved {
+        if record.archived || live_names.contains(tmux_name.as_str()) {
+            continue;
+        }
+        let reference = format!(
+            "{}/{}/{}",
+            record.project_name, record.task_name, record.session_name
+        );
+
+        if tmux::is_adhoc_marker(&record.task_name) {
+            // Adhoc sessions are project-scoped: recreate while the project
+            // exists, otherwise prune.
+            if !cfg.project_exists(&record.project_path) {
+                config::remove_session_record(tmux_name);
+            } else {
+                match tmux::recreate_adhoc_session(tmux_name, record) {
+                    Ok(_) => report.restored.push(reference),
+                    Err(e) => report.failures.push(format!("{reference}: {e}")),
+                }
+            }
+            continue;
+        }
+
+        // Task-scoped: match by branch (+ project path) rather than the display
+        // names, which can drift when the config is edited by hand.
+        match cfg.find_task_by_branch(&record.project_path, &record.task_branch) {
+            Some(_) => {
+                if tmux::record_worktree_missing(record) {
+                    config::remove_session_record(tmux_name);
+                } else {
+                    match tmux::recreate_session(tmux_name, record) {
+                        Ok(_) => report.restored.push(reference),
+                        Err(e) => report.failures.push(format!("{reference}: {e}")),
+                    }
+                }
+            }
+            None => {
+                // The task is gone from the config: reap the orphan (worktree,
+                // cached context, record); the git branch is kept.
+                tmux::cleanup_orphan_session(record);
+                config::remove_session_record(tmux_name);
+            }
+        }
+    }
+    report
 }

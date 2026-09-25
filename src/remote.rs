@@ -14,7 +14,7 @@
 //!   `showrunner` can find the way back. This is how sessions on a box behind
 //!   a VPN talk to sessions on the laptop without the laptop being reachable.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -370,9 +370,32 @@ impl HostPoller {
         let latest: Arc<Mutex<Option<Vec<HostSnapshot>>>> = Arc::new(Mutex::new(None));
         let slot = latest.clone();
         thread::spawn(move || {
+            // Hosts seen reachable on the previous round. A host that just
+            // (re)appeared may have rebooted with its sessions gone from
+            // tmux, and nobody opens a TUI there to bring them back: run its
+            // `restore` once before listing it.
+            let mut reachable: HashSet<String> = HashSet::new();
             loop {
                 let hosts = Config::load().map(|cfg| hosts(&cfg)).unwrap_or_default();
-                let snapshots: Vec<HostSnapshot> = hosts.iter().map(fetch_snapshot).collect();
+                let snapshots: Vec<HostSnapshot> = hosts
+                    .iter()
+                    .map(|host| {
+                        let mut snapshot = fetch_snapshot(host);
+                        if snapshot.error.is_none() && !reachable.contains(host.name()) {
+                            let restored = host
+                                .output(&["restore".to_string()])
+                                .is_ok_and(|out| out.contains("restored "));
+                            if restored {
+                                snapshot = fetch_snapshot(host);
+                            }
+                        }
+                        match snapshot.error {
+                            None => reachable.insert(host.name().to_string()),
+                            Some(_) => reachable.remove(host.name()),
+                        };
+                        snapshot
+                    })
+                    .collect();
                 *slot.lock().unwrap() = Some(snapshots);
                 thread::sleep(Duration::from_secs(3));
             }

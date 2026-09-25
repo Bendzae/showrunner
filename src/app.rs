@@ -575,66 +575,9 @@ impl App {
     pub fn new() -> Result<Self> {
         let config = Config::load()?;
         let keybindings = KeyBindings::load();
-        let mut sessions = tmux::list_sessions().unwrap_or_default();
-
         // Recreate any saved sessions that are no longer in tmux (e.g. tmux died)
-        let saved = config::load_sessions();
-        let mut restore_failures = Vec::new();
-        if !saved.is_empty() {
-            let live_names: HashSet<_> = sessions.iter().map(|s| s.name.as_str()).collect();
-            for (tmux_name, record) in &saved {
-                if record.archived {
-                    continue;
-                }
-                // Only act on records whose tmux session is gone. The decision
-                // to recreate vs. prune is based on whether the task still
-                // exists in config — NOT on tmux liveness — so legitimate
-                // sessions are recovered after showrunner/tmux restarts,
-                // while sessions whose task was deleted are reaped instead of
-                // being resurrected on every startup.
-                if live_names.contains(tmux_name.as_str()) {
-                    continue;
-                }
-
-                if tmux::is_adhoc_marker(&record.task_name) {
-                    // Adhoc sessions are project-scoped. Recreate while the
-                    // project exists; otherwise the project is gone — prune.
-                    if !config.project_exists(&record.project_path) {
-                        config::remove_session_record(tmux_name);
-                    } else if let Err(e) = tmux::recreate_adhoc_session(tmux_name, record) {
-                        restore_failures.push(format!(
-                            "{}/{}: {e}",
-                            record.project_name, record.session_name
-                        ));
-                    }
-                    continue;
-                }
-
-                // Task-scoped session: match by branch (+ project path) rather
-                // than the display-name fields, which can drift when the config
-                // is edited by hand.
-                match config.find_task_by_branch(&record.project_path, &record.task_branch) {
-                    Some(_) => {
-                        if tmux::record_worktree_missing(record) {
-                            config::remove_session_record(tmux_name);
-                        } else if let Err(e) = tmux::recreate_session(tmux_name, record) {
-                            restore_failures
-                                .push(format!("{}/{}: {e}", record.task_name, record.session_name));
-                        }
-                    }
-                    None => {
-                        // The task no longer exists in config. Reap the orphan
-                        // (worktree + cached context + record) so it isn't
-                        // resurrected on every startup. The git branch is kept,
-                        // preserving any committed work.
-                        tmux::cleanup_orphan_session(record);
-                        config::remove_session_record(tmux_name);
-                    }
-                }
-            }
-            // Re-list sessions after recreation
-            sessions = tmux::list_sessions().unwrap_or_default();
-        }
+        let restore_failures = crate::ops::restore_sessions(&config).failures;
+        let sessions = tmux::list_sessions().unwrap_or_default();
         let (tx, rx) = mpsc::channel();
         let (review_tx, review_rx) = mpsc::channel();
         let link = config.remote.as_ref().and_then(|r| Link::start(r).ok());
