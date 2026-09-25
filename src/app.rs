@@ -492,6 +492,15 @@ pub fn scoped_project(name: &str, path: &str) -> String {
     }
 }
 
+/// Key of a task branch in the per-branch maps (`task_diff_stats`, `prs`):
+/// `<host>:<branch>` for a remote project's task.
+pub fn scoped_branch(branch: &str, project_path: &str) -> String {
+    match remote::host_of_path(project_path) {
+        Some((host, _)) => format!("{host}:{branch}"),
+        None => branch.to_string(),
+    }
+}
+
 fn task_key(project: &str, task: &str) -> String {
     format!("t:{project}:{task}")
 }
@@ -721,13 +730,32 @@ impl App {
             }
             self.hosts = hosts;
         }
-        // Host sessions are keyed by `<host>:<tmux name>`, so they can share
-        // the per-session maps with local ones.
+        // Host entries are keyed by `<host>:<tmux name>` / `<host>:<branch>` /
+        // `<host>:<project>`, so they can share the maps with local ones.
         for host in &self.hosts {
             self.session_statuses
                 .extend(host.statuses.iter().map(|(k, v)| (k.clone(), *v)));
             self.session_agents
                 .extend(host.agents.iter().map(|(k, v)| (k.clone(), v.clone())));
+            self.diff_stats.extend(
+                host.session_diffs
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone())),
+            );
+            self.session_branches.extend(
+                host.session_branches
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone())),
+            );
+            self.task_diff_stats
+                .extend(host.task_diffs.iter().map(|(k, v)| (k.clone(), v.clone())));
+            self.prs
+                .extend(host.prs.iter().map(|(k, v)| (k.clone(), v.clone())));
+            self.project_branches.extend(
+                host.project_branches
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone())),
+            );
         }
         self.rebuild_items();
     }

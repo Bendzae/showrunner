@@ -851,11 +851,18 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
     let group_rail_style = Style::default().fg(current().magenta);
 
     // Stacked-task positions (⧉ n/m) per project, keyed by task branch.
-    let stacks: HashMap<&str, HashMap<String, (usize, usize)>> = app
-        .config
-        .projects
+    // Keyed by scoped project name; items carry a remote project's live tasks,
+    // the config only its entry.
+    let stacks: HashMap<String, HashMap<String, (usize, usize)>> = app
+        .items
         .iter()
-        .map(|p| (p.name.as_str(), p.stack_positions()))
+        .filter_map(|item| match item {
+            app::ListItem::Project { project } => Some((
+                app::scoped_project(&project.name, &project.path),
+                project.stack_positions(),
+            )),
+            _ => None,
+        })
         .collect();
 
     for (i, item) in app.items.iter().enumerate() {
@@ -931,11 +938,10 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
                     ));
                 }
 
-                // Branch names are tracked for local projects only.
-                let branch = host
-                    .is_none()
-                    .then(|| app.project_branches.get(&project.name).cloned())
-                    .flatten();
+                let branch = app
+                    .project_branches
+                    .get(&app::scoped_project(&project.name, &project.path))
+                    .cloned();
                 rows.push(Row::CardTop {
                     chevron,
                     name,
@@ -976,7 +982,7 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
                 ];
 
                 if let Some((pos, total)) = stacks
-                    .get(project_name.as_str())
+                    .get(&app::scoped_project(project_name, project_path))
                     .and_then(|s| s.get(&task.branch))
                 {
                     left.push(Span::styled(
@@ -1031,13 +1037,14 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
                 }
 
                 // --- right-hand metadata columns: churn | badge | branch ---
+                let branch_key = app::scoped_branch(&task.branch, project_path);
                 let (added, removed) = app
                     .task_diff_stats
-                    .get(&task.branch)
+                    .get(&branch_key)
                     .map(|s| (s.added, s.removed))
                     .unwrap_or((0, 0));
 
-                let badge = app.prs.get(&task.branch).map(pr_badge).unwrap_or_default();
+                let badge = app.prs.get(&branch_key).map(pr_badge).unwrap_or_default();
 
                 // Branch column: branch name, with "← base" suffix for non-main bases.
                 let branch_label = match task.base_branch.as_deref() {
@@ -1813,8 +1820,11 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     }
     // Show PR URL when a task with a PR is selected and no other status message
     if app.status_message.is_none() && app.input_mode == InputMode::Normal {
-        if let Some(app::ListItem::Task { task, .. }) = app.selected_item() {
-            if let Some(pr) = app.prs.get(&task.branch) {
+        if let Some(app::ListItem::Task {
+            task, project_path, ..
+        }) = app.selected_item()
+        {
+            if let Some(pr) = app.prs.get(&app::scoped_branch(&task.branch, project_path)) {
                 let pr_line = Paragraph::new(Line::from(vec![
                     Span::styled("\u{e728} ", Style::default().fg(current().magenta)),
                     Span::styled(pr.url.as_str(), Style::default().fg(current().muted)),

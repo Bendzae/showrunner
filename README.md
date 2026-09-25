@@ -331,7 +331,7 @@ This gives you a valid-HTTPS URL reachable only from your own devices. Open it o
 Besides the TUI and `serve`, the binary exposes the same task/session operations as commands. They act on the shared state in `~/.showrunner/`, so a running TUI picks the changes up on its next refresh. Agents running inside a session use these to manage each other (see [Agent skills](#agent-skills)), and they're handy from any shell.
 
 ```sh
-showrunner list [--json] [--project <name>]      # projects, tasks, live sessions + status
+showrunner list [--json] [--project <name>] [--stats]   # projects, tasks, live sessions + status (--stats: diffs, branches, PRs)
 showrunner task create <project> <name> [--branch <b>] [--base <b>] [--group <g>] [--prompt <text>] [--agent claude|codex|pi]
 showrunner task set-base <project> <task> <branch>   # 'main' resets to the default
 showrunner task set-group <project> <task> [<group>] # omit the group to ungroup

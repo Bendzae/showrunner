@@ -815,6 +815,12 @@ pub fn pr_url_path(project_name: &str, branch: &str) -> PathBuf {
     task_dir(project_name, branch).join("pr_url.txt")
 }
 
+/// Path to the cached PR details (`list --stats` serves these to other hosts
+/// without a `gh` call per listing).
+pub fn pr_cache_path(project_name: &str, branch: &str) -> PathBuf {
+    task_dir(project_name, branch).join("pr.json")
+}
+
 /// Metadata needed to recreate a tmux session after tmux dies.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionRecord {

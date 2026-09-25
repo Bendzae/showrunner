@@ -103,16 +103,11 @@ fn sync_hints(worker: &Worker, cfg: &Config) {
 }
 
 fn diff_json(d: &DiffStats) -> Value {
-    json!({ "added": d.added, "removed": d.removed })
+    d.to_json()
 }
 
 fn pr_json(p: &PrInfo) -> Value {
-    json!({
-        "url": p.url,
-        "state": p.state.as_str(),
-        "review": p.review.as_str(),
-        "checks": p.checks.map(|c| c.as_str()),
-    })
+    p.to_json()
 }
 
 fn session_json(s: &TmuxSession, u: &WorkerUpdate) -> Value {

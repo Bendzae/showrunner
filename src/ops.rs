@@ -438,3 +438,42 @@ pub fn restore_sessions(cfg: &Config) -> RestoreReport {
     }
     report
 }
+
+/// PR details for a task branch, from the on-disk cache when it is younger than
+/// `max_age`, else freshly from `gh` (and cached). Absence of a PR is cached
+/// too, so branches without one don't cost a `gh` call per listing.
+pub fn cached_pr_info(
+    project_name: &str,
+    project_path: &str,
+    branch: &str,
+    max_age: std::time::Duration,
+) -> Option<tmux::PrInfo> {
+    let path = config::pr_cache_path(project_name, branch);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if let Some(cached) = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        && cached["fetched_at"]
+            .as_u64()
+            .is_some_and(|t| now.saturating_sub(t) < max_age.as_secs())
+    {
+        return tmux::PrInfo::from_json(&cached["pr"]);
+    }
+
+    let info = tmux::get_pr_info(project_path, branch);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let entry = serde_json::json!({
+        "fetched_at": now,
+        "pr": info.as_ref().map(|i| i.to_json()),
+    });
+    let _ = std::fs::write(&path, entry.to_string());
+    if let Some(info) = &info {
+        let _ = std::fs::write(config::pr_url_path(project_name, branch), &info.url);
+    }
+    info
+}

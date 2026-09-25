@@ -27,7 +27,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{self, Config, Project, Remote, Task};
-use crate::tmux::{SessionStatus, TmuxSession};
+use crate::tmux::{DiffStats, PrInfo, SessionStatus, TmuxSession};
 
 /// Subcommands the peer may run here through the link.
 const LINK_ALLOWED: &[&str] = &["list", "ask", "send", "output", "task", "session"];
@@ -274,12 +274,19 @@ pub struct HostSnapshot {
     /// Keyed by `TmuxSession::key()`.
     pub statuses: HashMap<String, SessionStatus>,
     pub agents: HashMap<String, String>,
+    pub session_diffs: HashMap<String, DiffStats>,
+    pub session_branches: HashMap<String, String>,
+    /// Keyed by `<host>:<branch>`.
+    pub task_diffs: HashMap<String, DiffStats>,
+    pub prs: HashMap<String, PrInfo>,
+    /// Keyed by `<host>:<project name>`.
+    pub project_branches: HashMap<String, String>,
     pub error: Option<String>,
 }
 
 pub fn fetch_snapshot(host: &Host) -> HostSnapshot {
     // A ref prefix stops the host from listing *its* hosts in turn (us).
-    let args: Vec<String> = ["list", "--json", "--ref-prefix=-"]
+    let args: Vec<String> = ["list", "--json", "--stats", "--ref-prefix=-"]
         .iter()
         .map(|s| s.to_string())
         .collect();
@@ -319,7 +326,13 @@ fn snapshot_from_listing(
             snapshot.statuses.insert(key.clone(), status);
         }
         if let Some(agent) = v["agent"].as_str() {
-            snapshot.agents.insert(key, agent.to_string());
+            snapshot.agents.insert(key.clone(), agent.to_string());
+        }
+        if let Some(diff) = DiffStats::from_json(&v["diff"]) {
+            snapshot.session_diffs.insert(key.clone(), diff);
+        }
+        if let Some(branch) = v["branch"].as_str() {
+            snapshot.session_branches.insert(key, branch.to_string());
         }
         snapshot.sessions.push(session);
     };
@@ -344,6 +357,19 @@ fn snapshot_from_listing(
             for v in t["sessions"].as_array().into_iter().flatten() {
                 add_session(&mut snapshot, v);
             }
+            let branch_key = format!("{}:{}", snapshot.host, str_of(t, "branch"));
+            if let Some(diff) = DiffStats::from_json(&t["diff"]) {
+                snapshot.task_diffs.insert(branch_key.clone(), diff);
+            }
+            if let Some(pr) = PrInfo::from_json(&t["pr"]) {
+                snapshot.prs.insert(branch_key, pr);
+            }
+        }
+        if let Some(branch) = p["branch"].as_str() {
+            snapshot.project_branches.insert(
+                format!("{}:{}", snapshot.host, str_of(p, "name")),
+                branch.to_string(),
+            );
         }
         for v in p["adhoc_sessions"].as_array().into_iter().flatten() {
             add_session(&mut snapshot, v);
@@ -829,12 +855,16 @@ mod tests {
         let listing = serde_json::json!({
             "projects": [{
                 "name": "App", "path": "/home/ben/app",
+                "branch": "main",
                 "tasks": [{
                     "name": "Fix auth", "branch": "fix-auth", "base_branch": "main",
                     "archived": false, "group": "Auth",
+                    "diff": { "added": 12, "removed": 3 },
+                    "pr": { "url": "https://x/pr/7", "state": "open", "review": "approved", "checks": "passing" },
                     "sessions": [{
                         "ref": "-App/Fix-auth/main", "tmux_name": "cm__App__Fix-auth__main",
-                        "name": "main", "status": "waiting_input", "agent": "codex"
+                        "name": "main", "status": "waiting_input", "agent": "codex",
+                        "diff": { "added": 1, "removed": 0 }, "branch": "fix-auth"
                     }]
                 }],
                 "adhoc_sessions": [{
@@ -863,6 +893,32 @@ mod tests {
             Some("codex")
         );
         assert!(snap.error.is_none());
+        assert_eq!(snap.task_diffs["ec2:fix-auth"].added, 12);
+        assert_eq!(snap.prs["ec2:fix-auth"].url, "https://x/pr/7");
+        assert_eq!(snap.session_diffs["ec2:cm__App__Fix-auth__main"].added, 1);
+        assert_eq!(
+            snap.session_branches["ec2:cm__App__Fix-auth__main"],
+            "fix-auth"
+        );
+        assert_eq!(snap.project_branches["ec2:App"], "main");
+    }
+
+    #[test]
+    fn pr_info_round_trips_through_json() {
+        use crate::tmux::{CiStatus, PrReview, PrState};
+        let pr = PrInfo {
+            url: "https://x/pr/7".into(),
+            state: PrState::Draft,
+            review: PrReview::ChangesRequested,
+            checks: None,
+        };
+        assert_eq!(PrInfo::from_json(&pr.to_json()), Some(pr.clone()));
+        let with_checks = PrInfo {
+            checks: Some(CiStatus::Failing),
+            ..pr
+        };
+        assert_eq!(PrInfo::from_json(&with_checks.to_json()), Some(with_checks));
+        assert_eq!(PrInfo::from_json(&serde_json::Value::Null), None);
     }
 
     #[test]

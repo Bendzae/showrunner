@@ -2089,6 +2089,17 @@ pub struct DiffStats {
 }
 
 impl DiffStats {
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({ "added": self.added, "removed": self.removed })
+    }
+
+    pub fn from_json(v: &serde_json::Value) -> Option<Self> {
+        Some(DiffStats {
+            added: v["added"].as_u64()? as usize,
+            removed: v["removed"].as_u64()? as usize,
+        })
+    }
+
     pub fn is_empty(&self) -> bool {
         self.added == 0 && self.removed == 0
     }
@@ -2379,6 +2390,55 @@ pub struct PrInfo {
     pub review: PrReview,
     /// `None` when the PR has no status checks at all.
     pub checks: Option<CiStatus>,
+}
+
+impl PrInfo {
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "url": self.url,
+            "state": self.state.as_str(),
+            "review": self.review.as_str(),
+            "checks": self.checks.map(|c| c.as_str()),
+        })
+    }
+
+    /// Inverse of [`PrInfo::to_json`]; `None` for anything malformed.
+    pub fn from_json(v: &serde_json::Value) -> Option<Self> {
+        let parse_state = |s: &str| {
+            [
+                PrState::Open,
+                PrState::Draft,
+                PrState::Merged,
+                PrState::Closed,
+            ]
+            .into_iter()
+            .find(|st| st.as_str() == s)
+        };
+        let parse_review = |s: &str| {
+            [
+                PrReview::Approved,
+                PrReview::ChangesRequested,
+                PrReview::Requested,
+                PrReview::NotRequested,
+            ]
+            .into_iter()
+            .find(|r| r.as_str() == s)
+        };
+        let parse_checks = |s: &str| {
+            [CiStatus::Passing, CiStatus::Failing, CiStatus::Pending]
+                .into_iter()
+                .find(|c| c.as_str() == s)
+        };
+        Some(PrInfo {
+            url: v["url"].as_str()?.to_string(),
+            state: parse_state(v["state"].as_str()?)?,
+            review: parse_review(v["review"].as_str()?)?,
+            checks: match v["checks"].as_str() {
+                Some(s) => Some(parse_checks(s)?),
+                None => None,
+            },
+        })
+    }
 }
 
 /// Get PR details for a branch using the `gh` CLI.

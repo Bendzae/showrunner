@@ -27,7 +27,7 @@ Usage:
                                                     this machine (the TUI does this)
 
 Managing tasks and sessions (usable from inside a session):
-  showrunner list [--json] [--project <name>]
+  showrunner list [--json] [--project <name>] [--stats]
   showrunner task create <project> <name> [--branch <b>] [--base <b>]
                                            [--group <g>] [--prompt <text>]
                                            [--agent claude|codex|pi]
@@ -323,10 +323,13 @@ fn sample_statuses(sessions: &[TmuxSession]) -> HashMap<String, SessionStatus> {
 }
 
 fn cmd_list(args: &[String]) -> Result<()> {
-    let (positional, flags) = parse_args(args, &["project", "ref-prefix"], &["json"])?;
+    let (positional, flags) = parse_args(args, &["project", "ref-prefix"], &["json", "stats"])?;
     if let Some(extra) = positional.first() {
         bail!("unexpected argument '{extra}' (usage: list [--json] [--project <name>])");
     }
+    // `--stats` adds what the TUI's worker computes locally — diff churn,
+    // branches, PR details — so another host can show this one at parity.
+    let stats = flags.contains_key("stats");
 
     let cfg = Config::load()?;
     let sessions = tmux::list_sessions().unwrap_or_default();
@@ -361,14 +364,21 @@ fn cmd_list(args: &[String]) -> Result<()> {
     }
 
     let session_value = |s: &TmuxSession| {
-        json!({
+        let mut v = json!({
             "ref": session_ref(s),
             "tmux_name": s.name,
             "name": s.session_name,
             "status": statuses.get(&s.name).map(|st| st.as_str()),
             "agent": tmux::session_agent(&s.name).id(),
             "current": current.as_deref() == Some(s.name.as_str()),
-        })
+        });
+        if stats {
+            v["diff"] = tmux::get_diff_stats(&s.name)
+                .map(|d| d.to_json())
+                .unwrap_or(Value::Null);
+            v["branch"] = json!(tmux::get_session_branch(&s.name));
+        }
+        v
     };
 
     if flags.contains_key("json") {
@@ -380,7 +390,7 @@ fn cmd_list(args: &[String]) -> Result<()> {
                     .tasks_ordered()
                     .into_iter()
                     .map(|t| {
-                        json!({
+                        let mut v = json!({
                             "name": t.name,
                             "branch": t.branch,
                             "base_branch": t.base_branch(),
@@ -393,10 +403,24 @@ fn cmd_list(args: &[String]) -> Result<()> {
                                 .iter()
                                 .map(session_value)
                                 .collect::<Vec<_>>(),
-                        })
+                        });
+                        if stats && !t.archived {
+                            v["diff"] = tmux::get_branch_diff(&p.path, &t.branch, t.base_branch())
+                                .map(|d| d.to_json())
+                                .unwrap_or(Value::Null);
+                            v["pr"] = ops::cached_pr_info(
+                                &p.name,
+                                &p.path,
+                                &t.branch,
+                                Duration::from_secs(60),
+                            )
+                            .map(|pr| pr.to_json())
+                            .unwrap_or(Value::Null);
+                        }
+                        v
                     })
                     .collect();
-                json!({
+                let mut v = json!({
                     "name": p.name,
                     "path": p.path,
                     "tasks": tasks,
@@ -404,7 +428,11 @@ fn cmd_list(args: &[String]) -> Result<()> {
                         .iter()
                         .map(session_value)
                         .collect::<Vec<_>>(),
-                })
+                });
+                if stats {
+                    v["branch"] = json!(tmux::current_branch(&p.path));
+                }
+                v
             })
             .collect();
         let mut out = json!({ "projects": projects });
