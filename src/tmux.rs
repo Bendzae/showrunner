@@ -628,10 +628,23 @@ fn worktree_for_branch(project_path: &str, branch: &str) -> Option<String> {
 
 /// Kill a session and remove its worktree, keeping its branch — the branch
 /// lives on elsewhere (a session moved to another machine).
-pub fn remove_session_keep_branch(name: &str, project_path: &str, worktree_path: &str) {
-    let _ = Command::new("tmux")
-        .args(["kill-session", "-t", name])
-        .output();
+///
+/// With `from_inside` the caller runs *in* that session and dies with it, so
+/// the tmux kill comes last, after the worktree is gone.
+pub fn remove_session_keep_branch(
+    name: &str,
+    project_path: &str,
+    worktree_path: &str,
+    from_inside: bool,
+) {
+    let kill = || {
+        let _ = Command::new("tmux")
+            .args(["kill-session", "-t", name])
+            .output();
+    };
+    if !from_inside {
+        kill();
+    }
     if Path::new(worktree_path).exists() {
         let _ = Command::new("git")
             .args([
@@ -647,6 +660,9 @@ pub fn remove_session_keep_branch(name: &str, project_path: &str, worktree_path:
     let _ = Command::new("git")
         .args(["-C", project_path, "worktree", "prune"])
         .output();
+    if from_inside {
+        kill();
+    }
 }
 
 /// Create an adhoc session: tmux session running Claude in the project directory

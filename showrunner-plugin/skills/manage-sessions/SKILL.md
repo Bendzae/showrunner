@@ -36,12 +36,18 @@ retrying in a loop.
 A session can be moved to another host and back:
 
 ```
-showrunner session move <session> --to <host>     # e.g. --to ec2, or --to local from a prefixed ref
+showrunner session move <session> --to <host> [--note "<handoff>"]   # e.g. --to ec2, or --to local from a prefixed ref
 ```
 
 This asks that session's agent for a handoff note, commits and pushes its branch, recreates it on
 the destination with the note as its first prompt, and removes it here (branch kept). Only move
 sessions the user asked you to move.
+
+**Moving your own session** (the user asks you to continue on the other machine): nobody can ask
+you for a note while you run the command, so write it yourself with `--note` — goal, what is done,
+what is in progress, next steps. Say goodbye to the user *before* running it: the command ends
+this session as its last step, so nothing you print afterwards is seen. Uncommitted changes are
+committed and pushed for you.
 
 ## Viewing
 

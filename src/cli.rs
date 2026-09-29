@@ -3,6 +3,7 @@
 //! session a question.
 
 use std::collections::HashMap;
+use std::io::Write as _;
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -37,7 +38,7 @@ Managing tasks and sessions (usable from inside a session):
   showrunner session create <project> <task> [--prompt <text>] [--no-worktree]
                                               [--agent claude|codex|pi]
   showrunner session kill <session> --yes
-  showrunner session move <session> --to <host|local> [--no-handoff]
+  showrunner session move <session> --to <host|local> [--note <text>] [--no-handoff]
 
 Housekeeping:
   showrunner restore                            recreate saved sessions that
@@ -701,9 +702,11 @@ pushed for you — don't change anything further.";
 /// Move a session to another machine: collect a handoff note, commit and push
 /// its branch, recreate it on the destination, then remove it here.
 fn cmd_session_move(args: &[String]) -> Result<()> {
-    let (positional, flags) = parse_args(args, &["to"], &["no-handoff"])?;
+    let (positional, flags) = parse_args(args, &["to", "note"], &["no-handoff"])?;
     let ([reference], Some(to)) = (positional.as_slice(), flags.get("to")) else {
-        bail!("usage: session move <session> --to <host|local> [--no-handoff]");
+        bail!(
+            "usage: session move <session> --to <host|local> [--note <handoff text>] [--no-handoff]"
+        );
     };
 
     let cfg = Config::load()?;
@@ -714,7 +717,19 @@ fn cmd_session_move(args: &[String]) -> Result<()> {
     }
     let arg = |items: &[&str]| -> Vec<String> { items.iter().map(|s| s.to_string()).collect() };
 
-    let note = if flags.contains_key("no-handoff") {
+    // An agent moving its own session can't be asked for a note (it is busy
+    // running this command) and dies with the session at the end.
+    let moving_self = matches!(source, remote::Target::Local)
+        && resolve_recorded_session(&source_ref)
+            .ok()
+            .is_some_and(|name| current_session_name().as_deref() == Some(name.as_str()));
+
+    let note = if let Some(note) = flags.get("note") {
+        Some(note.clone())
+    } else if flags.contains_key("no-handoff") {
+        None
+    } else if moving_self {
+        eprintln!("moving this session itself: pass --note to hand over context (none given)");
         None
     } else {
         eprintln!("asking {reference} for a handoff note…");
@@ -757,7 +772,6 @@ fn cmd_session_move(args: &[String]) -> Result<()> {
         &prompt,
     ]))?;
 
-    source.output(&arg(&["session", "release", &source_ref, "--yes"]))?;
     let created_ref = created
         .trim()
         .strip_prefix("created session: ")
@@ -766,7 +780,17 @@ fn cmd_session_move(args: &[String]) -> Result<()> {
         remote::Target::Local => String::new(),
         remote::Target::Host(h) => format!("{}:", h.name()),
     };
-    println!("moved {reference} → {dest_prefix}{created_ref}");
+    if moving_self {
+        // Releasing kills the tmux session we run in: report before, not after.
+        println!(
+            "moved {reference} → {dest_prefix}{created_ref}; this session ends now — continue there"
+        );
+        let _ = std::io::stdout().flush();
+    }
+    source.output(&arg(&["session", "release", &source_ref, "--yes"]))?;
+    if !moving_self {
+        println!("moved {reference} → {dest_prefix}{created_ref}");
+    }
     Ok(())
 }
 
@@ -843,11 +867,16 @@ fn cmd_session_release(args: &[String]) -> Result<()> {
         bail!("usage: session release <session> --yes");
     };
     let tmux_name = resolve_recorded_session(reference)?;
-    if current_session_name().as_deref() == Some(tmux_name.as_str()) {
-        bail!("that is this session");
+    // Releasing the session we run in ends this process too — say so first.
+    let from_inside = current_session_name().as_deref() == Some(tmux_name.as_str());
+    if from_inside {
+        println!("released session: {reference} (this one — ending now)");
+        let _ = std::io::stdout().flush();
     }
-    ops::release_session(&tmux_name)?;
-    println!("released session: {reference}");
+    ops::release_session(&tmux_name, from_inside)?;
+    if !from_inside {
+        println!("released session: {reference}");
+    }
     Ok(())
 }
 

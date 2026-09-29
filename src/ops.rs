@@ -355,7 +355,10 @@ pub fn import_session(cfg: &Config, export: &SessionExport, prompt: &str) -> Res
 /// Drop a session that now lives on another machine: kill it and remove its
 /// worktree and record, but keep the branch (origin has it; a later move back
 /// fast-forwards it).
-pub fn release_session(tmux_name: &str) -> Result<()> {
+///
+/// `from_inside`: the caller runs in that very session (an agent moving
+/// itself) — the record and worktree go first, the tmux kill last.
+pub fn release_session(tmux_name: &str, from_inside: bool) -> Result<()> {
     let record = config::load_sessions()
         .remove(tmux_name)
         .ok_or_else(|| anyhow::anyhow!("no session record for {tmux_name}"))?;
@@ -366,8 +369,13 @@ pub fn release_session(tmux_name: &str) -> Result<()> {
     )
     .to_string_lossy()
     .to_string();
-    tmux::remove_session_keep_branch(tmux_name, &record.project_path, &worktree);
-    config::remove_session_record(tmux_name);
+    if from_inside {
+        config::remove_session_record(tmux_name);
+    }
+    tmux::remove_session_keep_branch(tmux_name, &record.project_path, &worktree, from_inside);
+    if !from_inside {
+        config::remove_session_record(tmux_name);
+    }
     Ok(())
 }
 
