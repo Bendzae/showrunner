@@ -32,8 +32,11 @@ Managing tasks and sessions (usable from inside a session):
   showrunner task create <project> <name> [--branch <b>] [--base <b>]
                                            [--group <g>] [--prompt <text>]
                                            [--agent claude|codex|pi]
+                                           [--linear <url|id>]
   showrunner task set-base <project> <task> <branch>   ('main' resets)
   showrunner task set-group <project> <task> [<group>]  (omit to ungroup)
+  showrunner task set-linear <project> <task> [<url|id>] (omit to unlink;
+                                                    ids need linear_workspace)
   showrunner task delete <project> <task> --yes
   showrunner session create <project> <task> [--prompt <text>] [--no-worktree]
                                               [--agent claude|codex|pi]
@@ -397,6 +400,7 @@ fn cmd_list(args: &[String]) -> Result<()> {
                             "base_branch": t.base_branch(),
                             "archived": t.archived,
                             "group": t.group,
+                            "linear": t.linear,
                             "stack": stacks.get(&t.branch).map(|(pos, total)| {
                                 json!({ "position": pos, "size": total })
                             }),
@@ -494,8 +498,13 @@ fn cmd_list(args: &[String]) -> Result<()> {
                 .get(&task.branch)
                 .map(|(pos, total)| format!("  stack={pos}/{total}"))
                 .unwrap_or_default();
+            let linear = task
+                .linear
+                .as_deref()
+                .map(|url| format!("  linear={url}"))
+                .unwrap_or_default();
             println!(
-                "  task {}  branch={} base={}{group}{stack}{archived}",
+                "  task {}  branch={} base={}{group}{stack}{linear}{archived}",
                 task.name,
                 task.branch,
                 task.base_branch()
@@ -546,30 +555,42 @@ fn cmd_task(args: &[String]) -> Result<()> {
         Some("create") => cmd_task_create(&args[1..]),
         Some("set-base") => cmd_task_set_base(&args[1..]),
         Some("set-group") => cmd_task_set_group(&args[1..]),
+        Some("set-linear") => cmd_task_set_linear(&args[1..]),
         Some("delete") => cmd_task_delete(&args[1..]),
         Some(other) => {
-            bail!("unknown task command '{other}' (expected create, set-base, set-group or delete)")
+            bail!(
+                "unknown task command '{other}' (expected create, set-base, set-group, \
+                 set-linear or delete)"
+            )
         }
         None => bail!(
             "usage: task create <project> <name> | task set-base <project> <task> <branch> | \
-             task set-group <project> <task> [<group>] | task delete <project> <task> --yes"
+             task set-group <project> <task> [<group>] | \
+             task set-linear <project> <task> [<url|id>] | task delete <project> <task> --yes"
         ),
     }
 }
 
 fn cmd_task_create(args: &[String]) -> Result<()> {
-    let (positional, flags) =
-        parse_args(args, &["branch", "base", "group", "prompt", "agent"], &[])?;
+    let (positional, flags) = parse_args(
+        args,
+        &["branch", "base", "group", "prompt", "agent", "linear"],
+        &[],
+    )?;
     let [project_name, task_name] = positional.as_slice() else {
         bail!(
             "usage: task create <project> <name> [--branch <b>] [--base <b>] [--group <g>] \
-             [--prompt <text>] [--agent <id>]"
+             [--prompt <text>] [--agent <id>] [--linear <url|id>]"
         );
     };
 
     let cfg = Config::load()?;
     let project = ops::find_project(&cfg, project_name)?;
     let agent = ops::resolve_agent(&cfg, flags.get("agent").map(String::as_str))?;
+    let linear = flags
+        .get("linear")
+        .map(|r| config::linear_ticket_url(r, cfg.linear_workspace.as_deref()))
+        .transpose()?;
     let base = flags.get("base").map(String::as_str);
     let (branch, tmux_name) = ops::create_task(
         &cfg,
@@ -584,6 +605,10 @@ fn cmd_task_create(args: &[String]) -> Result<()> {
             .filter(|p| !p.trim().is_empty()),
         agent,
     )?;
+    if linear.is_some() {
+        let (project_name, task_name) = (project_name.clone(), task_name.trim().to_string());
+        Config::modify(move |c| c.set_task_linear(&project_name, &task_name, linear))?;
+    }
 
     let session = TmuxSession::from_tmux_name(&tmux_name)
         .map(|s| session_ref(&s))
@@ -655,6 +680,38 @@ fn cmd_task_set_group(args: &[String]) -> Result<()> {
     match group_for_msg {
         Some(g) => println!("'{task_for_msg}' moved to group '{g}'"),
         None => println!("'{task_for_msg}' removed from its group"),
+    }
+    Ok(())
+}
+
+fn cmd_task_set_linear(args: &[String]) -> Result<()> {
+    let (positional, _) = parse_args(args, &[], &[])?;
+    let (project_name, task_name, reference) = match positional.as_slice() {
+        [project_name, task_name] => (project_name, task_name, None),
+        [project_name, task_name, reference] => (project_name, task_name, Some(reference)),
+        _ => bail!(
+            "usage: task set-linear <project> <task> [<url|id>]   (omit the ticket to unlink)"
+        ),
+    };
+
+    let cfg = Config::load()?;
+    let project = ops::find_project(&cfg, project_name)?;
+    if !project.tasks.iter().any(|t| t.name == *task_name) {
+        bail!("task '{task_name}' not found in project '{project_name}'");
+    }
+
+    let url = reference
+        .map(|r| config::linear_ticket_url(r, cfg.linear_workspace.as_deref()))
+        .transpose()?;
+    let (project_name, task_name) = (project_name.clone(), task_name.clone());
+    let task_for_msg = task_name.clone();
+    let url_for_msg = url.clone();
+    Config::modify(move |c| {
+        c.set_task_linear(&project_name, &task_name, url);
+    })?;
+    match url_for_msg {
+        Some(url) => println!("'{task_for_msg}' linked to {url}"),
+        None => println!("'{task_for_msg}' unlinked from Linear"),
     }
     Ok(())
 }

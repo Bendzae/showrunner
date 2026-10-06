@@ -137,6 +137,7 @@ Run sessions are independent per item, so running on a different item starts a s
 | `P` | Push branch | `push` |
 | `b` | Checkout branch in project dir | `checkout` |
 | `o` | Open/create PR | `open_pr` |
+| `l` | Open linked Linear ticket | `open_linear` |
 | `g` | Set group (fuzzy picker over existing groups; type a new name to create one) | `group` |
 | `A` | Archive | `archive` |
 | `d` | Delete | `delete` |
@@ -192,6 +193,21 @@ Tasks with a pull request (found via `gh`) show it in the `PR` column as `#123` 
 | `●` green / `●` red / `◍` yellow | CI: all checks passed / a check failed / checks still running (omitted when the PR has no checks) |
 
 Merged and closed PRs show only their state, since review and CI no longer apply.
+
+### Linear Tickets
+
+A task can be linked to a Linear ticket; its id (`ENG-123`) shows next to the task name and `l` opens it. Linking is done through the CLI — the task's main session agent links a ticket itself when the task's name, branch or prompt refers to one:
+
+```sh
+showrunner task set-linear <project> <task> https://linear.app/acme/issue/ENG-123
+showrunner task set-linear <project> <task> ENG-123   # needs linear_workspace
+showrunner task create <project> <name> --linear ENG-123
+```
+
+```toml
+# ~/.showrunner/config.toml — lets bare ids like ENG-123 be linked
+linear_workspace = "acme"
+```
 
 ### Worktrees
 

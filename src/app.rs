@@ -115,6 +115,7 @@ pub enum ContextAction {
     Update,
     Push,
     OpenPr,
+    OpenLinear,
     Checkout,
     CopyWorktreePath,
     SetBaseBranch,
@@ -1452,7 +1453,14 @@ impl App {
                     label: "Delete",
                     action: ContextAction::Delete,
                 },
-            ],
+            ]
+            .into_iter()
+            .chain(task.linear.is_some().then_some(ContextMenuItem {
+                key: cm.open_linear,
+                label: "Open Linear ticket",
+                action: ContextAction::OpenLinear,
+            }))
+            .collect(),
             Some(ListItem::Session { session, .. }) => {
                 let mut items = vec![
                     ContextMenuItem {
@@ -1647,6 +1655,13 @@ impl App {
                             action: ContextAction::SetGroup,
                         },
                     ];
+                    if task.linear.is_some() {
+                        items.push(ContextMenuItem {
+                            key: cm.open_linear,
+                            label: "Open Linear ticket",
+                            action: ContextAction::OpenLinear,
+                        });
+                    }
                     if remote_name.is_some() {
                         items.push(ContextMenuItem {
                             key: cm.move_session,
@@ -1752,6 +1767,7 @@ impl App {
             ContextAction::Update => self.update_session(),
             ContextAction::Push => self.push_task_branch(),
             ContextAction::OpenPr => self.open_pr(),
+            ContextAction::OpenLinear => self.open_linear(),
             ContextAction::Checkout => self.checkout_task_branch(),
             ContextAction::CopyWorktreePath => self.copy_worktree_path(),
             ContextAction::SetBaseBranch => self.start_set_base_branch(),
@@ -3876,6 +3892,14 @@ impl App {
                 self.input_mode = InputMode::ConfirmCreatePr;
                 self.status_message = Some("No PR found. Create one? (y/n)".into());
             }
+        }
+    }
+
+    pub fn open_linear(&mut self) {
+        if let Some(ListItem::Task { task, .. }) = self.selected_item()
+            && let Some(url) = &task.linear
+        {
+            open_url(url);
         }
     }
 

@@ -96,6 +96,7 @@ showrunner output <session> --lines 200   # what's currently on that session's s
 showrunner task create <project> <name> [--branch <b>] [--base <b>] [--group <g>] [--prompt "<initial task>"]
 showrunner task set-base <project> <task> <branch>
 showrunner task set-group <project> <task> [<group>]
+showrunner task set-linear <project> <task> [<url|id>]
 showrunner session create <project> <task> [--prompt "<initial task>"] [--no-worktree]
 ```
 
@@ -108,6 +109,11 @@ showrunner session create <project> <task> [--prompt "<initial task>"] [--no-wor
 - `--group <name>` lists the task under a named group in the TUI, together with every other task in
   the project carrying that group. Use it when fanning work out into several related tasks so they
   sit together. `task set-group` changes it later (omit the group to ungroup).
+- `--linear <url|id>` links the task to a Linear ticket, shown on the task in the TUI and opened
+  from it. Pass the issue URL, or a bare id like `ENG-123` when `linear_workspace` is set in
+  `config.toml`. Link one when the task's name, branch or prompt clearly refers to a ticket (Linear
+  branch names look like `user/eng-123-title`); don't guess. `task set-linear` links it later
+  (omit the ticket to unlink); `list` shows it as `linear=<url>`.
 - `session create` adds a parallel session to an existing task, on its own `<task-branch>-<n>`
   branch in its own worktree. Use it to fan out independent work within the same task.
 - `--prompt` is the agent's first instruction. Make it self-contained: a new session starts with no

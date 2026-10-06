@@ -9,7 +9,7 @@ use ratatui::widgets::{
 };
 
 use crate::app::{self, App, InputMode};
-use crate::config::Task;
+use crate::config::{Task, linear_ticket_id};
 use crate::theme::current;
 use crate::tmux::{self, CiStatus, PrInfo, PrReview, PrState, SessionStatus};
 
@@ -988,6 +988,14 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
                     left.push(Span::styled(
                         format!("  ⧉ {pos}/{total}"),
                         Style::default().fg(current().cyan),
+                    ));
+                }
+
+                if let Some(url) = &task.linear {
+                    let id = linear_ticket_id(url).unwrap_or("Linear");
+                    left.push(Span::styled(
+                        format!("  {id}"),
+                        Style::default().fg(current().accent),
                     ));
                 }
 

@@ -55,6 +55,9 @@ fn cm_checkout() -> char {
 fn cm_open_pr() -> char {
     'o'
 }
+fn cm_open_linear() -> char {
+    'l'
+}
 fn cm_delete() -> char {
     'd'
 }
@@ -151,6 +154,9 @@ pub struct ContextMenuKeyBindings {
     /// Open PR (default: o)
     #[serde(default = "cm_open_pr")]
     pub open_pr: char,
+    /// Open the task's linked Linear ticket (default: l)
+    #[serde(default = "cm_open_linear")]
+    pub open_linear: char,
     /// Delete item (default: d)
     #[serde(default = "cm_delete")]
     pub delete: char,
@@ -206,6 +212,7 @@ impl Default for ContextMenuKeyBindings {
             push: cm_push(),
             checkout: cm_checkout(),
             open_pr: cm_open_pr(),
+            open_linear: cm_open_linear(),
             delete: cm_delete(),
             merge: cm_merge(),
             copy_path: cm_copy_path(),
@@ -323,6 +330,9 @@ pub struct Task {
     /// collapsible group header.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
+    /// URL of the Linear ticket this task works on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linear: Option<String>,
 }
 
 impl Task {
@@ -617,6 +627,41 @@ pub fn normalize_group(raw: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
+/// Resolve a Linear ticket reference — an issue URL, or a bare id such as
+/// `ENG-123` (needs `workspace`) — to the issue URL.
+pub fn linear_ticket_url(reference: &str, workspace: Option<&str>) -> Result<String> {
+    let reference = reference.trim();
+    if reference.starts_with("https://linear.app/") {
+        return Ok(reference.trim_end_matches('/').to_string());
+    }
+    let is_ticket_id = reference.split_once('-').is_some_and(|(team, number)| {
+        team.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+            && team.chars().all(|c| c.is_ascii_alphanumeric())
+            && !number.is_empty()
+            && number.chars().all(|c| c.is_ascii_digit())
+    });
+    if !is_ticket_id {
+        anyhow::bail!(
+            "'{reference}' is neither a Linear issue URL (https://linear.app/…) nor a ticket id like ENG-123"
+        );
+    }
+    let workspace = workspace.map(str::trim).filter(|w| !w.is_empty()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "linking a bare ticket id needs `linear_workspace = \"<slug>\"` in config.toml; pass the issue URL instead"
+        )
+    })?;
+    Ok(format!(
+        "https://linear.app/{workspace}/issue/{}",
+        reference.to_ascii_uppercase()
+    ))
+}
+
+/// The ticket id (`ENG-123`) in a Linear issue URL.
+pub fn linear_ticket_id(url: &str) -> Option<&str> {
+    let (_, rest) = url.split_once("/issue/")?;
+    rest.split('/').next().filter(|id| !id.is_empty())
+}
+
 /// Which diff review tool the review action launches.
 ///
 /// - `Hunk` (default) — a terminal diff viewer ([modem-dev/hunk]) run in the
@@ -678,6 +723,10 @@ pub struct Config {
     /// Optional remote host whose sessions are addressed as `<name>:<ref>`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote: Option<Remote>,
+    /// Linear workspace slug (`linear.app/<slug>/…`), letting a bare ticket id
+    /// like `ENG-123` be linked to a task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linear_workspace: Option<String>,
     #[serde(default)]
     pub projects: Vec<Project>,
     /// Startup skills/commands to run before the initial prompt (e.g. ["/prime", "/caveman ultra"])
@@ -1010,6 +1059,7 @@ impl Config {
                     base_branch: None,
                     archived: false,
                     group: None,
+                    linear: None,
                 });
                 return true;
             }
@@ -1053,6 +1103,17 @@ impl Config {
             .and_then(|p| p.tasks.iter_mut().find(|t| t.name == task_name))
         {
             task.group = group.as_deref().and_then(normalize_group);
+        }
+    }
+
+    pub fn set_task_linear(&mut self, project_name: &str, task_name: &str, url: Option<String>) {
+        if let Some(task) = self
+            .projects
+            .iter_mut()
+            .find(|p| p.name == project_name)
+            .and_then(|p| p.tasks.iter_mut().find(|t| t.name == task_name))
+        {
+            task.linear = url;
         }
     }
 
@@ -1179,6 +1240,7 @@ mod tests {
             base_branch: base.map(str::to_string),
             archived: false,
             group: None,
+            linear: None,
         }
     }
 
@@ -1375,6 +1437,21 @@ mod tests {
         assert!(project.move_task("b", true));
         assert_eq!(names(&project), vec!["b", "a", "hidden"]);
         assert!(!project.move_task("hidden", false));
+    }
+
+    #[test]
+    fn linear_ticket_url_accepts_urls_and_ids_with_a_workspace() {
+        let url = "https://linear.app/acme/issue/ENG-123/fix-login";
+        assert_eq!(linear_ticket_url(url, None).unwrap(), url);
+        assert_eq!(
+            linear_ticket_url(" eng-42 ", Some("acme")).unwrap(),
+            "https://linear.app/acme/issue/ENG-42"
+        );
+        assert!(linear_ticket_url("ENG-42", None).is_err());
+        assert!(linear_ticket_url("not a ticket", Some("acme")).is_err());
+        assert!(linear_ticket_url("ENG-", Some("acme")).is_err());
+        assert_eq!(linear_ticket_id(url), Some("ENG-123"));
+        assert_eq!(linear_ticket_id("https://linear.app/acme"), None);
     }
 
     #[test]

@@ -351,6 +351,7 @@ fn snapshot_from_listing(
                     .map(str::to_string),
                 archived: t["archived"].as_bool().unwrap_or(false),
                 group: t["group"].as_str().map(str::to_string),
+                linear: t["linear"].as_str().map(str::to_string),
             })
             .collect();
         for t in p["tasks"].as_array().into_iter().flatten() {

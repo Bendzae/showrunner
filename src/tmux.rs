@@ -1457,6 +1457,13 @@ fn build_base_system_prompt(
          sessions, and ask an agent in another session a question — see the\n  \
          `manage-sessions` skill"
     ));
+    if is_main {
+        prompt.push_str(
+            "\n- If the task's name, branch or your prompt points to a Linear ticket and\n  \
+             `showrunner list` shows none linked to this task, link it with\n  \
+             `showrunner task set-linear`",
+        );
+    }
     if worktree_branch.is_some() {
         prompt.push_str("\n- NEVER push the worktree branch unless explicitly told to do so");
     }
