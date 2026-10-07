@@ -147,6 +147,8 @@ pub enum ContextAction {
     Ungroup,
     /// Move the selected session (or a task's main session) to the other machine.
     MoveSession,
+    /// Turn Remote Control on or off for the selected Claude session.
+    RemoteControl,
 }
 
 enum MoveTarget {
@@ -154,6 +156,24 @@ enum MoveTarget {
     Group(String),
     /// A project, identified by its path.
     Project(String),
+}
+
+/// The Remote Control toggle for a local session, labelled by its current
+/// state; `None` for sessions not running Claude.
+fn remote_control_menu_item(
+    cm: &config::ContextMenuKeyBindings,
+    session: &TmuxSession,
+) -> Option<ContextMenuItem> {
+    let record = config::load_sessions().remove(&session.name)?;
+    (record.agent_kind() == AgentKind::Claude).then_some(ContextMenuItem {
+        key: cm.remote_control,
+        label: if record.remote_control {
+            "Disable Remote Control"
+        } else {
+            "Enable Remote Control"
+        },
+        action: ContextAction::RemoteControl,
+    })
 }
 
 /// Picker entry offered to remove a task from its group.
@@ -1473,6 +1493,11 @@ impl App {
                         label: "Move session here",
                         action: ContextAction::MoveSession,
                     },
+                    ContextMenuItem {
+                        key: cm.remote_control,
+                        label: "Toggle Remote Control",
+                        action: ContextAction::RemoteControl,
+                    },
                 ];
                 if !tmux::is_main_session(&session.session_name) {
                     items.push(ContextMenuItem {
@@ -1483,11 +1508,18 @@ impl App {
                 }
                 items
             }
-            Some(ListItem::AdhocSession { .. }) => vec![ContextMenuItem {
-                key: cm.delete,
-                label: "Delete",
-                action: ContextAction::Delete,
-            }],
+            Some(ListItem::AdhocSession { .. }) => vec![
+                ContextMenuItem {
+                    key: cm.remote_control,
+                    label: "Toggle Remote Control",
+                    action: ContextAction::RemoteControl,
+                },
+                ContextMenuItem {
+                    key: cm.delete,
+                    label: "Delete",
+                    action: ContextAction::Delete,
+                },
+            ],
             _ => Vec::new(),
         }
     }
@@ -1571,18 +1603,20 @@ impl App {
                     action: ContextAction::Ungroup,
                 },
             ],
-            Some(ListItem::AdhocSession { .. }) => vec![
-                ContextMenuItem {
+            Some(ListItem::AdhocSession { session, .. }) => {
+                let mut items = vec![ContextMenuItem {
                     key: cm.run,
                     label: "Run",
                     action: ContextAction::Run,
-                },
-                ContextMenuItem {
+                }];
+                items.extend(remote_control_menu_item(&cm, session));
+                items.push(ContextMenuItem {
                     key: cm.delete,
                     label: "Delete",
                     action: ContextAction::Delete,
-                },
-            ],
+                });
+                items
+            }
             Some(ListItem::Task { task, .. }) => {
                 if task.archived {
                     vec![
@@ -1724,6 +1758,7 @@ impl App {
                         action: ContextAction::CopyWorktreePath,
                     },
                 ]);
+                items.extend(remote_control_menu_item(&cm, session));
                 if remote_name.is_some() {
                     items.push(ContextMenuItem {
                         key: cm.move_session,
@@ -1787,7 +1822,35 @@ impl App {
             ContextAction::RenameGroup => self.start_rename_group(),
             ContextAction::Ungroup => self.ungroup_selected(),
             ContextAction::MoveSession => self.move_session(),
+            ContextAction::RemoteControl => self.toggle_remote_control(),
         }
+    }
+
+    /// Toggle Remote Control on the selected session through the CLI, which
+    /// also reaches sessions on another host.
+    fn toggle_remote_control(&mut self) {
+        let session = match self.selected_item() {
+            Some(ListItem::Session { session, .. } | ListItem::AdhocSession { session, .. }) => {
+                session.clone()
+            }
+            _ => return,
+        };
+        let reference = session.reference();
+        self.start_op("Toggling Remote Control...", move || {
+            let args: Vec<String> = ["session", "remote-control", &reference]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            let message = match Target::Local.output(&args) {
+                Ok(out) => out.trim().to_string(),
+                Err(e) => format!("Remote Control failed: {e}"),
+            };
+            OpResult {
+                message,
+                rebuild: false,
+                reload_config: false,
+            }
+        })
     }
 
     /// Move the selected session (a task's main session when a task is
@@ -2927,6 +2990,7 @@ impl App {
                             use_worktree,
                             archived: false,
                             agent: agent.id().to_string(),
+                            remote_control: false,
                         },
                     );
                     let task_msg = if branch_exists {
@@ -3017,6 +3081,7 @@ impl App {
                             use_worktree: false,
                             archived: false,
                             agent: agent.id().to_string(),
+                            remote_control: false,
                         },
                     );
                     OpResult {
@@ -3191,6 +3256,7 @@ impl App {
                             use_worktree,
                             archived: false,
                             agent: agent.id().to_string(),
+                            remote_control: false,
                         },
                     );
                     OpResult {

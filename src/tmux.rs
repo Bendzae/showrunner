@@ -480,6 +480,7 @@ pub fn create_session_with(
         Some(&system_prompt),
         build_initial_prompt(startup_skills, initial_prompt, agent).as_deref(),
         false,
+        None,
     );
 
     let agent_cmd = with_server_path(agent_cmd);
@@ -683,6 +684,7 @@ pub fn create_adhoc_session(
         None,
         build_initial_prompt(startup_skills, None, agent).as_deref(),
         false,
+        None,
     );
 
     let output = Command::new("tmux")
@@ -724,7 +726,17 @@ pub fn recreate_adhoc_session(
     let agent = record.agent_kind();
     ensure_agent_installed(agent)?;
     let resume = has_resumable_session(agent, &record.project_path);
-    let agent_cmd = build_agent_command(agent, &record.project_path, None, None, resume);
+    let rc_name = record
+        .remote_control
+        .then(|| remote_control_name(&record.project_name, ADHOC_MARKER, &record.session_name));
+    let agent_cmd = build_agent_command(
+        agent,
+        &record.project_path,
+        None,
+        None,
+        resume,
+        rc_name.as_deref(),
+    );
 
     let output = Command::new("tmux")
         .args([
@@ -857,7 +869,21 @@ pub fn recreate_session(tmux_name: &str, record: &crate::config::SessionRecord) 
     );
 
     let resume = has_resumable_session(agent, &work_dir);
-    let agent_cmd = build_agent_command(agent, &work_dir, Some(&system_prompt), None, resume);
+    let rc_name = record.remote_control.then(|| {
+        remote_control_name(
+            &record.project_name,
+            &record.task_name,
+            &record.session_name,
+        )
+    });
+    let agent_cmd = build_agent_command(
+        agent,
+        &work_dir,
+        Some(&system_prompt),
+        None,
+        resume,
+        rc_name.as_deref(),
+    );
 
     let output = Command::new("tmux")
         .args([
@@ -1197,6 +1223,46 @@ pub fn session_agent(session_name: &str) -> AgentKind {
         .unwrap_or_default()
 }
 
+/// The Remote Control session name, `<machine> · <project> / <task>[ / <session>]`.
+pub fn remote_control_name(project_name: &str, task_name: &str, session_name: &str) -> String {
+    let machine = crate::config::Config::load()
+        .ok()
+        .and_then(|c| c.machine_name)
+        .unwrap_or_else(crate::app::detect_hostname);
+    format_remote_control_name(&machine, project_name, task_name, session_name)
+}
+
+/// Connect a running Claude session to Remote Control under `name`.
+pub fn connect_remote_control(session_name: &str, name: &str) -> Result<()> {
+    send_text(session_name, &format!("/remote-control {name}"), true)
+}
+
+/// Disconnect a running Claude session from Remote Control: `/remote-control`
+/// on a connected session opens a menu whose first entry is "Disconnect".
+pub fn disconnect_remote_control(session_name: &str) -> Result<()> {
+    send_text(session_name, "/remote-control", true)?;
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    send_key(session_name, "Up")?;
+    send_key(session_name, "Up")?;
+    send_key(session_name, "Enter")
+}
+
+fn format_remote_control_name(
+    machine: &str,
+    project_name: &str,
+    task_name: &str,
+    session_name: &str,
+) -> String {
+    let mut name = format!("{machine} · {project_name}");
+    if !is_adhoc_marker(task_name) {
+        name.push_str(&format!(" / {task_name}"));
+    }
+    if !is_main_session(session_name) {
+        name.push_str(&format!(" / {session_name}"));
+    }
+    name
+}
+
 /// Assemble the shell command that launches (or resumes) the agent for a
 /// session. `system_prompt` is the session-context briefing — present for task
 /// sessions, absent for adhoc ones; for Claude it also implies loading the
@@ -1208,12 +1274,16 @@ fn build_agent_command(
     system_prompt: Option<&str>,
     initial_prompt: Option<&str>,
     resume: bool,
+    remote_control_name: Option<&str>,
 ) -> String {
     match agent {
         AgentKind::Claude => {
             let mut cmd = String::from("claude --dangerously-skip-permissions");
             if resume {
                 cmd.push_str(" --continue");
+            }
+            if let Some(name) = remote_control_name {
+                cmd.push_str(&format!(" --remote-control {}", shell_escape(name)));
             }
             if system_prompt.is_some() {
                 cmd.push_str(&format!(
@@ -3157,16 +3227,55 @@ Some transcript output.\n\
 
     #[test]
     fn pi_command_uses_approve_system_prompt_flag_and_positional_prompt() {
-        let cmd = build_agent_command(AgentKind::Pi, "/w", Some("briefing"), Some("do it"), false);
+        let cmd = build_agent_command(
+            AgentKind::Pi,
+            "/w",
+            Some("briefing"),
+            Some("do it"),
+            false,
+            None,
+        );
         assert_eq!(
             cmd,
             "pi --approve --append-system-prompt 'briefing' 'do it'"
         );
 
-        let resumed = build_agent_command(AgentKind::Pi, "/w", Some("briefing"), None, true);
+        let resumed = build_agent_command(AgentKind::Pi, "/w", Some("briefing"), None, true, None);
         assert_eq!(
             resumed,
             "pi --approve --continue --append-system-prompt 'briefing'"
+        );
+    }
+
+    #[test]
+    fn claude_command_passes_remote_control_name() {
+        let cmd = build_agent_command(
+            AgentKind::Claude,
+            "/w",
+            None,
+            None,
+            true,
+            Some("mac · app / fix"),
+        );
+        assert_eq!(
+            cmd,
+            "claude --dangerously-skip-permissions --continue --remote-control 'mac · app / fix'"
+        );
+    }
+
+    #[test]
+    fn remote_control_name_omits_main_session_and_adhoc_task() {
+        assert_eq!(
+            format_remote_control_name("mac", "app", "fix", "main"),
+            "mac · app / fix"
+        );
+        assert_eq!(
+            format_remote_control_name("mac", "app", "fix", "2"),
+            "mac · app / fix / 2"
+        );
+        assert_eq!(
+            format_remote_control_name("mac", "app", ADHOC_MARKER, "scratch"),
+            "mac · app / scratch"
         );
     }
 

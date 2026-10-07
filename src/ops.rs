@@ -55,6 +55,7 @@ pub fn create_task_session(
             use_worktree,
             archived: false,
             agent: agent.id().to_string(),
+            remote_control: false,
         },
     );
 
@@ -347,6 +348,7 @@ pub fn import_session(cfg: &Config, export: &SessionExport, prompt: &str) -> Res
             use_worktree: true,
             archived: false,
             agent: agent.id().to_string(),
+            remote_control: false,
         },
     );
     Ok(tmux_name)

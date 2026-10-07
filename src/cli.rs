@@ -42,6 +42,7 @@ Managing tasks and sessions (usable from inside a session):
                                               [--agent claude|codex|pi]
   showrunner session kill <session> --yes
   showrunner session move <session> --to <host|local> [--note <text>] [--no-handoff]
+  showrunner session remote-control <session> [on|off]   (omit to toggle; Claude only)
 
 Housekeeping:
   showrunner restore                            recreate saved sessions that
@@ -743,6 +744,7 @@ fn cmd_session(args: &[String]) -> Result<()> {
         Some("export") => cmd_session_export(&args[1..]),
         Some("import") => cmd_session_import(&args[1..]),
         Some("release") => cmd_session_release(&args[1..]),
+        Some("remote-control") => cmd_session_remote_control(&args[1..]),
         Some(other) => bail!("unknown session command '{other}' (expected create, kill or move)"),
         None => bail!(
             "usage: session create <project> <task> | session kill <session> --yes | \
@@ -915,6 +917,57 @@ fn cmd_session_import(args: &[String]) -> Result<()> {
         .map(|s| session_ref(&s))
         .unwrap_or(tmux_name);
     println!("created session: {session}");
+    Ok(())
+}
+
+/// Turn Remote Control on or off for a Claude session: the running agent gets
+/// `/remote-control`, and the record keeps the setting for recreation.
+fn cmd_session_remote_control(args: &[String]) -> Result<()> {
+    let (positional, _) = parse_args(args, &[], &[])?;
+    let (reference, state) = match positional.as_slice() {
+        [reference] => (reference, None),
+        [reference, state] => (reference, Some(state.as_str())),
+        _ => bail!("usage: session remote-control <session> [on|off]"),
+    };
+    let tmux_name = resolve_recorded_session(reference)?;
+    let record = config::load_sessions()
+        .remove(&tmux_name)
+        .ok_or_else(|| anyhow::anyhow!("no session record for {tmux_name}"))?;
+    if record.agent_kind() != AgentKind::Claude {
+        bail!("Remote Control is only available for Claude sessions");
+    }
+    let on = match state {
+        None => !record.remote_control,
+        Some("on") => true,
+        Some("off") => false,
+        Some(other) => bail!("expected 'on' or 'off', got '{other}'"),
+    };
+    let name = tmux::remote_control_name(
+        &record.project_name,
+        &record.task_name,
+        &record.session_name,
+    );
+    if on == record.remote_control {
+        println!(
+            "Remote Control already {}: {name}",
+            if on { "on" } else { "off" }
+        );
+        return Ok(());
+    }
+
+    let live = tmux::list_sessions()
+        .unwrap_or_default()
+        .iter()
+        .any(|s| s.name == tmux_name);
+    if live {
+        if on {
+            tmux::connect_remote_control(&tmux_name, &name)?;
+        } else {
+            tmux::disconnect_remote_control(&tmux_name)?;
+        }
+    }
+    config::set_session_record_remote_control(&tmux_name, on);
+    println!("Remote Control {}: {name}", if on { "on" } else { "off" });
     Ok(())
 }
 

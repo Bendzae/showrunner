@@ -560,6 +560,7 @@ async fn api_create_adhoc(
                 use_worktree: false,
                 archived: false,
                 agent: agent.id().to_string(),
+                remote_control: false,
             },
         );
         Ok(tmux_name)

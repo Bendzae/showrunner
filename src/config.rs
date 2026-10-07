@@ -121,6 +121,9 @@ fn cm_ungroup() -> char {
 fn cm_move_session() -> char {
     'M'
 }
+fn cm_remote_control() -> char {
+    'R'
+}
 
 fn is_false(b: &bool) -> bool {
     !*b
@@ -199,6 +202,9 @@ pub struct ContextMenuKeyBindings {
     /// Move a session to the other machine (default: M)
     #[serde(default = "cm_move_session")]
     pub move_session: char,
+    /// Toggle Remote Control on a Claude session (default: R)
+    #[serde(default = "cm_remote_control")]
+    pub remote_control: char,
 }
 
 impl Default for ContextMenuKeyBindings {
@@ -227,6 +233,7 @@ impl Default for ContextMenuKeyBindings {
             group: cm_group(),
             ungroup: cm_ungroup(),
             move_session: cm_move_session(),
+            remote_control: cm_remote_control(),
         }
     }
 }
@@ -727,6 +734,10 @@ pub struct Config {
     /// like `ENG-123` be linked to a task.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub linear_workspace: Option<String>,
+    /// Names this machine in Remote Control session names. Defaults to the
+    /// hostname.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_name: Option<String>,
     #[serde(default)]
     pub projects: Vec<Project>,
     /// Startup skills/commands to run before the initial prompt (e.g. ["/prime", "/caveman ultra"])
@@ -886,6 +897,9 @@ pub struct SessionRecord {
     /// tracked default to "claude".
     #[serde(default = "default_agent_id")]
     pub agent: String,
+    /// Claude session reachable via Remote Control; kept on recreation.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub remote_control: bool,
 }
 
 impl SessionRecord {
@@ -931,6 +945,16 @@ pub fn remove_session_record(tmux_name: &str) {
     let _g = IO_LOCK.lock().unwrap();
     let mut sessions = load_sessions();
     if sessions.remove(tmux_name).is_some() {
+        let _ = save_sessions(&sessions);
+    }
+}
+
+/// Set a session record's Remote Control flag and persist.
+pub fn set_session_record_remote_control(tmux_name: &str, on: bool) {
+    let _g = IO_LOCK.lock().unwrap();
+    let mut sessions = load_sessions();
+    if let Some(record) = sessions.get_mut(tmux_name) {
+        record.remote_control = on;
         let _ = save_sessions(&sessions);
     }
 }

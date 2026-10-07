@@ -160,9 +160,12 @@ Run sessions are independent per item, so running on a different item starts a s
 | `t` | Open/attach a terminal in the worktree | `terminal` |
 | `x` | Run the project's configured run command | `run` |
 | `y` | Copy worktree path to clipboard | `copy_path` |
+| `R` | Enable/disable Remote Control (Claude sessions) | `remote_control` |
 | `d` | Delete | `delete` |
 
-The main session only offers Review, Terminal, Run and Copy path: it is already on the task branch, so Merge and Update have nothing to do, and it can't be deleted on its own — delete or archive the task instead.
+The main session only offers Review, Terminal, Run, Copy path and Remote Control: it is already on the task branch, so Merge and Update have nothing to do, and it can't be deleted on its own — delete or archive the task instead.
+
+**Remote Control** (`R`, Claude sessions, also adhoc and on a remote host) makes a session show up in the Claude desktop and mobile apps and on claude.ai/code, by sending `/remote-control <name>` into it — no restart. It's named `<machine> · <project> / <task>[ / <session>]`, with `<machine>` from `machine_name` in that machine's config (default: its hostname). Pressing `R` again disconnects it. The setting is kept on the session, so a session recreated after tmux dies comes back connected. Same from the CLI: `showrunner session remote-control <session> [on|off]`. Needs a claude.ai login with Remote Control allowed by your org; the first time on a machine Claude asks for consent in the session.
 
 The **Review** action (`r`) launches the configured diff review tool on the relevant diff — branch-vs-base for a task, uncommitted changes for a session. Choose the tool with `review_tool` in `~/.showrunner/config.toml` (`"hunk"`, the default, or `"difit"`):
 
@@ -239,6 +242,9 @@ default_agent = "claude"
 # Global: skills/slash-commands run in every new session before the initial
 # prompt (a single string or a list). Useful for priming context.
 startup_skills = ["/prime"]
+
+# Global: names this machine in Remote Control session names (default: hostname).
+machine_name = "work-laptop"
 
 [[projects]]
 name = "My App"
