@@ -162,9 +162,9 @@ enum MoveTarget {
 /// state; `None` for sessions not running Claude.
 fn remote_control_menu_item(
     cm: &config::ContextMenuKeyBindings,
-    session: &TmuxSession,
+    tmux_name: &str,
 ) -> Option<ContextMenuItem> {
-    let record = config::load_sessions().remove(&session.name)?;
+    let record = config::load_sessions().remove(tmux_name)?;
     (record.agent_kind() == AgentKind::Claude).then_some(ContextMenuItem {
         key: cm.remote_control,
         label: if record.remote_control {
@@ -1469,6 +1469,11 @@ impl App {
                     action: ContextAction::MoveSession,
                 },
                 ContextMenuItem {
+                    key: cm.remote_control,
+                    label: "Toggle Remote Control",
+                    action: ContextAction::RemoteControl,
+                },
+                ContextMenuItem {
                     key: cm.delete,
                     label: "Delete",
                     action: ContextAction::Delete,
@@ -1609,7 +1614,7 @@ impl App {
                     label: "Run",
                     action: ContextAction::Run,
                 }];
-                items.extend(remote_control_menu_item(&cm, session));
+                items.extend(remote_control_menu_item(&cm, &session.name));
                 items.push(ContextMenuItem {
                     key: cm.delete,
                     label: "Delete",
@@ -1617,7 +1622,9 @@ impl App {
                 });
                 items
             }
-            Some(ListItem::Task { task, .. }) => {
+            Some(ListItem::Task {
+                project_name, task, ..
+            }) => {
                 if task.archived {
                     vec![
                         ContextMenuItem {
@@ -1696,6 +1703,10 @@ impl App {
                             action: ContextAction::OpenLinear,
                         });
                     }
+                    items.extend(remote_control_menu_item(
+                        &cm,
+                        &tmux::build_tmux_name(project_name, &task.name, tmux::MAIN_SESSION),
+                    ));
                     if remote_name.is_some() {
                         items.push(ContextMenuItem {
                             key: cm.move_session,
@@ -1758,7 +1769,7 @@ impl App {
                         action: ContextAction::CopyWorktreePath,
                     },
                 ]);
-                items.extend(remote_control_menu_item(&cm, session));
+                items.extend(remote_control_menu_item(&cm, &session.name));
                 if remote_name.is_some() {
                     items.push(ContextMenuItem {
                         key: cm.move_session,
@@ -1826,14 +1837,30 @@ impl App {
         }
     }
 
-    /// Toggle Remote Control on the selected session through the CLI, which
-    /// also reaches sessions on another host.
-    fn toggle_remote_control(&mut self) {
-        let session = match self.selected_item() {
+    /// The selected session, or the main session of the selected task.
+    fn selected_session_or_main(&self) -> Option<TmuxSession> {
+        match self.selected_item() {
             Some(ListItem::Session { session, .. } | ListItem::AdhocSession { session, .. }) => {
-                session.clone()
+                Some(session.clone())
             }
-            _ => return,
+            Some(ListItem::Task {
+                project_name,
+                project_path,
+                task,
+            }) => tmux::sessions_for_task(project_name, &task.name, self.sessions_at(project_path))
+                .into_iter()
+                .find(|s| tmux::is_main_session(&s.session_name)),
+            _ => None,
+        }
+    }
+
+    /// Toggle Remote Control on the selected session (a task's main session
+    /// when a task is selected) through the CLI, which also reaches sessions
+    /// on another host.
+    fn toggle_remote_control(&mut self) {
+        let Some(session) = self.selected_session_or_main() else {
+            self.status_message = Some("No live session for Remote Control".into());
+            return;
         };
         let reference = session.reference();
         self.start_op("Toggling Remote Control...", move || {
@@ -1857,18 +1884,7 @@ impl App {
     /// selected) to the other machine: local ones go to the remote, remote
     /// ones come here. Runs `session move`, which handles the handoff.
     fn move_session(&mut self) {
-        let session = match self.selected_item() {
-            Some(ListItem::Session { session, .. }) => Some(session.clone()),
-            Some(ListItem::Task {
-                project_name,
-                project_path,
-                task,
-            }) => tmux::sessions_for_task(project_name, &task.name, self.sessions_at(project_path))
-                .into_iter()
-                .find(|s| tmux::is_main_session(&s.session_name)),
-            _ => None,
-        };
-        let Some(session) = session else {
+        let Some(session) = self.selected_session_or_main() else {
             self.status_message = Some("No live session to move".into());
             return;
         };

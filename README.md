@@ -139,6 +139,7 @@ Run sessions are independent per item, so running on a different item starts a s
 | `o` | Open/create PR | `open_pr` |
 | `l` | Open linked Linear ticket | `open_linear` |
 | `g` | Set group (fuzzy picker over existing groups; type a new name to create one) | `group` |
+| `R` | Enable/disable Remote Control on the main session (Claude) | `remote_control` |
 | `A` | Archive | `archive` |
 | `d` | Delete | `delete` |
 
