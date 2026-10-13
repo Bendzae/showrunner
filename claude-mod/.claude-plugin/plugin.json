@@ -1,0 +1,6 @@
+{
+  "name": "showrunner-mod",
+  "version": "0.1.0",
+  "description": "Reports session status to showrunner and shows the task context above the prompt",
+  "types": "./types/index.d.ts"
+}

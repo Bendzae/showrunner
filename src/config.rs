@@ -669,6 +669,12 @@ pub fn linear_ticket_id(url: &str) -> Option<&str> {
     rest.split('/').next().filter(|id| !id.is_empty())
 }
 
+/// The workspace slug (`acme`) in a Linear issue URL.
+pub fn linear_workspace(url: &str) -> Option<&str> {
+    let (_, rest) = url.split_once("linear.app/")?;
+    rest.split('/').next().filter(|slug| !slug.is_empty())
+}
+
 /// Which diff review tool the review action launches.
 ///
 /// - `Hunk` (default) — a terminal diff viewer ([modem-dev/hunk]) run in the
@@ -873,6 +879,11 @@ pub fn task_dir(project_name: &str, branch: &str) -> PathBuf {
 /// Path to the cached PR URL file for a given project/branch.
 pub fn pr_url_path(project_name: &str, branch: &str) -> PathBuf {
     task_dir(project_name, branch).join("pr_url.txt")
+}
+
+/// Path to the cached workflow state of the task's Linear ticket.
+pub fn linear_cache_path(project_name: &str, branch: &str) -> PathBuf {
+    task_dir(project_name, branch).join("linear.json")
 }
 
 /// Path to the cached PR details (`list --stats` serves these to other hosts
@@ -1480,6 +1491,7 @@ mod tests {
         assert!(linear_ticket_url("ENG-", Some("acme")).is_err());
         assert_eq!(linear_ticket_id(url), Some("ENG-123"));
         assert_eq!(linear_ticket_id("https://linear.app/acme"), None);
+        assert_eq!(linear_workspace(url), Some("acme"));
     }
 
     #[test]

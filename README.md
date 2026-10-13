@@ -300,7 +300,20 @@ The default harness (`claude`).
 - Launches with `--dangerously-skip-permissions`; the session briefing is passed via `--append-system-prompt`.
 - The showrunner skills are loaded as a Claude Code plugin (`--plugin-dir`), so they're available as `/commit-push-task` and `/manage-sessions` slash commands.
 - Permission prompts and question dialogs surface as **Waiting for permission**.
-- Dead sessions resume with `claude --continue`.
+- Dead sessions resume their own conversation (`--session-id` at creation, `--resume <id>` after); sessions from before that use `claude --continue`.
+
+#### Claude mod (optional)
+
+`claude-mod/` is a Claude Code mod that ties Claude sessions closer to showrunner. Inside a showrunner session it:
+
+- reports the session's status itself (`CM_STATUS`: running, waiting for input, waiting for permission), which showrunner trusts over reading the pane;
+- draws a band above the prompt with the project, task, session, branch and base, diff, PR, Linear ticket and the status of sibling sessions (from `showrunner session info`).
+
+Outside showrunner sessions it does nothing. Install it for every session on a machine:
+
+```
+/plugin install showrunner-mod --marketplace Bendzae/showrunner
+```
 
 ### <img src="https://github.com/openai.png" height="20" alt=""/> Codex CLI
 

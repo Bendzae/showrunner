@@ -1,0 +1,5 @@
+{
+  "name": "showrunner",
+  "owner": { "name": "Bendzae" },
+  "plugins": [{ "name": "showrunner-mod", "source": "./claude-mod" }]
+}

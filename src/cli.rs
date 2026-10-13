@@ -974,6 +974,18 @@ fn cmd_session_info(args: &[String]) -> Result<()> {
     if let Some(task) = task {
         out["base_branch"] = json!(task.base_branch());
         out["linear"] = json!(task.linear);
+        out["linear_state"] = json!(
+            task.linear
+                .as_deref()
+                .and_then(config::linear_ticket_id)
+                .and_then(|id| ops::cached_linear_state(
+                    &record.project_name,
+                    &task.branch,
+                    id,
+                    task.linear.as_deref().and_then(config::linear_workspace),
+                    Duration::from_secs(300),
+                ))
+        );
         out["task_diff"] = json!(
             tmux::get_branch_diff(&record.project_path, &task.branch, task.base_branch())
                 .map(|d| d.to_json())

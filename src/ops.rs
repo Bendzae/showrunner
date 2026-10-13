@@ -489,3 +489,107 @@ pub fn cached_pr_info(
     }
     info
 }
+
+/// The workflow state (`{ name, color, type }`) of the task's Linear ticket,
+/// cached in the task dir for `max_age`. `None` without a Linear token or
+/// when Linear can't be reached.
+pub fn cached_linear_state(
+    project_name: &str,
+    branch: &str,
+    ticket_id: &str,
+    workspace: Option<&str>,
+    max_age: std::time::Duration,
+) -> Option<serde_json::Value> {
+    let path = config::linear_cache_path(project_name, branch);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if let Some(cached) = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        && cached["ticket"] == ticket_id
+        && cached["fetched_at"]
+            .as_u64()
+            .is_some_and(|t| now.saturating_sub(t) < max_age.as_secs())
+    {
+        return Some(cached["state"].clone()).filter(|s| !s.is_null());
+    }
+
+    let token = linear_token(workspace)?;
+    let state = fetch_linear_state(ticket_id, &token);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let entry = serde_json::json!({ "fetched_at": now, "ticket": ticket_id, "state": state });
+    let _ = std::fs::write(&path, entry.to_string());
+    state
+}
+
+/// A Linear API token: `LINEAR_API_KEY`, else the one the `linear` CLI keeps
+/// in the macOS keychain for `workspace`.
+fn linear_token(workspace: Option<&str>) -> Option<String> {
+    if let Some(key) = std::env::var("LINEAR_API_KEY")
+        .ok()
+        .filter(|k| !k.is_empty())
+    {
+        return Some(key);
+    }
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let output = std::process::Command::new("security")
+        .args([
+            "find-generic-password",
+            "-s",
+            "linear-cli",
+            "-a",
+            workspace?,
+            "-w",
+        ])
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn fetch_linear_state(ticket_id: &str, token: &str) -> Option<serde_json::Value> {
+    use std::io::Write;
+    let body = serde_json::json!({
+        "query": "query($id: String!) { issue(id: $id) { state { name color type } } }",
+        "variables": { "id": ticket_id },
+    });
+    // The token goes in on stdin (`-H @-`) so it never shows in the process list.
+    let mut child = std::process::Command::new("curl")
+        .args([
+            "-sf",
+            "--max-time",
+            "10",
+            "-X",
+            "POST",
+            "https://api.linear.app/graphql",
+            "-H",
+            "Content-Type: application/json",
+            "-H",
+            "@-",
+            "-d",
+            &body.to_string(),
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .ok()?;
+    child
+        .stdin
+        .take()?
+        .write_all(format!("Authorization: {token}\n").as_bytes())
+        .ok()?;
+    let output = child.wait_with_output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    Some(response["data"]["issue"]["state"].clone()).filter(|s| s.is_object())
+}
