@@ -66,6 +66,9 @@ export type Loaded<T> =
 export type TicketView =
   { status: 'loading' } | { status: 'error'; message: string } | { status: 'ready'; ticket: Ticket }
 
+/** Tags the monorepo-touched mod publishes, drawn beside the band. */
+export type ModuleTag = { label: string; background: string; text: string; added: number; removed: number }
+
 declare module 'claude-code' {
   interface PluginState {
     'showrunner-mod': {
@@ -73,5 +76,6 @@ declare module 'claude-code' {
       ticket: TicketView | null
       pr: Loaded<PullRequest> | null
     }
+    'monorepo-touched': { tags: ModuleTag[] | null }
   }
 }

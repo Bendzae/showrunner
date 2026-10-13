@@ -16,6 +16,8 @@ const ticket = atom({ plugin: 'showrunner-mod', key: 'ticket' } as const, null)
 
 const pr = atom({ plugin: 'showrunner-mod', key: 'pr' } as const, null)
 
+const moduleTags = { plugin: 'monorepo-touched', key: 'tags' } as const
+
 /** The band's colors, each toned a little toward a dark background. */
 const PALETTE = {
   text: '#F3F4F6',
@@ -33,6 +35,7 @@ const PALETTE = {
   prMerged: tone('#8B5CF6'),
   prDraft: tone('#6B7280'),
   linear: tone('#5E6AD2'),
+  border: tone('#22D3EE'),
 } as const
 
 const TICKET_PANE = 'ticket'
@@ -358,69 +361,85 @@ export const register: Register = on => {
     const isAdhoc = current.task === null
     const ticket = current.linear ? linearId(current.linear) : undefined
     const ticketState = current.linear_state ?? undefined
+    const { value: tags } = await $.state.get(moduleTags)
 
     return (
       <Box flexDirection="column">
         {hint}
-        <Box
-          flexDirection="row"
-          flexWrap="wrap"
-          columnGap={1}
-          borderStyle="round"
-          borderColor="claude"
-          paddingX={1}
-        >
-          <Pill Text={Text} bg={PALETTE.project} fg={PALETTE.text} bold>
-            ⌂ {current.project}
-          </Pill>
-          <Pill Text={Text} bg={isAdhoc ? PALETTE.adhoc : PALETTE.task} fg={PALETTE.text} bold>
-            {isAdhoc ? '✦ adhoc' : `◆ ${current.task}`}
-          </Pill>
-          <Text color={PALETTE.session} bold>
-            ▸ {current.session}
-          </Text>
-          {diff && diff.added + diff.removed > 0 ? (
-            <Text>
-              <Text color="diffAdded" bold>
-                +{diff.added}
-              </Text>{' '}
-              <Text color="diffRemoved" bold>
-                −{diff.removed}
+        <Box flexDirection="row" flexWrap="wrap">
+          <Box
+            flexDirection="row"
+            flexWrap="wrap"
+            columnGap={1}
+            borderStyle="round"
+            borderColor={PALETTE.border}
+            paddingX={1}
+          >
+            <Pill Text={Text} bg={PALETTE.project} fg={PALETTE.text} bold>
+              ⌂ {current.project}
+            </Pill>
+            <Pill Text={Text} bg={isAdhoc ? PALETTE.adhoc : PALETTE.task} fg={PALETTE.text} bold>
+              {isAdhoc ? '✦ adhoc' : `◆ ${current.task}`}
+            </Pill>
+            <Text color={PALETTE.session} bold>
+              ▸ {current.session}
+            </Text>
+            {diff && diff.added + diff.removed > 0 ? (
+              <Text>
+                <Text color="diffAdded" bold>
+                  +{diff.added}
+                </Text>{' '}
+                <Text color="diffRemoved" bold>
+                  −{diff.removed}
+                </Text>
               </Text>
-            </Text>
+            ) : null}
+            {current.pr ? (
+              <Link href={current.pr.url}>
+                <Pill
+                  Text={Text}
+                  bg={prColor(current.pr.state, current.pr.checks)}
+                  fg={PALETTE.text}
+                  bold
+                >
+                  {prIcon(current.pr.state, current.pr.checks)} PR {prNumber(current.pr.url)}{' '}
+                  {current.pr.state}
+                </Pill>
+              </Link>
+            ) : null}
+            {ticket && current.linear ? (
+              <Link href={current.linear}>
+                <Pill
+                  Text={Text}
+                  bg={ticketState ? tone(ticketState.color) : PALETTE.linear}
+                  fg={PALETTE.text}
+                  bold
+                >
+                  {ticketGlyph(ticketState?.type)} {ticket}
+                  {ticketState ? ` · ${ticketState.name}` : ''}
+                </Pill>
+              </Link>
+            ) : null}
+            {current.siblings.map(sibling => (
+              <Text key={sibling.name}>
+                <Text color={statusColor(sibling)}>{statusGlyph(sibling)}</Text>
+                <Text color="subtle"> {sibling.name}</Text>
+              </Text>
+            ))}
+          </Box>
+          {tags?.length ? (
+            <Box flexDirection="row" flexWrap="wrap" columnGap={1} paddingX={1} paddingY={1}>
+              {tags.map(tag => (
+                <Text key={tag.label}>
+                  <Pill Text={Text} bg={tag.background} fg={tag.text} bold>
+                    {tag.label}
+                  </Pill>
+                  {tag.added > 0 ? <Text color="diffAdded">{` +${tag.added}`}</Text> : null}
+                  {tag.removed > 0 ? <Text color="diffRemoved">{` −${tag.removed}`}</Text> : null}
+                </Text>
+              ))}
+            </Box>
           ) : null}
-          {current.pr ? (
-            <Link href={current.pr.url}>
-              <Pill
-                Text={Text}
-                bg={prColor(current.pr.state, current.pr.checks)}
-                fg={PALETTE.text}
-                bold
-              >
-                {prIcon(current.pr.state, current.pr.checks)} PR {prNumber(current.pr.url)}{' '}
-                {current.pr.state}
-              </Pill>
-            </Link>
-          ) : null}
-          {ticket && current.linear ? (
-            <Link href={current.linear}>
-              <Pill
-                Text={Text}
-                bg={ticketState ? tone(ticketState.color) : PALETTE.linear}
-                fg={PALETTE.text}
-                bold
-              >
-                {ticketGlyph(ticketState?.type)} {ticket}
-                {ticketState ? ` · ${ticketState.name}` : ''}
-              </Pill>
-            </Link>
-          ) : null}
-          {current.siblings.map(sibling => (
-            <Text key={sibling.name}>
-              <Text color={statusColor(sibling)}>{statusGlyph(sibling)}</Text>
-              <Text color="subtle"> {sibling.name}</Text>
-            </Text>
-          ))}
         </Box>
       </Box>
     )
