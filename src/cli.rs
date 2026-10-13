@@ -763,7 +763,10 @@ fn cmd_session(args: &[String]) -> Result<()> {
         Some("ticket") => cmd_session_ticket(&args[1..]),
         Some("pr") => cmd_session_pr(&args[1..]),
         Some("set-conversation") => cmd_session_set_conversation(&args[1..]),
-        Some(other) => bail!("unknown session command '{other}' (expected create, kill or move)"),
+        Some(other) => bail!(
+            "unknown session command '{other}' (expected create, kill, move, remote-control, \
+             info, ticket, pr or set-conversation)"
+        ),
         None => bail!(
             "usage: session create <project> <task> | session kill <session> --yes | \
              session move <session> --to <host>"

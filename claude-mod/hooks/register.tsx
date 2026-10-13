@@ -16,6 +16,25 @@ const ticket = atom({ plugin: 'showrunner-mod', key: 'ticket' } as const, null)
 
 const pr = atom({ plugin: 'showrunner-mod', key: 'pr' } as const, null)
 
+/** The band's colors, each toned a little toward a dark background. */
+const PALETTE = {
+  text: '#F3F4F6',
+  project: tone('#7C3AED'),
+  task: tone('#2563EB'),
+  adhoc: tone('#475569'),
+  session: tone('#F59E0B'),
+  ok: tone('#22C55E'),
+  bad: tone('#DC2626'),
+  warn: tone('#D97706'),
+  idle: tone('#94A3B8'),
+  prOpen: tone('#16A34A'),
+  prFailing: tone('#DC2626'),
+  prPending: tone('#D97706'),
+  prMerged: tone('#8B5CF6'),
+  prDraft: tone('#6B7280'),
+  linear: tone('#5E6AD2'),
+} as const
+
 const TICKET_PANE = 'ticket'
 const PR_PANE = 'pr'
 
@@ -51,7 +70,7 @@ async function loadPr($: EngineInterface) {
       ? { status: 'ready', value: JSON.parse(ran.stdout) }
       : {
           status: 'error',
-          message: ran?.stderr.replace(/^Error: /, '').trim() || 'showrunner did not answer',
+          message: failure(ran?.stderr),
         }
   await update($, pr, () => view)
 }
@@ -87,6 +106,15 @@ async function refresh($: EngineInterface) {
   await update($, info, () => parsed)
 }
 
+/** What a failed `showrunner` call says, or that showrunner needs updating. */
+function failure(stderr: string | undefined): string {
+  const message = stderr?.replace(/^Error: /, '').trim()
+  if (message?.includes('unknown session command')) {
+    return 'This needs a newer showrunner (0.29.5 or later): update it and try again.'
+  }
+  return message || 'showrunner did not answer'
+}
+
 async function loadTicket($: EngineInterface) {
   if (tmuxName === undefined) return
   await update($, ticket, (): TicketView => ({ status: 'loading' }))
@@ -98,7 +126,7 @@ async function loadTicket($: EngineInterface) {
       ? { status: 'ready', ticket: JSON.parse(ran.stdout) }
       : {
           status: 'error',
-          message: ran?.stderr.replace(/^Error: /, '').trim() || 'showrunner did not answer',
+          message: failure(ran?.stderr),
         }
   await update($, ticket, () => view)
 }
@@ -158,7 +186,7 @@ export const register: Register = on => {
       <Box flexDirection="column" gap={1} paddingX={1}>
         <Box flexDirection="row" flexWrap="wrap" columnGap={1}>
           <Link href={t.url}>
-            <Pill Text={Text} bg={t.state.color} fg={readableOn(t.state.color)} bold>
+            <Pill Text={Text} bg={tone(t.state.color)} fg={PALETTE.text} bold>
               {ticketGlyph(t.state.type)} {t.identifier} · {t.state.name}
             </Pill>
           </Link>
@@ -219,7 +247,7 @@ export const register: Register = on => {
       <Box flexDirection="column" gap={1} paddingX={1}>
         <Box flexDirection="row" flexWrap="wrap" columnGap={1}>
           <Link href={p.url}>
-            <Pill Text={Text} bg={prColor(p.state, checksState)} fg="#FFFFFF" bold>
+            <Pill Text={Text} bg={prColor(p.state, checksState)} fg={PALETTE.text} bold>
               {prIcon(p.state, checksState)} PR #{p.number} {p.state}
             </Pill>
           </Link>
@@ -236,16 +264,16 @@ export const register: Register = on => {
         </Box>
         <Text bold>{p.title}</Text>
         <Text>
-          <Text color="#22C55E">✓ {count('pass')} passed</Text>
+          <Text color={PALETTE.ok}>✓ {count('pass')} passed</Text>
           <Text color="subtle"> · </Text>
-          <Text color="#DC2626">✗ {count('fail')} failed</Text>
+          <Text color={PALETTE.bad}>✗ {count('fail')} failed</Text>
           <Text color="subtle"> · </Text>
-          <Text color="#D97706">◷ {count('pending')} pending</Text>
+          <Text color={PALETTE.warn}>◷ {count('pending')} pending</Text>
           <Text color="subtle"> · ⤼ {count('skipped')} skipped</Text>
         </Text>
         {attention.map((check, i) => (
           <Text key={`check-${i}`}>
-            <Text color={check.state === 'fail' ? '#DC2626' : '#D97706'}>
+            <Text color={check.state === 'fail' ? PALETTE.bad : PALETTE.warn}>
               {check.state === 'fail' ? '✗' : '◷'}{' '}
             </Text>
             {check.url ? (
@@ -320,9 +348,10 @@ export const register: Register = on => {
     return ran
   }).catch(($, e, next) => next(e))
 
-  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+  on('ui.render', { component: 'PromptHint' }, async ($, e, next) => {
+    const hint = await next(e)
     const current = await read($, info)
-    if (current === null || e.props.hasSurvey) return next(e)
+    if (current === null) return hint
 
     const { Box, Link, Text } = $.ui.resolve(e)
     const diff = current.task_diff ?? current.session_diff
@@ -331,60 +360,68 @@ export const register: Register = on => {
     const ticketState = current.linear_state ?? undefined
 
     return (
-      <Box
-        flexDirection="row"
-        flexWrap="wrap"
-        columnGap={1}
-        borderStyle="round"
-        borderColor="claude"
-        paddingX={1}
-      >
-        <Pill Text={Text} bg="#7C3AED" fg="#FFFFFF" bold>
-          🎬 {current.project}
-        </Pill>
-        <Pill Text={Text} bg={isAdhoc ? '#475569' : '#2563EB'} fg="#FFFFFF" bold>
-          {isAdhoc ? '✦ adhoc' : `◆ ${current.task}`}
-        </Pill>
-        <Text color="#F59E0B" bold>
-          ▸ {current.session}
-        </Text>
-        {diff && diff.added + diff.removed > 0 ? (
-          <Text>
-            <Text color="diffAdded" bold>
-              +{diff.added}
-            </Text>{' '}
-            <Text color="diffRemoved" bold>
-              −{diff.removed}
+      <Box flexDirection="column">
+        {hint}
+        <Box
+          flexDirection="row"
+          flexWrap="wrap"
+          columnGap={1}
+          borderStyle="round"
+          borderColor="claude"
+          paddingX={1}
+        >
+          <Pill Text={Text} bg={PALETTE.project} fg={PALETTE.text} bold>
+            ⌂ {current.project}
+          </Pill>
+          <Pill Text={Text} bg={isAdhoc ? PALETTE.adhoc : PALETTE.task} fg={PALETTE.text} bold>
+            {isAdhoc ? '✦ adhoc' : `◆ ${current.task}`}
+          </Pill>
+          <Text color={PALETTE.session} bold>
+            ▸ {current.session}
+          </Text>
+          {diff && diff.added + diff.removed > 0 ? (
+            <Text>
+              <Text color="diffAdded" bold>
+                +{diff.added}
+              </Text>{' '}
+              <Text color="diffRemoved" bold>
+                −{diff.removed}
+              </Text>
             </Text>
-          </Text>
-        ) : null}
-        {current.pr ? (
-          <Link href={current.pr.url}>
-            <Pill Text={Text} bg={prColor(current.pr.state, current.pr.checks)} fg="#FFFFFF" bold>
-              {prIcon(current.pr.state, current.pr.checks)} PR {prNumber(current.pr.url)}{' '}
-              {current.pr.state}
-            </Pill>
-          </Link>
-        ) : null}
-        {ticket && current.linear ? (
-          <Link href={current.linear}>
-            <Pill
-              Text={Text}
-              bg={ticketState?.color ?? '#5E6AD2'}
-              fg={readableOn(ticketState?.color ?? '#5E6AD2')}
-              bold
-            >
-              {ticketGlyph(ticketState?.type)} {ticket}
-              {ticketState ? ` · ${ticketState.name}` : ''}
-            </Pill>
-          </Link>
-        ) : null}
-        {current.siblings.map(sibling => (
-          <Text key={sibling.name}>
-            <Text color={statusColor(sibling)}>{statusGlyph(sibling)}</Text>
-            <Text color="subtle"> {sibling.name}</Text>
-          </Text>
-        ))}
+          ) : null}
+          {current.pr ? (
+            <Link href={current.pr.url}>
+              <Pill
+                Text={Text}
+                bg={prColor(current.pr.state, current.pr.checks)}
+                fg={PALETTE.text}
+                bold
+              >
+                {prIcon(current.pr.state, current.pr.checks)} PR {prNumber(current.pr.url)}{' '}
+                {current.pr.state}
+              </Pill>
+            </Link>
+          ) : null}
+          {ticket && current.linear ? (
+            <Link href={current.linear}>
+              <Pill
+                Text={Text}
+                bg={ticketState ? tone(ticketState.color) : PALETTE.linear}
+                fg={PALETTE.text}
+                bold
+              >
+                {ticketGlyph(ticketState?.type)} {ticket}
+                {ticketState ? ` · ${ticketState.name}` : ''}
+              </Pill>
+            </Link>
+          ) : null}
+          {current.siblings.map(sibling => (
+            <Text key={sibling.name}>
+              <Text color={statusColor(sibling)}>{statusGlyph(sibling)}</Text>
+              <Text color="subtle"> {sibling.name}</Text>
+            </Text>
+          ))}
+        </Box>
       </Box>
     )
   })
@@ -423,9 +460,9 @@ function reviewLabel(review: string): string {
 }
 
 function reviewColor(review: string): string {
-  if (review === 'APPROVED') return '#22C55E'
-  if (review === 'CHANGES_REQUESTED') return '#DC2626'
-  return '#D97706'
+  if (review === 'APPROVED') return PALETTE.ok
+  if (review === 'CHANGES_REQUESTED') return PALETTE.bad
+  return PALETTE.warn
 }
 
 /** A review comment's text without bot footers, badges and HTML. */
@@ -454,22 +491,22 @@ function statusGlyph(sibling: Sibling): string {
 function statusColor(sibling: Sibling): string {
   switch (sibling.status) {
     case 'running':
-      return '#22C55E'
+      return PALETTE.ok
     case 'waiting_permission':
-      return '#F59E0B'
+      return PALETTE.warn
     case 'waiting_input':
-      return '#94A3B8'
+      return PALETTE.idle
     default:
       return 'subtle'
   }
 }
 
 function prColor(state: string, checks: string | null): string {
-  if (state === 'merged') return '#8B5CF6'
-  if (state === 'closed' || checks === 'failing') return '#DC2626'
-  if (state === 'draft') return '#6B7280'
-  if (checks === 'pending') return '#D97706'
-  return '#16A34A'
+  if (state === 'merged') return PALETTE.prMerged
+  if (state === 'closed' || checks === 'failing') return PALETTE.prFailing
+  if (state === 'draft') return PALETTE.prDraft
+  if (checks === 'pending') return PALETTE.prPending
+  return PALETTE.prOpen
 }
 
 function prIcon(state: string, checks: string | null): string {
@@ -507,10 +544,17 @@ function ticketGlyph(type: string | undefined): string {
   }
 }
 
-/** Black or white text, whichever reads on the `#rrggbb` background. */
-function readableOn(hex: string): string {
+/** A `#rrggbb` color blended a little (22%) toward a dark background. */
+function tone(hex: string): string {
   const rgb = hex.match(/^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i)
-  if (!rgb) return '#FFFFFF'
-  const [r, g, b] = rgb.slice(1).map(c => parseInt(c, 16))
-  return 0.299 * r! + 0.587 * g! + 0.114 * b! > 150 ? '#111111' : '#FFFFFF'
+  if (!rgb) return hex
+  const base = [0x1f, 0x20, 0x23]
+  return (
+    '#' +
+    rgb
+      .slice(1)
+      .map((c, i) => Math.round(parseInt(c, 16) * 0.78 + base[i]! * 0.22))
+      .map(v => v.toString(16).padStart(2, '0'))
+      .join('')
+  )
 }

@@ -67,8 +67,8 @@ const PR: PullRequest = {
 }
 
 const BAND = {
-  component: 'AbovePrompt',
-  props: { hasSurvey: false, isWorking: false, maxRows: 3, bodyColumns: 120, scroll: { top: 0 } },
+  component: 'PromptHint',
+  props: { isDraft: false, isWorking: false, hint: '? for shortcuts' },
 } as const
 
 const ok = (stdout: string) => ({
