@@ -561,6 +561,7 @@ async fn api_create_adhoc(
                 archived: false,
                 agent: agent.id().to_string(),
                 remote_control: false,
+                claude_session_id: tmux::claude_session_id(&tmux_name),
             },
         );
         Ok(tmux_name)

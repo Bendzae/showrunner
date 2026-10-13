@@ -56,6 +56,7 @@ pub fn create_task_session(
             archived: false,
             agent: agent.id().to_string(),
             remote_control: false,
+            claude_session_id: tmux::claude_session_id(&tmux_name),
         },
     );
 
@@ -349,6 +350,7 @@ pub fn import_session(cfg: &Config, export: &SessionExport, prompt: &str) -> Res
             archived: false,
             agent: agent.id().to_string(),
             remote_control: false,
+            claude_session_id: tmux::claude_session_id(&tmux_name),
         },
     );
     Ok(tmux_name)

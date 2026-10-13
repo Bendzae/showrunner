@@ -474,6 +474,7 @@ pub fn create_session_with(
         is_main_session(session_name),
     );
 
+    let claude_session_id = new_claude_session_id(agent);
     let agent_cmd = build_agent_command(
         agent,
         &work_dir,
@@ -481,6 +482,7 @@ pub fn create_session_with(
         build_initial_prompt(startup_skills, initial_prompt, agent).as_deref(),
         false,
         None,
+        claude_session_id.as_deref(),
     );
 
     let agent_cmd = with_server_path(agent_cmd);
@@ -523,6 +525,7 @@ pub fn create_session_with(
         .output();
 
     set_session_agent(&tmux_name, agent);
+    set_claude_session_id(&tmux_name, claude_session_id.as_deref());
 
     if use_worktree {
         let _ = Command::new("tmux")
@@ -678,6 +681,7 @@ pub fn create_adhoc_session(
 ) -> Result<String> {
     let tmux_name = build_tmux_name(project_name, ADHOC_MARKER, session_name);
 
+    let claude_session_id = new_claude_session_id(agent);
     let agent_cmd = build_agent_command(
         agent,
         project_path,
@@ -685,6 +689,7 @@ pub fn create_adhoc_session(
         build_initial_prompt(startup_skills, None, agent).as_deref(),
         false,
         None,
+        claude_session_id.as_deref(),
     );
 
     let output = Command::new("tmux")
@@ -714,6 +719,7 @@ pub fn create_adhoc_session(
         .output();
 
     set_session_agent(&tmux_name, agent);
+    set_claude_session_id(&tmux_name, claude_session_id.as_deref());
 
     Ok(tmux_name)
 }
@@ -725,7 +731,7 @@ pub fn recreate_adhoc_session(
 ) -> Result<String> {
     let agent = record.agent_kind();
     ensure_agent_installed(agent)?;
-    let resume = has_resumable_session(agent, &record.project_path);
+    let resume = can_resume(agent, &record.project_path, record);
     let rc_name = record
         .remote_control
         .then(|| remote_control_name(&record.project_name, ADHOC_MARKER, &record.session_name));
@@ -736,6 +742,7 @@ pub fn recreate_adhoc_session(
         None,
         resume,
         rc_name.as_deref(),
+        record.claude_session_id.as_deref(),
     );
 
     let output = Command::new("tmux")
@@ -803,13 +810,7 @@ fn has_resumable_session(agent: AgentKind, work_dir: &str) -> bool {
         return false;
     };
     match agent {
-        AgentKind::Claude => {
-            let key: String = work_dir
-                .chars()
-                .map(|c| if c.is_alphanumeric() { c } else { '-' })
-                .collect();
-            dir_has_jsonl(&home.join(".claude/projects").join(key))
-        }
+        AgentKind::Claude => dir_has_jsonl(&claude_project_dir(&home, work_dir)),
         AgentKind::Pi => {
             let key = format!("-{}-", format!("{work_dir}/").replace('/', "-"));
             dir_has_jsonl(&home.join(".pi/agent/sessions").join(key))
@@ -824,6 +825,29 @@ fn has_resumable_session(agent: AgentKind, work_dir: &str) -> bool {
             .output()
             .is_ok_and(|o| !o.stdout.is_empty()),
     }
+}
+
+/// Whether a recreated session has a conversation to resume. A Claude
+/// session with a known id resumes only that conversation; otherwise any in
+/// its directory.
+fn can_resume(agent: AgentKind, work_dir: &str, record: &crate::config::SessionRecord) -> bool {
+    match (agent, &record.claude_session_id) {
+        (AgentKind::Claude, Some(id)) => dirs::home_dir().is_some_and(|home| {
+            claude_project_dir(&home, work_dir)
+                .join(format!("{id}.jsonl"))
+                .exists()
+        }),
+        _ => has_resumable_session(agent, work_dir),
+    }
+}
+
+/// Where Claude keeps the transcripts of conversations run in `work_dir`.
+fn claude_project_dir(home: &Path, work_dir: &str) -> PathBuf {
+    let key: String = work_dir
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect();
+    home.join(".claude/projects").join(key)
 }
 
 fn dir_has_jsonl(dir: &Path) -> bool {
@@ -868,7 +892,7 @@ pub fn recreate_session(tmux_name: &str, record: &crate::config::SessionRecord) 
         is_main_session(&record.session_name),
     );
 
-    let resume = has_resumable_session(agent, &work_dir);
+    let resume = can_resume(agent, &work_dir, record);
     let rc_name = record.remote_control.then(|| {
         remote_control_name(
             &record.project_name,
@@ -883,6 +907,7 @@ pub fn recreate_session(tmux_name: &str, record: &crate::config::SessionRecord) 
         None,
         resume,
         rc_name.as_deref(),
+        record.claude_session_id.as_deref(),
     );
 
     let output = Command::new("tmux")
@@ -1215,6 +1240,23 @@ fn set_session_agent(tmux_name: &str, agent: AgentKind) {
         .output();
 }
 
+fn new_claude_session_id(agent: AgentKind) -> Option<String> {
+    (agent == AgentKind::Claude).then(|| uuid::Uuid::new_v4().to_string())
+}
+
+fn set_claude_session_id(tmux_name: &str, id: Option<&str>) {
+    if let Some(id) = id {
+        let _ = Command::new("tmux")
+            .args(["set-environment", "-t", tmux_name, "CM_CLAUDE_SESSION", id])
+            .output();
+    }
+}
+
+/// The Claude conversation id a session was created with, for its record.
+pub fn claude_session_id(tmux_name: &str) -> Option<String> {
+    get_session_env(tmux_name, "CM_CLAUDE_SESSION").map(|id| id.trim().to_string())
+}
+
 /// The agent running in a session. Sessions created before agents were
 /// tracked have no `CM_AGENT` and default to Claude.
 pub fn session_agent(session_name: &str) -> AgentKind {
@@ -1275,12 +1317,16 @@ fn build_agent_command(
     initial_prompt: Option<&str>,
     resume: bool,
     remote_control_name: Option<&str>,
+    claude_session_id: Option<&str>,
 ) -> String {
     match agent {
         AgentKind::Claude => {
             let mut cmd = String::from("claude --dangerously-skip-permissions");
-            if resume {
-                cmd.push_str(" --continue");
+            match (resume, claude_session_id) {
+                (true, Some(id)) => cmd.push_str(&format!(" --resume {id}")),
+                (true, None) => cmd.push_str(" --continue"),
+                (false, Some(id)) => cmd.push_str(&format!(" --session-id {id}")),
+                (false, None) => {}
             }
             if let Some(name) = remote_control_name {
                 cmd.push_str(&format!(" --remote-control {}", shell_escape(name)));
@@ -3234,17 +3280,51 @@ Some transcript output.\n\
             Some("do it"),
             false,
             None,
+            None,
         );
         assert_eq!(
             cmd,
             "pi --approve --append-system-prompt 'briefing' 'do it'"
         );
 
-        let resumed = build_agent_command(AgentKind::Pi, "/w", Some("briefing"), None, true, None);
+        let resumed = build_agent_command(
+            AgentKind::Pi,
+            "/w",
+            Some("briefing"),
+            None,
+            true,
+            None,
+            None,
+        );
         assert_eq!(
             resumed,
             "pi --approve --continue --append-system-prompt 'briefing'"
         );
+    }
+
+    #[test]
+    fn claude_command_pins_conversation_by_session_id() {
+        let new = build_agent_command(
+            AgentKind::Claude,
+            "/w",
+            None,
+            None,
+            false,
+            None,
+            Some("id1"),
+        );
+        assert_eq!(
+            new,
+            "claude --dangerously-skip-permissions --session-id id1"
+        );
+        let resumed =
+            build_agent_command(AgentKind::Claude, "/w", None, None, true, None, Some("id1"));
+        assert_eq!(
+            resumed,
+            "claude --dangerously-skip-permissions --resume id1"
+        );
+        let legacy = build_agent_command(AgentKind::Claude, "/w", None, None, true, None, None);
+        assert_eq!(legacy, "claude --dangerously-skip-permissions --continue");
     }
 
     #[test]
@@ -3256,6 +3336,7 @@ Some transcript output.\n\
             None,
             true,
             Some("mac · app / fix"),
+            None,
         );
         assert_eq!(
             cmd,

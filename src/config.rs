@@ -900,6 +900,10 @@ pub struct SessionRecord {
     /// Claude session reachable via Remote Control; kept on recreation.
     #[serde(default, skip_serializing_if = "is_false")]
     pub remote_control: bool,
+    /// Claude conversation id (`--session-id`), so recreation resumes this
+    /// session's conversation rather than the latest one in its directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_session_id: Option<String>,
 }
 
 impl SessionRecord {
