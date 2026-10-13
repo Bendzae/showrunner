@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use crate::tmux::{self, DiffStats, PrInfo, PrState, SessionStatus, TmuxSession};
+use crate::tmux::{self, DiffStats, PrInfo, PrState, SessionProbe, SessionStatus, TmuxSession};
 
 /// Task info for computing branch diffs.
 #[derive(Clone)]
@@ -97,6 +97,10 @@ fn worker_loop(hints: Arc<Mutex<WorkerHints>>, latest: Arc<Mutex<Option<WorkerUp
                     stable_ticks.remove(&session.name);
                     SessionStatus::Finished
                 }
+                Some(SessionProbe {
+                    reported: Some(status),
+                    ..
+                }) => status,
                 Some(probe) => {
                     let prev_hash = content_hashes.get(&session.name).copied();
                     let content_changed = prev_hash.is_some_and(|h| h != probe.content_hash);

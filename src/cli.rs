@@ -43,6 +43,8 @@ Managing tasks and sessions (usable from inside a session):
   showrunner session kill <session> --yes
   showrunner session move <session> --to <host|local> [--note <text>] [--no-handoff]
   showrunner session remote-control <session> [on|off]   (omit to toggle; Claude only)
+  showrunner session info [<session>]           JSON: the session's task, PR, diff and
+                                                    sibling sessions (default: this one)
 
 Housekeeping:
   showrunner restore                            recreate saved sessions that
@@ -313,6 +315,13 @@ fn sample_statuses(sessions: &[TmuxSession]) -> HashMap<String, SessionStatus> {
             let status = match (first.get(&s.name).and_then(|p| p.as_ref()), probe) {
                 (_, None) => SessionStatus::Finished,
                 (_, Some(p)) if !p.agent_alive => SessionStatus::Finished,
+                (
+                    _,
+                    Some(tmux::SessionProbe {
+                        reported: Some(status),
+                        ..
+                    }),
+                ) => status,
                 (Some(before), Some(after)) if before.content_hash != after.content_hash => {
                     SessionStatus::Running
                 }
@@ -745,6 +754,7 @@ fn cmd_session(args: &[String]) -> Result<()> {
         Some("import") => cmd_session_import(&args[1..]),
         Some("release") => cmd_session_release(&args[1..]),
         Some("remote-control") => cmd_session_remote_control(&args[1..]),
+        Some("info") => cmd_session_info(&args[1..]),
         Some(other) => bail!("unknown session command '{other}' (expected create, kill or move)"),
         None => bail!(
             "usage: session create <project> <task> | session kill <session> --yes | \
@@ -917,6 +927,68 @@ fn cmd_session_import(args: &[String]) -> Result<()> {
         .map(|s| session_ref(&s))
         .unwrap_or(tmux_name);
     println!("created session: {session}");
+    Ok(())
+}
+
+/// One session's context as JSON, cheap enough to poll from inside it: its
+/// task, branch, PR (cached), diff and siblings with their reported status.
+fn cmd_session_info(args: &[String]) -> Result<()> {
+    let (positional, _) = parse_args(args, &[], &[])?;
+    let tmux_name = match positional.as_slice() {
+        [reference] => resolve_recorded_session(reference)?,
+        [] => current_session_name()
+            .ok_or_else(|| anyhow::anyhow!("not inside a showrunner session; pass <session>"))?,
+        _ => bail!("usage: session info [<session>]"),
+    };
+    let record = config::load_sessions()
+        .remove(&tmux_name)
+        .ok_or_else(|| anyhow::anyhow!("no session record for {tmux_name}"))?;
+    let cfg = Config::load()?;
+    let sessions = tmux::list_sessions().unwrap_or_default();
+    let is_adhoc = tmux::is_adhoc_marker(&record.task_name);
+    let siblings = if is_adhoc {
+        tmux::adhoc_sessions_for_project(&record.project_name, &sessions)
+    } else {
+        tmux::sessions_for_task(&record.project_name, &record.task_name, &sessions)
+    };
+    let task = (!is_adhoc)
+        .then(|| cfg.find_task(&record.project_name, &record.task_name))
+        .flatten();
+
+    let mut out = json!({
+        "project": record.project_name,
+        "task": (!is_adhoc).then_some(&record.task_name),
+        "session": record.session_name,
+        "branch": tmux::get_session_branch(&tmux_name),
+        "session_diff": tmux::get_diff_stats(&tmux_name).map(|d| d.to_json()),
+        "siblings": siblings
+            .iter()
+            .filter(|s| s.name != tmux_name)
+            .map(|s| json!({
+                "name": s.session_name,
+                "agent": tmux::session_agent(&s.name).id(),
+                "status": tmux::reported_status(&s.name).map(|st| st.as_str()),
+            }))
+            .collect::<Vec<_>>(),
+    });
+    if let Some(task) = task {
+        out["base_branch"] = json!(task.base_branch());
+        out["linear"] = json!(task.linear);
+        out["task_diff"] = json!(
+            tmux::get_branch_diff(&record.project_path, &task.branch, task.base_branch())
+                .map(|d| d.to_json())
+        );
+        out["pr"] = json!(
+            ops::cached_pr_info(
+                &record.project_name,
+                &record.project_path,
+                &task.branch,
+                Duration::from_secs(300),
+            )
+            .map(|pr| pr.to_json())
+        );
+    }
+    println!("{}", serde_json::to_string(&out)?);
     Ok(())
 }
 

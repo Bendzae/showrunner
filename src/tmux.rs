@@ -1257,6 +1257,12 @@ pub fn claude_session_id(tmux_name: &str) -> Option<String> {
     get_session_env(tmux_name, "CM_CLAUDE_SESSION").map(|id| id.trim().to_string())
 }
 
+/// The status a session's agent reports in `CM_STATUS` (set by the
+/// showrunner Claude mod).
+pub fn reported_status(session_name: &str) -> Option<SessionStatus> {
+    get_session_env(session_name, "CM_STATUS").and_then(|s| SessionStatus::parse(s.trim()))
+}
+
 /// The agent running in a session. Sessions created before agents were
 /// tracked have no `CM_AGENT` and default to Claude.
 pub fn session_agent(session_name: &str) -> AgentKind {
@@ -2360,6 +2366,9 @@ pub struct SessionProbe {
     pub agent_alive: bool,
     pub content_hash: u64,
     pub has_permission_prompt: bool,
+    /// Status the agent reports itself (the showrunner Claude mod), trusted
+    /// over the pane heuristics.
+    pub reported: Option<SessionStatus>,
 }
 
 /// Probe a session for raw status signals.
@@ -2417,6 +2426,7 @@ pub fn probe_session(session_name: &str) -> Option<SessionProbe> {
         agent_alive,
         content_hash,
         has_permission_prompt,
+        reported: reported_status(session_name),
     })
 }
 
