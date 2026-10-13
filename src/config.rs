@@ -974,6 +974,20 @@ pub fn set_session_record_remote_control(tmux_name: &str, on: bool) {
     }
 }
 
+/// Set the Claude conversation a session record resumes and persist.
+pub fn set_session_record_claude_session_id(tmux_name: &str, id: &str) -> bool {
+    let _g = IO_LOCK.lock().unwrap();
+    let mut sessions = load_sessions();
+    let Some(record) = sessions.get_mut(tmux_name) else {
+        return false;
+    };
+    if record.claude_session_id.as_deref() != Some(id) {
+        record.claude_session_id = Some(id.to_string());
+        let _ = save_sessions(&sessions);
+    }
+    true
+}
+
 /// Remove all session records matching a project+task and persist.
 pub fn remove_task_session_records(project_name: &str, task_name: &str) {
     let _g = IO_LOCK.lock().unwrap();

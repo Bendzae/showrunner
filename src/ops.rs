@@ -556,11 +556,41 @@ fn linear_token(workspace: Option<&str>) -> Option<String> {
 }
 
 fn fetch_linear_state(ticket_id: &str, token: &str) -> Option<serde_json::Value> {
+    let data = linear_query(
+        "query($id: String!) { issue(id: $id) { state { name color type } } }",
+        ticket_id,
+        token,
+    )?;
+    Some(data["issue"]["state"].clone()).filter(|s| s.is_object())
+}
+
+/// A Linear ticket's content for reading: title, state, people, description
+/// and its latest comments, fetched live.
+pub fn linear_ticket(ticket_id: &str, workspace: Option<&str>) -> Result<serde_json::Value> {
+    let token = linear_token(workspace).ok_or_else(|| {
+        anyhow::anyhow!("no Linear token: set LINEAR_API_KEY or log in with the linear CLI")
+    })?;
+    let data = linear_query(
+        "query($id: String!) { issue(id: $id) { \
+           identifier title url description priorityLabel \
+           state { name color type } assignee { displayName } creator { displayName } \
+           labels { nodes { name color } } \
+           comments(last: 10) { nodes { body createdAt user { displayName } } } } }",
+        ticket_id,
+        &token,
+    )
+    .ok_or_else(|| anyhow::anyhow!("could not fetch {ticket_id} from Linear"))?;
+    let issue = data["issue"].clone();
+    if !issue.is_object() {
+        bail!("Linear has no ticket {ticket_id}");
+    }
+    Ok(issue)
+}
+
+/// Run a GraphQL query taking one `$id` against Linear and return its `data`.
+fn linear_query(query: &str, id: &str, token: &str) -> Option<serde_json::Value> {
     use std::io::Write;
-    let body = serde_json::json!({
-        "query": "query($id: String!) { issue(id: $id) { state { name color type } } }",
-        "variables": { "id": ticket_id },
-    });
+    let body = serde_json::json!({ "query": query, "variables": { "id": id } });
     // The token goes in on stdin (`-H @-`) so it never shows in the process list.
     let mut child = std::process::Command::new("curl")
         .args([
@@ -591,5 +621,107 @@ fn fetch_linear_state(ticket_id: &str, token: &str) -> Option<serde_json::Value>
         return None;
     }
     let response: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
-    Some(response["data"]["issue"]["state"].clone()).filter(|s| s.is_object())
+    Some(response["data"].clone()).filter(|d| d.is_object())
+}
+
+/// A task's PR for reading: title, state, checks and unresolved review
+/// threads, fetched live through `gh`.
+pub fn pr_details(project_path: &str, branch: &str) -> Result<serde_json::Value> {
+    let gh = |args: &[&str]| -> Result<serde_json::Value> {
+        let output = std::process::Command::new("gh")
+            .args(args)
+            .current_dir(project_path)
+            .output()?;
+        if !output.status.success() {
+            bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+        }
+        Ok(serde_json::from_slice(&output.stdout)?)
+    };
+
+    let pr = gh(&[
+        "pr",
+        "view",
+        branch,
+        "--json",
+        "number,title,url,state,isDraft,reviewDecision,statusCheckRollup,additions,deletions,changedFiles",
+    ])
+    .map_err(|e| anyhow::anyhow!("no PR for {branch}: {e}"))?;
+
+    let checks: Vec<serde_json::Value> = pr["statusCheckRollup"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|run| {
+            // CheckRun: status + conclusion; StatusContext: state.
+            let outcome = run["conclusion"]
+                .as_str()
+                .filter(|c| !c.is_empty())
+                .or_else(|| run["state"].as_str())
+                .unwrap_or("");
+            let state = match outcome {
+                "SUCCESS" => "pass",
+                "FAILURE" | "ERROR" | "TIMED_OUT" | "CANCELLED" | "ACTION_REQUIRED"
+                | "STARTUP_FAILURE" => "fail",
+                "SKIPPED" | "NEUTRAL" | "STALE" => "skipped",
+                _ => "pending",
+            };
+            serde_json::json!({
+                "name": run["name"].as_str().or_else(|| run["context"].as_str()),
+                "state": state,
+                "url": run["detailsUrl"].as_str().or_else(|| run["targetUrl"].as_str()),
+            })
+        })
+        .collect();
+
+    let number = pr["number"].as_u64().unwrap_or(0).to_string();
+    let threads = gh(&[
+        "api",
+        "graphql",
+        "-F",
+        "owner={owner}",
+        "-F",
+        "repo={repo}",
+        "-F",
+        &format!("number={number}"),
+        "-f",
+        "query=query($owner: String!, $repo: String!, $number: Int!) { repository(owner: $owner, name: $repo) { pullRequest(number: $number) { reviewThreads(first: 100) { nodes { isResolved path line comments(first: 1) { nodes { author { login } body url } } } } } } }",
+    ])
+    .map(|v| {
+        v["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|t| t["isResolved"] == false)
+            .map(|t| {
+                let first = &t["comments"]["nodes"][0];
+                serde_json::json!({
+                    "path": t["path"],
+                    "line": t["line"],
+                    "author": first["author"]["login"],
+                    "body": first["body"],
+                    "url": first["url"],
+                })
+            })
+            .collect::<Vec<_>>()
+    })
+    .unwrap_or_default();
+
+    let state = match (pr["state"].as_str(), pr["isDraft"].as_bool()) {
+        (Some("MERGED"), _) => "merged",
+        (Some("CLOSED"), _) => "closed",
+        (_, Some(true)) => "draft",
+        _ => "open",
+    };
+    Ok(serde_json::json!({
+        "number": pr["number"],
+        "title": pr["title"],
+        "url": pr["url"],
+        "state": state,
+        "review": pr["reviewDecision"],
+        "additions": pr["additions"],
+        "deletions": pr["deletions"],
+        "changed_files": pr["changedFiles"],
+        "checks": checks,
+        "threads": threads,
+    }))
 }

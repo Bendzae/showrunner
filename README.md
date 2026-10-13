@@ -307,7 +307,12 @@ The default harness (`claude`).
 `claude-mod/` is a Claude Code mod that ties Claude sessions closer to showrunner. Inside a showrunner session it:
 
 - reports the session's status itself (`CM_STATUS`: running, waiting for input, waiting for permission), which showrunner trusts over reading the pane;
-- draws a band above the prompt with the project, task, session, branch and base, diff, PR, Linear ticket and the status of sibling sessions (from `showrunner session info`).
+- draws a band above the prompt with the project, task, session, diff, PR and Linear ticket (with its state) — both clickable — and the status of sibling sessions (from `showrunner session info`);
+- adds `/ticket`, which opens the task's Linear ticket (description, labels, latest comments) in a pane (from `showrunner session ticket`);
+- adds `/pr`, which opens the task's PR in a pane: checks (failing and pending ones linked), review state and unresolved review comments, with a **Send to Claude** button that puts them in the prompt (from `showrunner session pr`);
+- keeps the session record on the conversation the session runs, so a session recreated after `/clear` resumes the right one.
+
+Ticket state and content need a Linear token: `LINEAR_API_KEY`, or on macOS the one the `linear` CLI keeps in the keychain. Clickable links inside tmux need `set -as terminal-features ',*:hyperlinks'`.
 
 Outside showrunner sessions it does nothing. Install it for every session on a machine:
 

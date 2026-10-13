@@ -45,6 +45,11 @@ Managing tasks and sessions (usable from inside a session):
   showrunner session remote-control <session> [on|off]   (omit to toggle; Claude only)
   showrunner session info [<session>]           JSON: the session's task, PR, diff and
                                                     sibling sessions (default: this one)
+  showrunner session ticket [<session>]         JSON: the task's Linear ticket, live
+  showrunner session pr [<session>]             JSON: the task's PR with checks and
+                                                    unresolved review threads, live
+  showrunner session set-conversation <session> <id>
+                                                record the Claude conversation it resumes
 
 Housekeeping:
   showrunner restore                            recreate saved sessions that
@@ -755,6 +760,9 @@ fn cmd_session(args: &[String]) -> Result<()> {
         Some("release") => cmd_session_release(&args[1..]),
         Some("remote-control") => cmd_session_remote_control(&args[1..]),
         Some("info") => cmd_session_info(&args[1..]),
+        Some("ticket") => cmd_session_ticket(&args[1..]),
+        Some("pr") => cmd_session_pr(&args[1..]),
+        Some("set-conversation") => cmd_session_set_conversation(&args[1..]),
         Some(other) => bail!("unknown session command '{other}' (expected create, kill or move)"),
         None => bail!(
             "usage: session create <project> <task> | session kill <session> --yes | \
@@ -927,6 +935,62 @@ fn cmd_session_import(args: &[String]) -> Result<()> {
         .map(|s| session_ref(&s))
         .unwrap_or(tmux_name);
     println!("created session: {session}");
+    Ok(())
+}
+
+/// The PR of a session's task, fetched live, as JSON.
+fn cmd_session_pr(args: &[String]) -> Result<()> {
+    let (positional, _) = parse_args(args, &[], &[])?;
+    let tmux_name = match positional.as_slice() {
+        [reference] => resolve_recorded_session(reference)?,
+        [] => current_session_name()
+            .ok_or_else(|| anyhow::anyhow!("not inside a showrunner session; pass <session>"))?,
+        _ => bail!("usage: session pr [<session>]"),
+    };
+    let record = config::load_sessions()
+        .remove(&tmux_name)
+        .ok_or_else(|| anyhow::anyhow!("no session record for {tmux_name}"))?;
+    if tmux::is_adhoc_marker(&record.task_name) {
+        bail!("adhoc sessions have no PR");
+    }
+    let pr = ops::pr_details(&record.project_path, &record.task_branch)?;
+    println!("{}", serde_json::to_string(&pr)?);
+    Ok(())
+}
+
+/// Record the Claude conversation a session runs, so recreation resumes it
+/// (the showrunner Claude mod calls this when it changes, e.g. on `/clear`).
+fn cmd_session_set_conversation(args: &[String]) -> Result<()> {
+    let (positional, _) = parse_args(args, &[], &[])?;
+    let [reference, id] = positional.as_slice() else {
+        bail!("usage: session set-conversation <session> <id>");
+    };
+    let tmux_name = resolve_recorded_session(reference)?;
+    config::set_session_record_claude_session_id(&tmux_name, id);
+    Ok(())
+}
+
+/// The Linear ticket linked to a session's task, fetched live, as JSON.
+fn cmd_session_ticket(args: &[String]) -> Result<()> {
+    let (positional, _) = parse_args(args, &[], &[])?;
+    let tmux_name = match positional.as_slice() {
+        [reference] => resolve_recorded_session(reference)?,
+        [] => current_session_name()
+            .ok_or_else(|| anyhow::anyhow!("not inside a showrunner session; pass <session>"))?,
+        _ => bail!("usage: session ticket [<session>]"),
+    };
+    let record = config::load_sessions()
+        .remove(&tmux_name)
+        .ok_or_else(|| anyhow::anyhow!("no session record for {tmux_name}"))?;
+    let cfg = Config::load()?;
+    let url = cfg
+        .find_task(&record.project_name, &record.task_name)
+        .and_then(|t| t.linear.clone())
+        .ok_or_else(|| anyhow::anyhow!("no Linear ticket linked to this task"))?;
+    let id = config::linear_ticket_id(&url)
+        .ok_or_else(|| anyhow::anyhow!("'{url}' is not a Linear issue URL"))?;
+    let ticket = ops::linear_ticket(id, config::linear_workspace(&url))?;
+    println!("{}", serde_json::to_string(&ticket)?);
     Ok(())
 }
 
