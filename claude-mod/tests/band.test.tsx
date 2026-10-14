@@ -291,3 +291,62 @@ test('/pr shows checks and review comments; Send to Claude fills the prompt', as
   expect(filled[0]).not.toContain('bot footer')
   await ui.unmount()
 })
+
+async function finishTurn($: any, on: On, answer: string, verdict: string, classified: string[]) {
+  const writes: string[][] = []
+  host(on, 'cm__app__fix-auth__main', writes)
+  on('session.start', ($, e) => ({ cwd: e.cwd }))
+  on('turn.start', ($, e) => ({ turnId: e.turnId }))
+  on('turn.complete', () => ({ text: '' }))
+  on('model.classify', ($, e) => {
+    classified.push(e.text)
+    return { value: verdict } as any
+  })
+  await $.session.start(start as any)
+  await $.turn.start({ text: 'go', turnId: 't1' } as any)
+  await $.turn.complete({
+    reason: 'answer',
+    answer,
+    durationMs: 5,
+    isAborted: false,
+    turnId: 't1',
+  } as any)
+  await settle()
+  return writes
+    .filter(w => w[0] === 'tmux')
+    .map(w => w[5])
+    .pop()
+}
+
+test('an answer ending in questions for the person needs them', async ($, on) => {
+  const classified: string[] = []
+  const last = await finishTurn(
+    $,
+    on,
+    'Done with the parser.\n\nShould dates be UTC or local? And keep empty rows?',
+    'asks',
+    classified,
+  )
+  expect(classified.length).toBe(1)
+  expect(last).toBe('waiting_permission')
+})
+
+test('a question the model judges rhetorical leaves the session idle', async ($, on) => {
+  const classified: string[] = []
+  const last = await finishTurn($, on, 'All tests pass. Anything else?', 'done', classified)
+  expect(classified.length).toBe(1)
+  expect(last).toBe('waiting_input')
+})
+
+test('a ? only inside code is not checked', async ($, on) => {
+  const classified: string[] = []
+  const last = await finishTurn(
+    $,
+    on,
+    'Fixed:\n```ts\nconst x = a ? b : c\n```\nDone.',
+    'asks',
+    classified,
+  )
+  expect(classified.length).toBe(0)
+  expect(last).toBe('waiting_input')
+})

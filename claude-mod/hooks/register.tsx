@@ -62,6 +62,20 @@ async function syncConversation($: EngineInterface) {
     .catch(() => undefined)
 }
 
+/** Whether an answer ends by asking the person something they need to
+ * answer: only a closing `?` is worth a quick check by the small model. */
+async function asksPerson($: EngineInterface, answer: string): Promise<boolean> {
+  const tail = answerTail(answer)
+  if (!tail.includes('?')) return false
+  const verdict = await $.model
+    .classify(
+      `Does this end of an assistant's reply ask the user one or more questions they need to answer before work can continue? Offers like "Want me to …?" count only if the reply waits on the answer.\n\n${tail}`,
+      ['asks', 'done'],
+    )
+    .catch(() => undefined)
+  return verdict === 'asks'
+}
+
 async function loadPr($: EngineInterface) {
   if (tmuxName === undefined) return
   await update($, pr, (): Loaded<PullRequest> => ({ status: 'loading' }))
@@ -332,7 +346,8 @@ export const register: Register = on => {
 
   on('turn.complete', async ($, e, next) => {
     if (e.agentId === undefined) {
-      await report($, 'waiting_input')
+      const asks = e.reason === 'answer' && (await asksPerson($, e.answer))
+      await report($, asks ? 'waiting_permission' : 'waiting_input')
       void refresh($)
     }
     return next(e)
@@ -465,6 +480,14 @@ function Pill({
       {children}{' '}
     </Text>
   )
+}
+
+/** The last stretch of an answer, code blocks left out. */
+function answerTail(answer: string): string {
+  return answer
+    .replace(/```[\s\S]*?```/g, '')
+    .trim()
+    .slice(-800)
 }
 
 function reviewLabel(review: string): string {
