@@ -1072,6 +1072,20 @@ pub fn send_key(session_name: &str, key: &str) -> Result<()> {
     Ok(())
 }
 
+/// Names of the local tmux sessions a client is attached to.
+pub fn attached_sessions() -> Vec<String> {
+    Command::new("tmux")
+        .args(["list-clients", "-F", "#{session_name}"])
+        .output()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 pub fn attach_session(name: &str) -> Result<()> {
     // Select window 0 (claude) before attaching
     let _ = Command::new("tmux")

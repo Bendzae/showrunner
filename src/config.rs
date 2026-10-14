@@ -740,6 +740,9 @@ pub struct Config {
     /// like `ENG-123` be linked to a task.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub linear_workspace: Option<String>,
+    /// macOS notifications when a session starts needing you (default: on).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notifications: Option<bool>,
     /// Names this machine in Remote Control session names. Defaults to the
     /// hostname.
     #[serde(default, skip_serializing_if = "Option::is_none")]

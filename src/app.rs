@@ -714,6 +714,7 @@ impl App {
         if latest.is_none() && hosts.is_none() {
             return;
         }
+        let previous_statuses = self.session_statuses.clone();
         if let Some(update) = latest {
             self.sessions = update.sessions;
             self.session_statuses = update.statuses;
@@ -778,7 +779,68 @@ impl App {
                     .map(|(k, v)| (k.clone(), v.clone())),
             );
         }
+        self.notify_needs_you(&previous_statuses);
         self.rebuild_items();
+    }
+
+    /// Post a notification for each session that just started needing the
+    /// person, skipping sessions someone is attached to. Nothing on the first
+    /// update, so sessions already waiting at startup stay quiet.
+    fn notify_needs_you(&self, previous: &HashMap<String, SessionStatus>) {
+        if !self.config.notifications.unwrap_or(true) || previous.is_empty() {
+            return;
+        }
+        let newly_waiting: Vec<&String> = self
+            .session_statuses
+            .iter()
+            .filter(|(key, status)| {
+                **status == SessionStatus::WaitingForPermission
+                    && previous
+                        .get(*key)
+                        .is_some_and(|before| *before != SessionStatus::WaitingForPermission)
+            })
+            .map(|(key, _)| key)
+            .collect();
+        if newly_waiting.is_empty() {
+            return;
+        }
+        let attached = tmux::attached_sessions();
+        let all_sessions = self
+            .sessions
+            .iter()
+            .chain(self.hosts.iter().flat_map(|h| h.sessions.iter()));
+        for session in all_sessions {
+            let key = session.key();
+            if !newly_waiting.contains(&&key) || attached.contains(&key) {
+                continue;
+            }
+            let project = match &session.host {
+                Some(host) => format!("{host}:{}", session.project_name),
+                None => session.project_name.clone(),
+            };
+            let place = if tmux::is_adhoc_marker(&session.task_name) {
+                session.session_name.clone()
+            } else {
+                format!(
+                    "{} / {}",
+                    self.task_display_name(session),
+                    session.session_name
+                )
+            };
+            crate::notify::post("showrunner", &project, &format!("{place} needs you"));
+        }
+    }
+
+    /// The task's name as configured, for a session whose tmux name carries
+    /// it sanitized.
+    fn task_display_name(&self, session: &TmuxSession) -> String {
+        self.config
+            .projects
+            .iter()
+            .filter(|p| tmux::sanitize(&p.name) == session.project_name)
+            .flat_map(|p| p.tasks.iter())
+            .find(|t| tmux::sanitize(&t.name) == session.task_name)
+            .map_or_else(|| session.task_name.clone(), |t| t.name.clone())
     }
 
     /// The sessions living where the project at `project_path` lives: on a

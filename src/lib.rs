@@ -3,6 +3,7 @@ pub mod app;
 pub mod cli;
 pub mod config;
 mod entry;
+pub mod notify;
 pub mod ops;
 pub mod remote;
 pub mod server;

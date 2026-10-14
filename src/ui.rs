@@ -936,6 +936,28 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
                             Style::default().fg(current().green),
                         ));
                     }
+                    let needing_you = app
+                        .sessions_at(&project.path)
+                        .iter()
+                        .filter(|s| {
+                            s.project_name == sanitized
+                                && app.session_statuses.get(&s.key())
+                                    == Some(&SessionStatus::WaitingForPermission)
+                        })
+                        .count();
+                    if needing_you > 0 {
+                        meta.push(Span::raw("  "));
+                        meta.push(needs_you_badge());
+                        meta.push(Span::styled(
+                            format!(
+                                " {needing_you} need{} you",
+                                if needing_you == 1 { "s" } else { "" }
+                            ),
+                            Style::default()
+                                .fg(current().attention)
+                                .add_modifier(Modifier::BOLD),
+                        ));
+                    }
                 }
 
                 if let Some(ind) = run_indicator(app, item) {
