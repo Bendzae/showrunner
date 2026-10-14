@@ -841,6 +841,62 @@ fn can_resume(agent: AgentKind, work_dir: &str, record: &crate::config::SessionR
     }
 }
 
+/// When the session's agent last exchanged a message (a prompt or a turn,
+/// not an attach), as Unix seconds. Claude sessions only.
+pub fn last_active(session_name: &str) -> Option<u64> {
+    if session_agent(session_name) != AgentKind::Claude {
+        return None;
+    }
+    let work_dir = get_session_env(session_name, "CM_WORKTREE_PATH")
+        .or_else(|| get_session_env(session_name, "CM_PROJECT_PATH"))?;
+    let home = dirs::home_dir()?;
+    let newest = fs::read_dir(claude_project_dir(&home, &work_dir))
+        .ok()?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().is_some_and(|x| x == "jsonl"))
+        .max_by_key(|entry| entry.metadata().and_then(|m| m.modified()).ok())?;
+    last_message_time(&newest.path())
+}
+
+/// The timestamp of the last user or assistant message in a transcript. Only
+/// the file's tail is read; Claude also appends bookkeeping entries at other
+/// times, so the file's mtime says nothing about work.
+fn last_message_time(path: &Path) -> Option<u64> {
+    use std::io::{Read, Seek, SeekFrom};
+    const TAIL: u64 = 256 * 1024;
+    let mut file = fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    file.seek(SeekFrom::Start(len.saturating_sub(TAIL))).ok()?;
+    let mut tail = String::new();
+    file.read_to_string(&mut tail).ok()?;
+    tail.lines().rev().find_map(|line| {
+        let entry: serde_json::Value = serde_json::from_str(line).ok()?;
+        if !matches!(entry["type"].as_str(), Some("user" | "assistant")) {
+            return None;
+        }
+        parse_utc_timestamp(entry["timestamp"].as_str()?)
+    })
+}
+
+/// Unix seconds of an RFC 3339 UTC timestamp (`2026-10-13T14:29:16.123Z`).
+fn parse_utc_timestamp(text: &str) -> Option<u64> {
+    let (date, time) = text.split_once('T')?;
+    let mut date = date.split('-').map(|p| p.parse::<i64>().ok());
+    let (year, month, day) = (date.next()??, date.next()??, date.next()??);
+    let mut time = time.trim_end_matches('Z').split(':');
+    let hour: i64 = time.next()?.parse().ok()?;
+    let minute: i64 = time.next()?.parse().ok()?;
+    let second: i64 = time.next()?.split('.').next()?.parse().ok()?;
+    // Days since 1970-01-01 (Howard Hinnant's days_from_civil).
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    u64::try_from(days * 86_400 + hour * 3_600 + minute * 60 + second).ok()
+}
+
 /// Where Claude keeps the transcripts of conversations run in `work_dir`.
 fn claude_project_dir(home: &Path, work_dir: &str) -> PathBuf {
     let key: String = work_dir
@@ -3324,6 +3380,16 @@ Some transcript output.\n\
             resumed,
             "pi --approve --continue --append-system-prompt 'briefing'"
         );
+    }
+
+    #[test]
+    fn parses_utc_timestamps() {
+        assert_eq!(parse_utc_timestamp("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(
+            parse_utc_timestamp("2026-10-13T14:29:16.123Z"),
+            Some(1_791_901_756)
+        );
+        assert_eq!(parse_utc_timestamp("garbage"), None);
     }
 
     #[test]

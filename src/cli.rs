@@ -396,6 +396,7 @@ fn cmd_list(args: &[String]) -> Result<()> {
                 .map(|d| d.to_json())
                 .unwrap_or(Value::Null);
             v["branch"] = json!(tmux::get_session_branch(&s.name));
+            v["last_active"] = json!(tmux::last_active(&s.name));
         }
         v
     };

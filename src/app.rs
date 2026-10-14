@@ -380,6 +380,9 @@ pub struct App {
     pub agent_picker_target: Option<AgentPickerTarget>,
     pub collapsed: HashSet<String>,
     pub session_statuses: HashMap<String, SessionStatus>,
+    /// When each session's agent last wrote its conversation (Unix seconds),
+    /// keyed by `TmuxSession::key()`.
+    pub last_active: HashMap<String, u64>,
     pub diff_stats: HashMap<String, DiffStats>,
     pub session_branches: HashMap<String, String>,
     /// Agent harness id per session, keyed by tmux name (from the worker).
@@ -636,6 +639,7 @@ impl App {
             agent_picker_target: None,
             collapsed: HashSet::new(),
             session_statuses: HashMap::new(),
+            last_active: HashMap::new(),
             diff_stats: HashMap::new(),
             session_branches: HashMap::new(),
             session_agents: HashMap::new(),
@@ -718,6 +722,9 @@ impl App {
         if let Some(update) = latest {
             self.sessions = update.sessions;
             self.session_statuses = update.statuses;
+            if !update.last_active.is_empty() {
+                self.last_active = update.last_active;
+            }
             self.diff_stats = update.diff_stats;
             if !update.session_agents.is_empty() {
                 self.session_agents = update.session_agents;
@@ -759,6 +766,8 @@ impl App {
                 .extend(host.statuses.iter().map(|(k, v)| (k.clone(), *v)));
             self.session_agents
                 .extend(host.agents.iter().map(|(k, v)| (k.clone(), v.clone())));
+            self.last_active
+                .extend(host.last_active.iter().map(|(k, v)| (k.clone(), *v)));
             self.diff_stats.extend(
                 host.session_diffs
                     .iter()

@@ -274,6 +274,7 @@ pub struct HostSnapshot {
     /// Keyed by `TmuxSession::key()`.
     pub statuses: HashMap<String, SessionStatus>,
     pub agents: HashMap<String, String>,
+    pub last_active: HashMap<String, u64>,
     pub session_diffs: HashMap<String, DiffStats>,
     pub session_branches: HashMap<String, String>,
     /// Keyed by `<host>:<branch>`.
@@ -327,6 +328,9 @@ fn snapshot_from_listing(
         }
         if let Some(agent) = v["agent"].as_str() {
             snapshot.agents.insert(key.clone(), agent.to_string());
+        }
+        if let Some(at) = v["last_active"].as_u64() {
+            snapshot.last_active.insert(key.clone(), at);
         }
         if let Some(diff) = DiffStats::from_json(&v["diff"]) {
             snapshot.session_diffs.insert(key.clone(), diff);

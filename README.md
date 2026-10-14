@@ -186,6 +186,10 @@ Sessions display their current status:
 - **Needs you** — the agent stopped on a permission or question dialog, or (with the Claude mod) ended its answer with questions for you; shown as a solid orange ` ! ` badge (each theme's own orange, used for nothing else) at the end of the session's line; its task's line turns orange (with the badge after the name while collapsed), and a collapsed project shows how many of its sessions need you. While the TUI runs, a session that starts needing you also posts a macOS notification (not for the session you're attached to) — through `terminal-notifier` when installed, so a click brings your terminal forward, else `osascript`; set `notifications = false` in `config.toml` to turn them off
 - **Finished** — the agent process has exited
 
+### Hot tasks
+
+A task whose agent exchanged a message (your prompt or a turn — attaching doesn't count) in the last 2 hours shows a 🔥 after its name, so the tasks you're actually working on stand out from the ones waiting on something. It's read from the end of each Claude session's transcript; the order of tasks doesn't change.
+
 ### PR Status
 
 Tasks with a pull request (found via `gh`) show it in the `PR` column as `#123` plus two glyphs, refreshed about once a minute. Selecting the task spells the same information out in the status bar.

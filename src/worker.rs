@@ -32,6 +32,9 @@ pub struct WorkerUpdate {
     pub session_branches: HashMap<String, String>,
     /// Agent harness id per session, keyed by session tmux name.
     pub session_agents: HashMap<String, String>,
+    /// When each session's agent last wrote its conversation (Unix seconds),
+    /// keyed by session tmux name.
+    pub last_active: HashMap<String, u64>,
     /// PR details keyed by branch name.
     pub prs: HashMap<String, PrInfo>,
     /// Current git branch for each project, keyed by project name.
@@ -71,6 +74,7 @@ fn worker_loop(hints: Arc<Mutex<WorkerHints>>, latest: Arc<Mutex<Option<WorkerUp
     let mut diff_stats: HashMap<String, DiffStats> = HashMap::new();
     let mut session_branches: HashMap<String, String> = HashMap::new();
     let mut session_agents: HashMap<String, String> = HashMap::new();
+    let mut last_active: HashMap<String, u64> = HashMap::new();
     let mut prs: HashMap<String, PrInfo> = HashMap::new();
     let mut task_diff_stats: HashMap<String, DiffStats> = HashMap::new();
     let mut project_branches: HashMap<String, String> = HashMap::new();
@@ -137,6 +141,7 @@ fn worker_loop(hints: Arc<Mutex<WorkerHints>>, latest: Arc<Mutex<Option<WorkerUp
             diff_stats: diff_stats.clone(),
             session_branches: session_branches.clone(),
             session_agents: session_agents.clone(),
+            last_active: last_active.clone(),
             task_diff_stats: task_diff_stats.clone(),
             prs: prs.clone(),
             project_branches: project_branches.clone(),
@@ -149,6 +154,7 @@ fn worker_loop(hints: Arc<Mutex<WorkerHints>>, latest: Arc<Mutex<Option<WorkerUp
             diff_stats.retain(|k, _| session_names.contains(k));
             session_branches.retain(|k, _| session_names.contains(k));
             session_agents.retain(|k, _| session_names.contains(k));
+            last_active.retain(|k, _| session_names.contains(k));
 
             for session in &sessions {
                 if let Some(stats) = tmux::get_diff_stats(&session.name) {
@@ -160,6 +166,9 @@ fn worker_loop(hints: Arc<Mutex<WorkerHints>>, latest: Arc<Mutex<Option<WorkerUp
                 session_agents
                     .entry(session.name.clone())
                     .or_insert_with(|| tmux::session_agent(&session.name).id().to_string());
+                if let Some(at) = tmux::last_active(&session.name) {
+                    last_active.insert(session.name.clone(), at);
+                }
             }
         }
 
@@ -221,6 +230,7 @@ fn worker_loop(hints: Arc<Mutex<WorkerHints>>, latest: Arc<Mutex<Option<WorkerUp
             diff_stats: diff_stats.clone(),
             session_branches: session_branches.clone(),
             session_agents: session_agents.clone(),
+            last_active: last_active.clone(),
             task_diff_stats: task_diff_stats.clone(),
             prs: prs.clone(),
             project_branches: project_branches.clone(),

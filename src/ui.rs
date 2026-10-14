@@ -76,6 +76,21 @@ fn status_glyph(status: SessionStatus, tick: usize) -> (&'static str, Color) {
     }
 }
 
+/// How recently a task's agent must have worked (a prompt or a turn) for the
+/// task to count as hot.
+const HOT_WINDOW_SECS: u64 = 2 * 60 * 60;
+
+/// Whether any of the task's sessions saw agent activity within the hot window.
+fn is_hot(app: &App, project_name: &str, project_path: &str, task: &Task) -> bool {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    tmux::sessions_for_task(project_name, &task.name, app.sessions_at(project_path))
+        .iter()
+        .filter_map(|s| app.last_active.get(&s.key()))
+        .any(|at| now.saturating_sub(*at) < HOT_WINDOW_SECS)
+}
+
 /// A solid badge marking what needs the person, so it stands out in the list.
 fn needs_you_badge() -> Span<'static> {
     Span::styled(
@@ -1018,6 +1033,9 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
                     tree,
                     Span::styled(&task.name, style),
                 ];
+                if is_hot(app, project_name, project_path, task) {
+                    left.push(Span::raw(" 🔥"));
+                }
 
                 if let Some((pos, total)) = stacks
                     .get(&app::scoped_project(project_name, project_path))
