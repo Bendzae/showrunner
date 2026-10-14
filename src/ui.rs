@@ -76,6 +76,27 @@ fn status_glyph(status: SessionStatus, tick: usize) -> (&'static str, Color) {
     }
 }
 
+/// The status marker in front of a session's name. A session that needs the
+/// person gets a solid badge instead of a glyph, so it stands out in the list.
+fn status_marker(status: SessionStatus, tick: usize) -> Span<'static> {
+    if status == SessionStatus::WaitingForPermission {
+        return Span::styled(
+            " ! ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(current().magenta)
+                .add_modifier(Modifier::BOLD),
+        );
+    }
+    let (icon, color) = status_glyph(status, tick);
+    Span::styled(format!("{icon} "), Style::default().fg(color))
+}
+
+/// Recolour a row's name and icon for a session that needs the person.
+fn needs_you_style(style: Style) -> Style {
+    style.fg(current().magenta).add_modifier(Modifier::BOLD)
+}
+
 pub fn draw(f: &mut Frame, app: &App) {
     crate::theme::set(crate::theme::THEMES[app.theme_index % crate::theme::THEMES.len()]);
 
@@ -1022,11 +1043,8 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
                         .filter_map(|s| app.session_statuses.get(&s.key()).copied())
                         .collect();
                     if let Some(status) = aggregate_status(&statuses) {
-                        let (icon, color) = status_glyph(status, app.tick);
-                        left.push(Span::styled(
-                            format!("  {icon}"),
-                            Style::default().fg(color),
-                        ));
+                        left.push(Span::raw("  "));
+                        left.push(status_marker(status, app.tick));
                     }
                     let active = statuses
                         .iter()
@@ -1176,7 +1194,16 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
                     .get(&session.key())
                     .copied()
                     .unwrap_or(SessionStatus::Finished);
-                let (status_icon, status_color) = status_glyph(status, app.tick);
+                let (_, status_color) = status_glyph(status, app.tick);
+                let needs_you = status == SessionStatus::WaitingForPermission;
+                if needs_you {
+                    style = needs_you_style(style);
+                }
+                let icon_style = if needs_you {
+                    needs_you_style(Style::default())
+                } else {
+                    Style::default().fg(current().accent)
+                };
 
                 let group_last = is_last_adhoc_group_lookup(&app.items, i, project_name);
                 let session_last = is_last_adhoc_session(&app.items, i, project_name);
@@ -1187,8 +1214,8 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
                     Span::styled(indicator, indicator_style),
                     Span::styled(continuation, tree_style),
                     Span::styled(branch_char, tree_style),
-                    Span::styled(format!("{status_icon} "), Style::default().fg(status_color)),
-                    Span::styled("⌂ ", Style::default().fg(current().accent)),
+                    status_marker(status, app.tick),
+                    Span::styled("⌂ ", icon_style),
                     Span::styled(&session.session_name, style),
                 ];
                 if let Some(icon) = agent_icon_span(app, &session.key()) {
@@ -1231,7 +1258,11 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
                     .get(&session.key())
                     .copied()
                     .unwrap_or(SessionStatus::Finished);
-                let (status_icon, status_color) = status_glyph(status, app.tick);
+                let (_, status_color) = status_glyph(status, app.tick);
+                let needs_you = status == SessionStatus::WaitingForPermission;
+                if needs_you {
+                    style = needs_you_style(style);
+                }
 
                 let continuation = session_tree_continuation(&app.items, i, project_name, task);
                 let continuation_style = if task.group.is_some() {
@@ -1247,18 +1278,21 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
                     Span::styled(indicator, indicator_style),
                     Span::styled(continuation, continuation_style),
                     Span::styled(connector(session_last), tree_style),
-                    Span::styled(format!("{status_icon} "), Style::default().fg(status_color)),
+                    status_marker(status, app.tick),
                 ];
-                if is_main {
-                    left.push(Span::styled("◆ ", Style::default().fg(current().accent)));
+                let (kind_icon, kind_color) = if is_main {
+                    ("◆ ", current().accent)
                 } else if has_worktree {
-                    left.push(Span::styled(
-                        "\u{e0a0} ",
-                        Style::default().fg(current().border),
-                    ));
+                    ("\u{e0a0} ", current().border)
                 } else {
-                    left.push(Span::styled("⌂ ", Style::default().fg(current().accent)));
-                }
+                    ("⌂ ", current().accent)
+                };
+                let kind_style = if needs_you {
+                    needs_you_style(Style::default())
+                } else {
+                    Style::default().fg(kind_color)
+                };
+                left.push(Span::styled(kind_icon, kind_style));
                 left.push(Span::styled(&session.session_name, style));
                 if let Some(icon) = agent_icon_span(app, &session.key()) {
                     left.push(icon);

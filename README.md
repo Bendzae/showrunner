@@ -183,7 +183,7 @@ review_tool = "difit"   # or "hunk" (default)
 Sessions display their current status:
 - **Running** — the agent is actively working
 - **Waiting for input** — the agent is waiting for your response
-- **Waiting for permission** — the agent stopped on a permission or question dialog
+- **Needs you** — the agent stopped on a permission or question dialog, or (with the Claude mod) ended its answer with questions for you; shown as a solid magenta ` ! ` badge with the session's line in magenta
 - **Finished** — the agent process has exited
 
 ### PR Status
@@ -299,14 +299,14 @@ The default harness (`claude`).
 
 - Launches with `--dangerously-skip-permissions`; the session briefing is passed via `--append-system-prompt`.
 - The showrunner skills are loaded as a Claude Code plugin (`--plugin-dir`), so they're available as `/commit-push-task` and `/manage-sessions` slash commands.
-- Permission prompts and question dialogs surface as **Waiting for permission**.
+- Permission prompts and question dialogs surface as **Needs you**.
 - Dead sessions resume their own conversation (`--session-id` at creation, `--resume <id>` after); sessions from before that use `claude --continue`.
 
 #### Claude mod (optional)
 
 `claude-mod/` is a Claude Code mod that ties Claude sessions closer to showrunner. Inside a showrunner session it:
 
-- reports the session's status itself (`CM_STATUS`: running, waiting for input, waiting for permission), which showrunner trusts over reading the pane;
+- reports the session's status itself (`CM_STATUS`: running, waiting for input, needs you), which showrunner trusts over reading the pane — an answer that ends by asking you questions (checked by Claude Code's small model when the reply's tail has a `?`) counts as needing you, like a question dialog;
 - draws a band above the prompt with the project, task, session, diff, PR and Linear ticket (with its state) — both clickable — and the status of sibling sessions (from `showrunner session info`);
 - adds `/ticket`, which opens the task's Linear ticket (description, labels, latest comments) in a pane (from `showrunner session ticket`);
 - adds `/pr`, which opens the task's PR in a pane: checks (failing and pending ones linked), review state and unresolved review comments, with a **Send to Claude** button that puts them in the prompt (from `showrunner session pr`);
