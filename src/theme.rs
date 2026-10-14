@@ -23,6 +23,8 @@ pub struct Theme {
     pub magenta: Color,
     pub cyan: Color,
     pub white: Color,
+    /// Only for sessions and tasks that need the person.
+    pub attention: Color,
 }
 
 const fn rgb(r: u8, g: u8, b: u8) -> Color {
@@ -43,6 +45,7 @@ impl Theme {
         magenta: Color::Magenta,
         cyan: Color::Cyan,
         white: Color::White,
+        attention: Color::Indexed(208),
     };
 
     /// Catppuccin Mocha — soft pastels on a warm dark base.
@@ -55,9 +58,10 @@ impl Theme {
         green: rgb(0xa6, 0xe3, 0xa1),
         red: rgb(0xf3, 0x8b, 0xa8),
         yellow: rgb(0xf9, 0xe2, 0xaf),
-        magenta: rgb(0xf5, 0xc2, 0xe7), // pink
-        cyan: rgb(0x94, 0xe2, 0xd5),    // teal
-        white: rgb(0xcd, 0xd6, 0xf4),   // text
+        magenta: rgb(0xf5, 0xc2, 0xe7),   // pink
+        cyan: rgb(0x94, 0xe2, 0xd5),      // teal
+        white: rgb(0xcd, 0xd6, 0xf4),     // text
+        attention: rgb(0xfa, 0xb3, 0x87), // peach
     };
 
     /// Tokyo Night — cool blues and purples on near-black.
@@ -73,6 +77,7 @@ impl Theme {
         magenta: rgb(0xbb, 0x9a, 0xf7), // purple
         cyan: rgb(0x7d, 0xcf, 0xff),
         white: rgb(0xc0, 0xca, 0xf5),
+        attention: rgb(0xff, 0x9e, 0x64), // orange
     };
 
     /// Dracula — vivid high-contrast purples, cyan and pink.
@@ -88,6 +93,7 @@ impl Theme {
         magenta: rgb(0xff, 0x79, 0xc6), // pink
         cyan: rgb(0x8b, 0xe9, 0xfd),
         white: rgb(0xf8, 0xf8, 0xf2),
+        attention: rgb(0xff, 0xb8, 0x6c), // orange
     };
 }
 

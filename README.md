@@ -183,7 +183,7 @@ review_tool = "difit"   # or "hunk" (default)
 Sessions display their current status:
 - **Running** — the agent is actively working
 - **Waiting for input** — the agent is waiting for your response
-- **Needs you** — the agent stopped on a permission or question dialog, or (with the Claude mod) ended its answer with questions for you; shown as a solid magenta ` ! ` badge at the end of the session's line; its task's line turns magenta (with the badge after the name while collapsed)
+- **Needs you** — the agent stopped on a permission or question dialog, or (with the Claude mod) ended its answer with questions for you; shown as a solid orange ` ! ` badge (each theme's own orange, used for nothing else) at the end of the session's line; its task's line turns orange (with the badge after the name while collapsed)
 - **Finished** — the agent process has exited
 
 ### PR Status

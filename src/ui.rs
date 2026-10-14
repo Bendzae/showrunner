@@ -71,7 +71,7 @@ fn status_glyph(status: SessionStatus, tick: usize) -> (&'static str, Color) {
     match status {
         SessionStatus::Running => (SPINNER[tick % SPINNER.len()], current().yellow),
         SessionStatus::WaitingForInput => ("●", current().green),
-        SessionStatus::WaitingForPermission => ("!", current().magenta),
+        SessionStatus::WaitingForPermission => ("!", current().attention),
         SessionStatus::Finished => ("●", current().red),
     }
 }
@@ -82,14 +82,14 @@ fn needs_you_badge() -> Span<'static> {
         " ! ",
         Style::default()
             .fg(Color::Black)
-            .bg(current().magenta)
+            .bg(current().attention)
             .add_modifier(Modifier::BOLD),
     )
 }
 
 /// Recolour a task row whose sessions need the person.
 fn needs_you_style(style: Style) -> Style {
-    style.fg(current().magenta).add_modifier(Modifier::BOLD)
+    style.fg(current().attention).add_modifier(Modifier::BOLD)
 }
 
 pub fn draw(f: &mut Frame, app: &App) {
@@ -227,7 +227,7 @@ fn draw_dashboard(f: &mut Frame, app: &App, area: Rect) {
         spans.push(Span::styled(sep_str, sep));
         spans.push(Span::styled(
             label("!", perm, "needs you"),
-            Style::default().fg(current().magenta),
+            Style::default().fg(current().attention),
         ));
     }
     if running > 0 {
