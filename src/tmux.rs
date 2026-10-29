@@ -435,23 +435,12 @@ pub fn create_session_with(
             bail!("Failed to create worktree: {stderr}");
         }
 
-        // Always copy .claude/ folder, plus any configured patterns (sync, before hooks setup)
-        let mut all_patterns = vec![".claude/***".to_string()];
-        all_patterns.extend_from_slice(copy_patterns);
-        copy_patterns_to_worktree(project_path, &worktree_path_str, &all_patterns);
-
-        // Run setup commands in the new worktree if configured
-        for cmd in setup_commands {
-            let output = Command::new("sh")
-                .args(["-c", cmd])
-                .current_dir(&worktree_path_str)
-                .output()?;
-
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                bail!("Setup command failed: {stderr}\nCommand: {cmd}");
-            }
-        }
+        prepare_worktree(
+            project_path,
+            &worktree_path_str,
+            copy_patterns,
+            setup_commands,
+        )?;
 
         work_dir = worktree_path_str.clone();
     } else {
@@ -784,10 +773,119 @@ fn record_worktree_dir(record: &crate::config::SessionRecord) -> PathBuf {
     )
 }
 
-/// A worktree-backed record whose worktree is gone can never be recreated;
-/// callers drop such records instead of retrying on every startup.
+/// A worktree-backed record whose worktree is gone: freed by archiving the
+/// task, or removed by hand. See [`restore_record_worktree`].
 pub fn record_worktree_missing(record: &crate::config::SessionRecord) -> bool {
     record.use_worktree && !record_worktree_dir(record).exists()
+}
+
+/// The branch a record's worktree has checked out: the task branch for the
+/// main session, `<task-branch>-<session>` for the others.
+pub fn record_branch(record: &crate::config::SessionRecord) -> String {
+    if is_main_session(&record.session_name) {
+        record.task_branch.clone()
+    } else {
+        format!("{}-{}", record.task_branch, sanitize(&record.session_name))
+    }
+}
+
+/// Remove a record's worktree (uncommitted changes included), keeping its
+/// branch and the record so the session can be restored later.
+pub fn remove_record_worktree(record: &crate::config::SessionRecord) {
+    if record.use_worktree {
+        remove_worktree(&record.project_path, &record_worktree_dir(record));
+    }
+}
+
+fn remove_worktree(project_path: &str, wt_path: &Path) {
+    if wt_path.exists() {
+        let _ = Command::new("git")
+            .args(["-C", project_path, "worktree", "remove", "--force"])
+            .arg(wt_path)
+            .output();
+    }
+    // Prune regardless, in case the dir was already removed but git still
+    // tracks it.
+    let _ = Command::new("git")
+        .args(["-C", project_path, "worktree", "prune"])
+        .output();
+}
+
+/// Recreate a record's missing worktree at its old path from the session
+/// branch. The path is what agents key their conversations by, so the
+/// recreated session resumes the old one.
+pub fn restore_record_worktree(
+    record: &crate::config::SessionRecord,
+    copy_patterns: &[String],
+    setup_commands: &[String],
+) -> Result<()> {
+    restore_worktree(
+        &record.project_path,
+        &record_worktree_dir(record),
+        &record_branch(record),
+        copy_patterns,
+        setup_commands,
+    )
+}
+
+fn restore_worktree(
+    project_path: &str,
+    wt_path: &Path,
+    branch: &str,
+    copy_patterns: &[String],
+    setup_commands: &[String],
+) -> Result<()> {
+    if let Some(parent) = wt_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    // Drop git's stale entry for a worktree removed by hand, which would
+    // otherwise block re-adding it at the same path.
+    let _ = Command::new("git")
+        .args(["-C", project_path, "worktree", "prune"])
+        .output();
+    let output = Command::new("git")
+        .args(["-C", project_path, "worktree", "add"])
+        .arg(wt_path)
+        .arg(branch)
+        .output()?;
+    if !output.status.success() {
+        bail!(
+            "Failed to recreate worktree: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    prepare_worktree(
+        project_path,
+        &wt_path.to_string_lossy(),
+        copy_patterns,
+        setup_commands,
+    )
+}
+
+/// Copy the `.claude/` folder and the configured patterns into a fresh
+/// worktree, then run the project's setup commands in it.
+fn prepare_worktree(
+    project_path: &str,
+    worktree_path: &str,
+    copy_patterns: &[String],
+    setup_commands: &[String],
+) -> Result<()> {
+    let mut all_patterns = vec![".claude/***".to_string()];
+    all_patterns.extend_from_slice(copy_patterns);
+    copy_patterns_to_worktree(project_path, worktree_path, &all_patterns);
+
+    for cmd in setup_commands {
+        let output = Command::new("sh")
+            .args(["-c", cmd])
+            .current_dir(worktree_path)
+            .output()?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!("Setup command failed: {stderr}\nCommand: {cmd}");
+        }
+    }
+    Ok(())
 }
 
 fn ensure_agent_installed(agent: AgentKind) -> Result<()> {
@@ -913,8 +1011,8 @@ fn dir_has_jsonl(dir: &Path) -> bool {
 }
 
 /// Recreate a tmux session from a saved record (e.g. after tmux dies) under the
-/// record's own `tmux_name`. Reuses the existing worktree if present; does NOT
-/// send an initial prompt.
+/// record's own `tmux_name` in its existing worktree; does NOT send an
+/// initial prompt.
 pub fn recreate_session(tmux_name: &str, record: &crate::config::SessionRecord) -> Result<String> {
     if record_worktree_missing(record) {
         bail!("worktree no longer exists");
@@ -931,15 +1029,8 @@ pub fn recreate_session(tmux_name: &str, record: &crate::config::SessionRecord) 
     // Always install the showrunner skills
     install_agent_skills(agent, &work_dir);
 
-    let session_branch = if record.use_worktree && !is_main_session(&record.session_name) {
-        Some(format!(
-            "{}-{}",
-            record.task_branch,
-            sanitize(&record.session_name)
-        ))
-    } else {
-        None
-    };
+    let session_branch = (record.use_worktree && !is_main_session(&record.session_name))
+        .then(|| record_branch(record));
 
     let system_prompt = build_base_system_prompt(
         &record.project_name,
@@ -2926,31 +3017,7 @@ pub fn delete_task(
 pub fn cleanup_orphan_session(record: &crate::config::SessionRecord) {
     // Remove the worktree directory if this session used one (committed work
     // remains on the branch, which we keep).
-    if record.use_worktree {
-        let wt_path = worktree_dir(
-            &record.project_name,
-            &record.task_name,
-            &record.session_name,
-        );
-        let wt_str = wt_path.to_string_lossy().to_string();
-        if wt_path.exists() {
-            let _ = Command::new("git")
-                .args([
-                    "-C",
-                    &record.project_path,
-                    "worktree",
-                    "remove",
-                    "--force",
-                    &wt_str,
-                ])
-                .output();
-        }
-        // Prune stale worktree references regardless, in case the dir was
-        // already removed but git still tracks it.
-        let _ = Command::new("git")
-            .args(["-C", &record.project_path, "worktree", "prune"])
-            .output();
-    }
+    remove_record_worktree(record);
 
     // Remove the cached task directory (pr_url.txt). The dir is
     // shared by all sessions of a task; since orphan status is per-task, every
@@ -3525,5 +3592,122 @@ Some transcript output.\n\
         let info = parse_pr_info(json).unwrap();
         assert_eq!(info.review, PrReview::ChangesRequested);
         assert_eq!(info.checks, Some(CiStatus::Failing));
+    }
+
+    // --- worktree remove / restore ---
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn scratch_repo(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("showrunner-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let repo = dir.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(
+            &repo,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "init",
+            ],
+        );
+        repo
+    }
+
+    #[test]
+    fn removed_worktree_is_restored_at_same_path_on_its_branch() {
+        let repo = scratch_repo("restore");
+        let project = repo.to_string_lossy().to_string();
+        let wt = repo.parent().unwrap().join("worktrees/task-review");
+        fs::create_dir_all(wt.parent().unwrap()).unwrap();
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "task-review",
+                wt.to_str().unwrap(),
+            ],
+        );
+        fs::write(wt.join("scratch.txt"), "uncommitted").unwrap();
+
+        remove_worktree(&project, &wt);
+        assert!(!wt.exists());
+        assert!(branch_exists(&project, "task-review"));
+
+        restore_worktree(
+            &project,
+            &wt,
+            "task-review",
+            &[],
+            &["touch setup-ran".into()],
+        )
+        .unwrap();
+        assert_eq!(
+            git(&wt, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            "task-review"
+        );
+        assert!(wt.join("setup-ran").exists());
+
+        let _ = fs::remove_dir_all(repo.parent().unwrap());
+    }
+
+    #[test]
+    fn worktree_removed_by_hand_is_restored() {
+        let repo = scratch_repo("by-hand");
+        let project = repo.to_string_lossy().to_string();
+        let wt = repo.parent().unwrap().join("worktrees/task-main");
+        fs::create_dir_all(wt.parent().unwrap()).unwrap();
+        git(&repo, &["branch", "task"]);
+        git(
+            &repo,
+            &["worktree", "add", "-q", wt.to_str().unwrap(), "task"],
+        );
+        fs::remove_dir_all(&wt).unwrap();
+
+        restore_worktree(&project, &wt, "task", &[], &[]).unwrap();
+        assert_eq!(git(&wt, &["rev-parse", "--abbrev-ref", "HEAD"]), "task");
+
+        let _ = fs::remove_dir_all(repo.parent().unwrap());
+    }
+
+    #[test]
+    fn record_branch_is_task_branch_for_main_else_session_branch() {
+        let record = |session: &str| crate::config::SessionRecord {
+            project_name: "p".into(),
+            project_path: "/p".into(),
+            task_name: "t".into(),
+            task_branch: "feat".into(),
+            session_name: session.into(),
+            use_worktree: true,
+            archived: false,
+            agent: "claude".into(),
+            remote_control: false,
+            claude_session_id: None,
+        };
+        assert_eq!(record_branch(&record(MAIN_SESSION)), "feat");
+        assert_eq!(record_branch(&record("code review")), "feat-code-review");
     }
 }

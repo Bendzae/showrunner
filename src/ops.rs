@@ -7,7 +7,7 @@ use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::agent::AgentKind;
-use crate::config::{self, Config, Project};
+use crate::config::{self, Config, Project, SessionRecord};
 use crate::tmux;
 
 /// The agent new sessions run: an explicit `--agent` value wins, else the
@@ -431,13 +431,11 @@ pub fn restore_sessions(cfg: &Config) -> RestoreReport {
         // names, which can drift when the config is edited by hand.
         match cfg.find_task_by_branch(&record.project_path, &record.task_branch) {
             Some(_) => {
-                if tmux::record_worktree_missing(record) {
-                    config::remove_session_record(tmux_name);
-                } else {
-                    match tmux::recreate_session(tmux_name, record) {
-                        Ok(_) => report.restored.push(reference),
-                        Err(e) => report.failures.push(format!("{reference}: {e}")),
-                    }
+                let project = cfg.projects.iter().find(|p| p.path == record.project_path);
+                match recreate_task_session(project, tmux_name, record) {
+                    Ok(true) => report.restored.push(reference),
+                    Ok(false) => {}
+                    Err(e) => report.failures.push(format!("{reference}: {e}")),
                 }
             }
             None => {
@@ -449,6 +447,29 @@ pub fn restore_sessions(cfg: &Config) -> RestoreReport {
         }
     }
     report
+}
+
+/// Recreate a task session from its record. A missing worktree (the task was
+/// archived, or it was removed by hand) is first rebuilt at its old path from
+/// the session branch, so the agent resumes the old conversation. When that
+/// branch is gone too the record is dropped and `Ok(false)` returned.
+pub fn recreate_task_session(
+    project: Option<&Project>,
+    tmux_name: &str,
+    record: &SessionRecord,
+) -> Result<bool> {
+    if tmux::record_worktree_missing(record) {
+        if !tmux::branch_exists(&record.project_path, &tmux::record_branch(record)) {
+            config::remove_session_record(tmux_name);
+            return Ok(false);
+        }
+        let (copy_patterns, setup_commands) = project
+            .map(|p| (&p.copy_patterns[..], &p.setup_commands[..]))
+            .unwrap_or_default();
+        tmux::restore_record_worktree(record, copy_patterns, setup_commands)?;
+    }
+    tmux::recreate_session(tmux_name, record)?;
+    Ok(true)
 }
 
 /// PR details for a task branch, from the on-disk cache when it is younger than

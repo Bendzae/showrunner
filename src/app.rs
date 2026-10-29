@@ -2048,6 +2048,11 @@ impl App {
             for name in &live_names {
                 let _ = tmux::kill_session_only(name);
             }
+            for record in config::load_sessions().values() {
+                if record.project_name == project_name && record.task_name == task_name {
+                    tmux::remove_record_worktree(record);
+                }
+            }
             OpResult {
                 message: format!(
                     "Archived task '{task_name}' ({} session{} suspended)",
@@ -2076,6 +2081,12 @@ impl App {
         config::set_task_session_records_archived(&project_name, &task_name, false);
 
         let _ = task_branch;
+        let project = self
+            .config
+            .projects
+            .iter()
+            .find(|p| p.name == project_name)
+            .cloned();
         // Switch back to the active view so the unarchived task is visible.
         if self.view_archived {
             self.view_archived = false;
@@ -2087,13 +2098,9 @@ impl App {
             let mut failed = Vec::new();
             for (tmux_name, record) in &records {
                 if record.project_name == project_name && record.task_name == task_name {
-                    if tmux::record_worktree_missing(record) {
-                        // Stale record (e.g. worktree removed externally) — drop it.
-                        config::remove_session_record(tmux_name);
-                        continue;
-                    }
-                    match tmux::recreate_session(tmux_name, record) {
-                        Ok(_) => recreated += 1,
+                    match crate::ops::recreate_task_session(project.as_ref(), tmux_name, record) {
+                        Ok(true) => recreated += 1,
+                        Ok(false) => {}
                         Err(e) => failed.push(format!("{}: {e}", record.session_name)),
                     }
                 }
