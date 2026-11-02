@@ -21,6 +21,7 @@ add_remote_project  = "P"
 [context_menu_keys]
 add_task                = "t"
 add_task_with_agent     = "T"
+add_task_from_ticket    = "l"
 new_session             = "n"
 new_session_with_agent  = "S"
 new_session_no_worktree = "N"

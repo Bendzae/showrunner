@@ -432,6 +432,7 @@ async fn api_create_task(
             None,
             None,
             body.prompt.as_deref().filter(|p| !p.trim().is_empty()),
+            None,
             agent,
         )?;
         Ok::<_, anyhow::Error>(tmux_name)

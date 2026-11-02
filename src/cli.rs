@@ -619,12 +619,9 @@ fn cmd_task_create(args: &[String]) -> Result<()> {
             .get("prompt")
             .map(String::as_str)
             .filter(|p| !p.trim().is_empty()),
+        linear,
         agent,
     )?;
-    if linear.is_some() {
-        let (project_name, task_name) = (project_name.clone(), task_name.trim().to_string());
-        Config::modify(move |c| c.set_task_linear(&project_name, &task_name, linear))?;
-    }
 
     let session = TmuxSession::from_tmux_name(&tmux_name)
         .map(|s| session_ref(&s))

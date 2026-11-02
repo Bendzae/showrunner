@@ -100,6 +100,7 @@ The context menu shows actions relevant to the selected item. Press the hotkey c
 |-----|--------|------------|
 | `t` | Add task | `add_task` |
 | `T` | Add task, choosing the agent harness first | `add_task_with_agent` |
+| `l` | Add task from a Linear ticket: named after its title, on its Linear branch, linked, with a session prompted to start on it | `add_task_from_ticket` |
 | `A` | New adhoc session | `new_adhoc_session` |
 | `x` | Run the project's configured run command | `run` |
 | `b` | Checkout branch (fuzzy-search the branch list) | `checkout` |

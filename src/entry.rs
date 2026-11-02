@@ -27,6 +27,7 @@ fn is_text_input_mode(mode: InputMode) -> bool {
             | InputMode::AddTaskName
             | InputMode::AddTaskBranch
             | InputMode::AddTaskPrompt
+            | InputMode::AddTaskTicket
             | InputMode::MergeCommitMessage
             | InputMode::SetBaseBranch
             | InputMode::RenameGroup
@@ -218,6 +219,15 @@ fn run_tui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
                     },
                     InputMode::AddTaskName => match key.code {
                         KeyCode::Enter => app.confirm_add_task(),
+                        KeyCode::Esc => app.cancel_input(),
+                        KeyCode::Backspace => {
+                            app.input_buffer.pop();
+                        }
+                        KeyCode::Char(c) => app.input_buffer.push(c),
+                        _ => {}
+                    },
+                    InputMode::AddTaskTicket => match key.code {
+                        KeyCode::Enter => app.confirm_add_task_from_ticket(),
                         KeyCode::Esc => app.cancel_input(),
                         KeyCode::Backspace => {
                             app.input_buffer.pop();

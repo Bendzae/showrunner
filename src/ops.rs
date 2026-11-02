@@ -3,7 +3,7 @@
 
 use std::collections::HashSet;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::agent::AgentKind;
@@ -76,6 +76,7 @@ pub fn create_task(
     base: Option<&str>,
     group: Option<&str>,
     prompt: Option<&str>,
+    linear: Option<String>,
     agent: AgentKind,
 ) -> Result<(String, String)> {
     let task_name = task_name.trim();
@@ -129,6 +130,7 @@ pub fn create_task(
         c.add_task(&project_name, task.clone(), branch_for_config);
         c.set_task_base_branch(&project_name, &task, base_for_config);
         c.set_task_group(&project_name, &task, group_for_config);
+        c.set_task_linear(&project_name, &task, linear);
     })?;
 
     let tmux_name = create_task_session(
@@ -606,6 +608,51 @@ pub fn linear_ticket(ticket_id: &str, workspace: Option<&str>) -> Result<serde_j
         bail!("Linear has no ticket {ticket_id}");
     }
     Ok(issue)
+}
+
+pub struct LinearIssue {
+    pub identifier: String,
+    pub title: String,
+    pub url: String,
+    pub branch_name: String,
+}
+
+/// Look up a Linear issue (URL or id like `ENG-123`) with the `linear` CLI.
+pub fn linear_issue(reference: &str) -> Result<LinearIssue> {
+    let output = std::process::Command::new("linear")
+        .args([
+            "issue",
+            "view",
+            reference.trim(),
+            "--json",
+            "--no-comments",
+            "--no-download",
+            "--no-input",
+        ])
+        .output()
+        .context("could not run the linear CLI")?;
+    if !output.status.success() {
+        bail!(
+            "linear issue view failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let issue: serde_json::Value =
+        serde_json::from_slice(&output.stdout).context("could not parse the linear CLI output")?;
+    let field = |name: &str| issue[name].as_str().unwrap_or_default().to_string();
+    Ok(LinearIssue {
+        identifier: field("identifier"),
+        title: field("title"),
+        url: field("url"),
+        branch_name: field("branchName"),
+    })
+}
+
+/// The initial prompt of a task created from a Linear ticket.
+pub fn ticket_prompt(identifier: &str) -> String {
+    format!(
+        "Read the Linear ticket {identifier} linked to this task (`showrunner session ticket`) and start working on it."
+    )
 }
 
 /// Run a GraphQL query taking one `$id` against Linear and return its `data`.

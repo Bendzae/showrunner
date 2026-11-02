@@ -58,6 +58,8 @@ pub enum InputMode {
     AddTaskName,
     AddTaskBranch,
     AddTaskPrompt,
+    /// Prompt for the Linear ticket a new task is created from.
+    AddTaskTicket,
     AddSessionName,
     AddSessionPrompt,
     AddAdhocSessionName,
@@ -105,6 +107,7 @@ pub enum ContextAction {
     AddTask,
     /// Add task, picking the agent harness first.
     AddTaskWithAgent,
+    AddTaskFromTicket,
     NewSession,
     /// New worktree session, picking the agent harness first.
     NewSessionWithAgent,
@@ -1513,6 +1516,11 @@ impl App {
                     action: ContextAction::AddTaskWithAgent,
                 },
                 ContextMenuItem {
+                    key: cm.add_task_from_ticket,
+                    label: "Add task from Linear ticket",
+                    action: ContextAction::AddTaskFromTicket,
+                },
+                ContextMenuItem {
                     key: cm.delete,
                     label: "Remove from list",
                     action: ContextAction::Delete,
@@ -1625,6 +1633,11 @@ impl App {
                     key: cm.add_task_with_agent,
                     label: "Add task (choose agent)",
                     action: ContextAction::AddTaskWithAgent,
+                },
+                ContextMenuItem {
+                    key: cm.add_task_from_ticket,
+                    label: "Add task from Linear ticket",
+                    action: ContextAction::AddTaskFromTicket,
                 },
                 ContextMenuItem {
                     key: cm.new_adhoc_session,
@@ -1873,6 +1886,7 @@ impl App {
         match action {
             ContextAction::AddTask => self.start_add_task(),
             ContextAction::AddTaskWithAgent => self.open_agent_picker(AgentPickerTarget::AddTask),
+            ContextAction::AddTaskFromTicket => self.start_add_task_from_ticket(),
             ContextAction::NewSession => self.start_new_session(true),
             ContextAction::NewSessionWithAgent => {
                 self.open_agent_picker(AgentPickerTarget::NewSession)
@@ -2895,6 +2909,100 @@ impl App {
             });
             self.pending_task_host = host;
         }
+    }
+
+    pub fn start_add_task_from_ticket(&mut self) {
+        if self.selected_project_info().is_some() {
+            self.input_mode = InputMode::AddTaskTicket;
+            self.input_buffer.clear();
+            self.status_message = Some("Linear ticket (URL or id): ".into());
+        }
+    }
+
+    /// Create a task named after the entered Linear ticket, on its Linear
+    /// branch, linked to it, with a session prompted to start working on it.
+    pub fn confirm_add_task_from_ticket(&mut self) {
+        let reference = self.input_buffer.trim().to_string();
+        let Some((project_name, project_path)) = self
+            .selected_project_info()
+            .map(|(name, path)| (name.to_string(), path.to_string()))
+        else {
+            self.cancel_input();
+            return;
+        };
+        if reference.is_empty() {
+            self.cancel_input();
+            return;
+        }
+        self.collapsed
+            .remove(&project_key(&scoped_project(&project_name, &project_path)));
+        self.input_buffer.clear();
+        self.input_mode = InputMode::Normal;
+
+        let agent = self.default_agent();
+        let host = self
+            .selected_host()
+            .map(|name| (self.host_named(&name), name));
+        self.start_op("Creating task from Linear ticket...", move || {
+            let result = (|| -> anyhow::Result<String> {
+                let issue = crate::ops::linear_issue(&reference)?;
+                let branch = Some(issue.branch_name)
+                    .filter(|b| !b.is_empty())
+                    .unwrap_or_else(|| tmux::to_branch_name(&issue.title));
+                let prompt = crate::ops::ticket_prompt(&issue.identifier);
+                if let Some((host, host_name)) = host {
+                    let host =
+                        host.ok_or_else(|| anyhow::anyhow!("Host '{host_name}' is not available"))?;
+                    let out = host.output(&[
+                        "task".to_string(),
+                        "create".to_string(),
+                        project_name,
+                        issue.title,
+                        "--branch".to_string(),
+                        branch,
+                        "--linear".to_string(),
+                        issue.url,
+                        "--prompt".to_string(),
+                        prompt,
+                        "--agent".to_string(),
+                        agent.id().to_string(),
+                    ])?;
+                    return Ok(format!(
+                        "{host_name}: {}",
+                        out.lines().next().unwrap_or_default()
+                    ));
+                }
+                let cfg = Config::load()?;
+                let project = crate::ops::find_project(&cfg, &project_name)?;
+                let (branch, tmux_name) = crate::ops::create_task(
+                    &cfg,
+                    project,
+                    &issue.title,
+                    Some(&branch),
+                    None,
+                    None,
+                    Some(&prompt),
+                    Some(issue.url),
+                    agent,
+                )?;
+                Ok(format!(
+                    "Created task '{}' on branch {branch} and session {tmux_name}",
+                    issue.title
+                ))
+            })();
+            match result {
+                Ok(message) => OpResult {
+                    message,
+                    rebuild: true,
+                    reload_config: true,
+                },
+                Err(e) => OpResult {
+                    message: format!("Error: {e}"),
+                    rebuild: false,
+                    reload_config: false,
+                },
+            }
+        });
     }
 
     pub fn confirm_add_task(&mut self) {

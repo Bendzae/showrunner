@@ -87,6 +87,9 @@ fn cm_fetch_pull() -> char {
 fn cm_run() -> char {
     'x'
 }
+fn cm_add_task_from_ticket() -> char {
+    'l'
+}
 fn cm_add_task_with_agent() -> char {
     'T'
 }
@@ -187,6 +190,9 @@ pub struct ContextMenuKeyBindings {
     /// Run the project's configured run command (default: x)
     #[serde(default = "cm_run")]
     pub run: char,
+    /// Add task from a Linear ticket (default: l)
+    #[serde(default = "cm_add_task_from_ticket")]
+    pub add_task_from_ticket: char,
     /// Add task, picking the agent harness first (default: T)
     #[serde(default = "cm_add_task_with_agent")]
     pub add_task_with_agent: char,
@@ -228,6 +234,7 @@ impl Default for ContextMenuKeyBindings {
             terminal: cm_terminal(),
             fetch_pull: cm_fetch_pull(),
             run: cm_run(),
+            add_task_from_ticket: cm_add_task_from_ticket(),
             add_task_with_agent: cm_add_task_with_agent(),
             new_session_with_agent: cm_new_session_with_agent(),
             group: cm_group(),

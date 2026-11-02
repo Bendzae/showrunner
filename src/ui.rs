@@ -267,6 +267,7 @@ fn is_text_input_mode(mode: InputMode) -> bool {
             | InputMode::AddTaskName
             | InputMode::AddTaskBranch
             | InputMode::AddTaskPrompt
+            | InputMode::AddTaskTicket
             | InputMode::MergeCommitMessage
             | InputMode::SetBaseBranch
             | InputMode::RenameGroup
@@ -1871,6 +1872,7 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         | InputMode::AddAdhocSessionName
         | InputMode::AddTaskName
         | InputMode::AddTaskBranch
+        | InputMode::AddTaskTicket
         | InputMode::SetBaseBranch
         | InputMode::RenameGroup
         | InputMode::RunCommand => help_bar(&[("⏎", "confirm"), ("Esc", "cancel")]),
@@ -1980,6 +1982,7 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
                 | InputMode::AddTaskName
                 | InputMode::AddTaskBranch
                 | InputMode::AddTaskPrompt
+                | InputMode::AddTaskTicket
                 | InputMode::MergeCommitMessage
         ) {
             format!("{}{}", msg, app.input_buffer)
