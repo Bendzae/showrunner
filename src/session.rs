@@ -1,16 +1,29 @@
 use std::collections::HashMap;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
 use crate::agent::AgentKind;
+use crate::hc;
 
 const SESSION_SEP: &str = "__";
 
-/// Sentinel placed in the task slot of a tmux session name to mark an adhoc session.
+/// hc labels. Sessions are found by their `cm__…` name in `SESSION`; hc's own
+/// names are too short for it.
+const LABEL_SESSION: &str = "showrunner.session";
+const LABEL_AGENT: &str = "showrunner.agent";
+const LABEL_CLAUDE_SESSION: &str = "showrunner.claude-session";
+const LABEL_PROJECT_PATH: &str = "showrunner.project-path";
+const LABEL_TASK_BRANCH: &str = "showrunner.task-branch";
+const LABEL_WORKTREE_PATH: &str = "showrunner.worktree-path";
+/// On a session's shell terminals (`t`): the session they belong to.
+const LABEL_TERMINAL: &str = "showrunner.terminal";
+/// On "Run" terminals: their `cmrun-…` name.
+const LABEL_RUN: &str = "showrunner.run";
+
+/// Sentinel placed in the task slot of a session name to mark an adhoc session.
 /// Adhoc sessions belong to a project but no task; they run in the project dir.
 pub const ADHOC_MARKER: &str = "adhoc";
 
@@ -48,7 +61,7 @@ impl SessionStatus {
 }
 
 #[derive(Debug, Clone)]
-pub struct TmuxSession {
+pub struct LiveSession {
     pub name: String,
     pub project_name: String,
     pub task_name: String,
@@ -57,14 +70,14 @@ pub struct TmuxSession {
     pub host: Option<String>,
 }
 
-impl TmuxSession {
-    /// Parse a tmux session name like `cm__project__task__session`.
-    pub fn from_tmux_name(name: &str) -> Option<Self> {
+impl LiveSession {
+    /// Parse a session name like `cm__project__task__session`.
+    pub fn from_name(name: &str) -> Option<Self> {
         let rest = name.strip_prefix("cm")?;
         let rest = rest.strip_prefix(SESSION_SEP)?;
         let (project_name, rest) = rest.split_once(SESSION_SEP)?;
         let (task_name, session_name) = rest.split_once(SESSION_SEP)?;
-        Some(TmuxSession {
+        Some(LiveSession {
             name: name.to_string(),
             project_name: project_name.to_string(),
             task_name: task_name.to_string(),
@@ -73,7 +86,7 @@ impl TmuxSession {
         })
     }
 
-    /// Key for per-session maps: the tmux name, prefixed by the host for
+    /// Key for per-session maps: the session name, prefixed by the host for
     /// remote sessions so equally named sessions on two machines don't collide.
     pub fn key(&self) -> String {
         match &self.host {
@@ -101,7 +114,7 @@ impl TmuxSession {
     }
 }
 
-/// Sanitize a name for use in tmux session names.
+/// Sanitize a name for use in session names.
 /// Replaces problematic characters and ensures no double underscores.
 pub fn sanitize(s: &str) -> String {
     let s: String = s
@@ -158,7 +171,7 @@ fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-pub fn build_tmux_name(project: &str, task: &str, session: &str) -> String {
+pub fn build_session_name(project: &str, task: &str, session: &str) -> String {
     format!(
         "cm{sep}{}{sep}{}{sep}{}",
         sanitize(project),
@@ -183,25 +196,80 @@ pub fn worktree_dir(project_name: &str, task: &str, session: &str) -> PathBuf {
         .join(format!("{}-{}", sanitize(task), sanitize(session)))
 }
 
-pub fn list_sessions() -> Result<Vec<TmuxSession>> {
-    let output = Command::new("tmux")
-        .args(["list-sessions", "-F", "#{session_name}"])
-        .output();
-
-    let output = match output {
-        Ok(o) => o,
-        Err(_) => return Ok(vec![]),
-    };
-
-    if !output.status.success() {
-        return Ok(vec![]);
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(stdout
-        .lines()
-        .filter_map(TmuxSession::from_tmux_name)
+pub fn list_sessions() -> Result<Vec<LiveSession>> {
+    Ok(agent_terminals()?
+        .iter()
+        .filter_map(|t| LiveSession::from_name(t.label(LABEL_SESSION)?))
         .collect())
+}
+
+/// Live terminals running session agents.
+fn agent_terminals() -> Result<Vec<hc::Terminal>> {
+    Ok(hc::list(&[])?
+        .into_iter()
+        .filter(|t| t.labels.contains_key(LABEL_SESSION))
+        .collect())
+}
+
+/// The live terminal running the session's agent.
+fn session_terminal(cm_name: &str) -> Option<hc::Terminal> {
+    hc::list(&[(LABEL_SESSION, cm_name)])
+        .ok()?
+        .into_iter()
+        .next()
+}
+
+fn session_terminal_required(cm_name: &str) -> Result<hc::Terminal> {
+    session_terminal(cm_name).with_context(|| format!("session {cm_name} is not running"))
+}
+
+fn session_label(cm_name: &str, key: &str) -> Option<String> {
+    session_terminal(cm_name)?.label(key).map(str::to_string)
+}
+
+/// Where the session works: its worktree, else the project directory.
+fn session_work_dir(cm_name: &str) -> Option<String> {
+    let terminal = session_terminal(cm_name)?;
+    terminal
+        .label(LABEL_WORKTREE_PATH)
+        .or(terminal.label(LABEL_PROJECT_PATH))
+        .map(str::to_string)
+}
+
+/// What a session's agent terminal is started with.
+struct Launch<'a> {
+    cm_name: &'a str,
+    work_dir: &'a str,
+    command: &'a str,
+    agent: AgentKind,
+    project_path: &'a str,
+    task_branch: Option<&'a str>,
+    worktree_path: Option<&'a str>,
+    claude_session_id: Option<&'a str>,
+}
+
+fn launch(spec: Launch) -> Result<()> {
+    // A finished terminal of the same session (its agent exited) would
+    // otherwise linger next to the new one.
+    for old in hc::list_all(&[(LABEL_SESSION, spec.cm_name)])? {
+        if !old.is_live() {
+            hc::remove(&old.address);
+        }
+    }
+    let mut labels = vec![
+        (LABEL_SESSION, spec.cm_name),
+        (LABEL_AGENT, spec.agent.id()),
+        (LABEL_PROJECT_PATH, spec.project_path),
+    ];
+    labels.extend(spec.task_branch.map(|b| (LABEL_TASK_BRANCH, b)));
+    labels.extend(spec.worktree_path.map(|p| (LABEL_WORKTREE_PATH, p)));
+    labels.extend(spec.claude_session_id.map(|id| (LABEL_CLAUDE_SESSION, id)));
+    hc::run(
+        spec.work_dir,
+        Some(&format!("exec {}", spec.command)),
+        &labels,
+    )?;
+    Ok(())
 }
 
 pub fn branch_exists(project_path: &str, branch: &str) -> bool {
@@ -393,7 +461,7 @@ pub fn create_session_with(
     agent: AgentKind,
     checkout: Checkout,
 ) -> Result<String> {
-    let tmux_name = build_tmux_name(project_name, task_name, session_name);
+    let cm_name = build_session_name(project_name, task_name, session_name);
 
     let work_dir;
     let mut worktree_path_str = String::new();
@@ -474,79 +542,18 @@ pub fn create_session_with(
         claude_session_id.as_deref(),
     );
 
-    let agent_cmd = with_server_path(agent_cmd);
-    let output = Command::new("tmux")
-        .args([
-            "new-session",
-            "-d",
-            "-s",
-            &tmux_name,
-            "-c",
-            &work_dir,
-            &agent_cmd,
-        ])
-        .output()?;
+    launch(Launch {
+        cm_name: &cm_name,
+        work_dir: &work_dir,
+        command: &agent_cmd,
+        agent,
+        project_path,
+        task_branch: Some(task_branch),
+        worktree_path: use_worktree.then_some(worktree_path_str.as_str()),
+        claude_session_id: claude_session_id.as_deref(),
+    })?;
 
-    if !output.status.success() {
-        bail!("Failed to create tmux session");
-    }
-
-    // Store metadata in tmux environment for cleanup
-    let _ = Command::new("tmux")
-        .args([
-            "set-environment",
-            "-t",
-            &tmux_name,
-            "CM_PROJECT_PATH",
-            project_path,
-        ])
-        .output();
-
-    // Store the task branch so we can diff against it later
-    let _ = Command::new("tmux")
-        .args([
-            "set-environment",
-            "-t",
-            &tmux_name,
-            "CM_TASK_BRANCH",
-            task_branch,
-        ])
-        .output();
-
-    set_session_agent(&tmux_name, agent);
-    set_claude_session_id(&tmux_name, claude_session_id.as_deref());
-
-    if use_worktree {
-        let _ = Command::new("tmux")
-            .args([
-                "set-environment",
-                "-t",
-                &tmux_name,
-                "CM_WORKTREE_PATH",
-                &worktree_path_str,
-            ])
-            .output();
-    }
-
-    Ok(tmux_name)
-}
-
-/// Prefix a session command with the PATH the tmux server was started with. A
-/// new session's command otherwise runs with the *client's* PATH, which for a
-/// non-interactive ssh client (the remote proxy) lacks the agent binaries that
-/// the server's interactive shell had.
-fn with_server_path(cmd: String) -> String {
-    let server_path = Command::new("tmux")
-        .args(["show-environment", "-g", "PATH"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .and_then(|line| line.strip_prefix("PATH=").map(str::to_string));
-    match server_path {
-        Some(path) if !path.is_empty() => format!("export PATH={}; {cmd}", shell_escape(&path)),
-        _ => cmd,
-    }
+    Ok(cm_name)
 }
 
 /// Bring the local `branch` up to `origin/<branch>` so a worktree can check it
@@ -623,7 +630,7 @@ fn worktree_for_branch(project_path: &str, branch: &str) -> Option<String> {
 /// lives on elsewhere (a session moved to another machine).
 ///
 /// With `from_inside` the caller runs *in* that session and dies with it, so
-/// the tmux kill comes last, after the worktree is gone.
+/// the kill comes last, after the worktree is gone.
 pub fn remove_session_keep_branch(
     name: &str,
     project_path: &str,
@@ -631,9 +638,7 @@ pub fn remove_session_keep_branch(
     from_inside: bool,
 ) {
     let kill = || {
-        let _ = Command::new("tmux")
-            .args(["kill-session", "-t", name])
-            .output();
+        let _ = kill_session_only(name);
     };
     if !from_inside {
         kill();
@@ -658,7 +663,7 @@ pub fn remove_session_keep_branch(
     }
 }
 
-/// Create an adhoc session: tmux session running Claude in the project directory
+/// Create an adhoc session: an agent running in the project directory
 /// on whatever branch is currently checked out, with no task or worktree.
 /// Applies `startup_skills` if any, but sends no user prompt.
 pub fn create_adhoc_session(
@@ -668,7 +673,7 @@ pub fn create_adhoc_session(
     startup_skills: &[String],
     agent: AgentKind,
 ) -> Result<String> {
-    let tmux_name = build_tmux_name(project_name, ADHOC_MARKER, session_name);
+    let cm_name = build_session_name(project_name, ADHOC_MARKER, session_name);
 
     let claude_session_id = new_claude_session_id(agent);
     let agent_cmd = build_agent_command(
@@ -681,41 +686,23 @@ pub fn create_adhoc_session(
         claude_session_id.as_deref(),
     );
 
-    let output = Command::new("tmux")
-        .args([
-            "new-session",
-            "-d",
-            "-s",
-            &tmux_name,
-            "-c",
-            project_path,
-            &agent_cmd,
-        ])
-        .output()?;
+    launch(Launch {
+        cm_name: &cm_name,
+        work_dir: project_path,
+        command: &agent_cmd,
+        agent,
+        project_path,
+        task_branch: None,
+        worktree_path: None,
+        claude_session_id: claude_session_id.as_deref(),
+    })?;
 
-    if !output.status.success() {
-        bail!("Failed to create tmux session");
-    }
-
-    let _ = Command::new("tmux")
-        .args([
-            "set-environment",
-            "-t",
-            &tmux_name,
-            "CM_PROJECT_PATH",
-            project_path,
-        ])
-        .output();
-
-    set_session_agent(&tmux_name, agent);
-    set_claude_session_id(&tmux_name, claude_session_id.as_deref());
-
-    Ok(tmux_name)
+    Ok(cm_name)
 }
 
-/// Recreate an adhoc tmux session from a saved record (e.g. after tmux dies).
+/// Recreate an adhoc session from a saved record (e.g. after a reboot).
 pub fn recreate_adhoc_session(
-    tmux_name: &str,
+    cm_name: &str,
     record: &crate::config::SessionRecord,
 ) -> Result<String> {
     let agent = record.agent_kind();
@@ -734,35 +721,18 @@ pub fn recreate_adhoc_session(
         record.claude_session_id.as_deref(),
     );
 
-    let output = Command::new("tmux")
-        .args([
-            "new-session",
-            "-d",
-            "-s",
-            tmux_name,
-            "-c",
-            &record.project_path,
-            &agent_cmd,
-        ])
-        .output()?;
+    launch(Launch {
+        cm_name,
+        work_dir: &record.project_path,
+        command: &agent_cmd,
+        agent,
+        project_path: &record.project_path,
+        task_branch: None,
+        worktree_path: None,
+        claude_session_id: record.claude_session_id.as_deref(),
+    })?;
 
-    if !output.status.success() {
-        bail!("Failed to recreate adhoc tmux session");
-    }
-
-    let _ = Command::new("tmux")
-        .args([
-            "set-environment",
-            "-t",
-            tmux_name,
-            "CM_PROJECT_PATH",
-            &record.project_path,
-        ])
-        .output();
-
-    set_session_agent(tmux_name, agent);
-
-    Ok(tmux_name.to_string())
+    Ok(cm_name.to_string())
 }
 
 fn record_worktree_dir(record: &crate::config::SessionRecord) -> PathBuf {
@@ -902,7 +872,7 @@ fn ensure_agent_installed(agent: AgentKind) -> Result<()> {
 
 /// Whether the agent has a prior conversation for `work_dir` that its resume
 /// flag can pick up. Resuming without one makes the agent exit right away,
-/// which takes the tmux session down with it.
+/// which takes its terminal down with it.
 fn has_resumable_session(agent: AgentKind, work_dir: &str) -> bool {
     let Some(home) = dirs::home_dir() else {
         return false;
@@ -945,8 +915,7 @@ pub fn last_active(session_name: &str) -> Option<u64> {
     if session_agent(session_name) != AgentKind::Claude {
         return None;
     }
-    let work_dir = get_session_env(session_name, "CM_WORKTREE_PATH")
-        .or_else(|| get_session_env(session_name, "CM_PROJECT_PATH"))?;
+    let work_dir = session_work_dir(session_name)?;
     let home = dirs::home_dir()?;
     let newest = fs::read_dir(claude_project_dir(&home, &work_dir))
         .ok()?
@@ -1010,10 +979,10 @@ fn dir_has_jsonl(dir: &Path) -> bool {
     })
 }
 
-/// Recreate a tmux session from a saved record (e.g. after tmux dies) under the
-/// record's own `tmux_name` in its existing worktree; does NOT send an
+/// Recreate a session from a saved record (e.g. after a reboot) under the
+/// record's own `cm_name` in its existing worktree; does NOT send an
 /// initial prompt.
-pub fn recreate_session(tmux_name: &str, record: &crate::config::SessionRecord) -> Result<String> {
+pub fn recreate_session(cm_name: &str, record: &crate::config::SessionRecord) -> Result<String> {
     if record_worktree_missing(record) {
         bail!("worktree no longer exists");
     }
@@ -1057,304 +1026,121 @@ pub fn recreate_session(tmux_name: &str, record: &crate::config::SessionRecord) 
         record.claude_session_id.as_deref(),
     );
 
-    let output = Command::new("tmux")
-        .args([
-            "new-session",
-            "-d",
-            "-s",
-            tmux_name,
-            "-c",
-            &work_dir,
-            &agent_cmd,
-        ])
-        .output()?;
+    launch(Launch {
+        cm_name,
+        work_dir: &work_dir,
+        command: &agent_cmd,
+        agent,
+        project_path: &record.project_path,
+        task_branch: Some(&record.task_branch),
+        worktree_path: record.use_worktree.then_some(work_dir.as_str()),
+        claude_session_id: record.claude_session_id.as_deref(),
+    })?;
 
-    if !output.status.success() {
-        bail!("Failed to create tmux session for recreation");
-    }
-
-    // Restore environment variables
-    let _ = Command::new("tmux")
-        .args([
-            "set-environment",
-            "-t",
-            tmux_name,
-            "CM_PROJECT_PATH",
-            &record.project_path,
-        ])
-        .output();
-
-    let _ = Command::new("tmux")
-        .args([
-            "set-environment",
-            "-t",
-            tmux_name,
-            "CM_TASK_BRANCH",
-            &record.task_branch,
-        ])
-        .output();
-
-    set_session_agent(tmux_name, agent);
-
-    if record.use_worktree {
-        let _ = Command::new("tmux")
-            .args([
-                "set-environment",
-                "-t",
-                tmux_name,
-                "CM_WORKTREE_PATH",
-                &work_dir,
-            ])
-            .output();
-    }
-
-    Ok(tmux_name.to_string())
+    Ok(cm_name.to_string())
 }
 
-/// Insert text into the claude pane's input buffer as a bracketed paste.
-/// If `submit` is true, also presses Enter afterwards.
+/// Type text into the session's agent. If `submit` is true, also presses
+/// Enter; otherwise the text is left in its input box as a draft.
 pub fn send_text(session_name: &str, text: &str, submit: bool) -> Result<()> {
-    let target = format!("{session_name}:0");
-    let buf_name = "cm_comment_paste";
-
-    let mut child = Command::new("tmux")
-        .args(["load-buffer", "-b", buf_name, "-"])
-        .stdin(Stdio::piped())
-        .spawn()?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(text.as_bytes())?;
-    }
-    let status = child.wait()?;
-    if !status.success() {
-        bail!("tmux load-buffer failed");
-    }
-
-    // -p: bracketed paste, -d: delete buffer after pasting.
-    let out = Command::new("tmux")
-        .args(["paste-buffer", "-d", "-p", "-b", buf_name, "-t", &target])
-        .output()?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        bail!("tmux paste-buffer failed: {}", stderr.trim());
-    }
-
+    let terminal = session_terminal_required(session_name)?;
     if submit {
-        let out = Command::new("tmux")
-            .args(["send-keys", "-t", &target, "Enter"])
-            .output()?;
-        if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            bail!("tmux send-keys Enter failed: {}", stderr.trim());
-        }
+        hc::send(&terminal.address, text, None)?;
+    } else {
+        hc::paste(&terminal, text)?;
     }
     Ok(())
 }
 
-/// Capture the last `lines` lines (including scrollback) of a session's Claude
-/// pane (window 0) with ANSI escape sequences, plus the pane width in columns.
+/// The last `lines` lines (including scrollback) of a session's agent
+/// terminal as plain text, plus its width in columns.
 pub fn capture_output(session_name: &str, lines: usize) -> Option<(String, usize)> {
-    let target = format!("{session_name}:0");
-    let output = Command::new("tmux")
-        .args([
-            "capture-pane",
-            "-p",
-            "-e",
-            "-t",
-            &target,
-            "-S",
-            &format!("-{lines}"),
-        ])
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    let width = Command::new("tmux")
-        .args(["display-message", "-p", "-t", &target, "#{pane_width}"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())
-        .unwrap_or(80);
-
-    Some((String::from_utf8_lossy(&output.stdout).to_string(), width))
+    let terminal = session_terminal(session_name)?;
+    let text = hc::read(&terminal.address, lines).ok()?;
+    Some((text, terminal.cols.into()))
 }
 
-/// Capture the last `lines` lines (including scrollback) of a session's Claude
-/// pane as plain text, without ANSI escape sequences.
+/// The last `lines` lines (including scrollback) of a session's agent
+/// terminal as plain text.
 pub fn capture_output_plain(session_name: &str, lines: usize) -> Option<String> {
-    let target = format!("{session_name}:0");
-    let output = Command::new("tmux")
-        .args([
-            "capture-pane",
-            "-p",
-            "-t",
-            &target,
-            "-S",
-            &format!("-{lines}"),
-        ])
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    Some(String::from_utf8_lossy(&output.stdout).to_string())
+    let terminal = session_terminal(session_name)?;
+    hc::read(&terminal.address, lines).ok()
 }
 
-/// Send a single tmux key name (e.g. "Enter", "Escape", "Up", "1") to the
-/// Claude pane.
+/// Press one key (`enter`, `esc`, `up`, `1`, …) in the session's agent.
+/// The web UI's `Enter`/`Escape` spellings are accepted too.
 pub fn send_key(session_name: &str, key: &str) -> Result<()> {
-    let target = format!("{session_name}:0");
-    let out = Command::new("tmux")
-        .args(["send-keys", "-t", &target, key])
-        .output()?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        bail!("tmux send-keys failed: {}", stderr.trim());
-    }
-    Ok(())
+    let terminal = session_terminal_required(session_name)?;
+    let key = match key.to_lowercase().as_str() {
+        "escape" => "esc".to_string(),
+        other => other.to_string(),
+    };
+    hc::keys(&terminal.address, &[&key])
 }
 
-/// Names of the local tmux sessions a client is attached to.
-pub fn attached_sessions() -> Vec<String> {
-    Command::new("tmux")
-        .args(["list-clients", "-F", "#{session_name}"])
-        .output()
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
+/// Attach to a session's agent, or to a "Run" terminal by its `cmrun-` name.
 pub fn attach_session(name: &str) -> Result<()> {
-    // Select window 0 (claude) before attaching
-    let _ = Command::new("tmux")
-        .args(["select-window", "-t", &format!("{name}:0")])
-        .output();
-
-    let status = Command::new("tmux")
-        .args(["attach-session", "-t", name])
-        .status()?;
-
-    if !status.success() {
-        bail!("Failed to attach to tmux session");
-    }
-
-    Ok(())
+    let terminal = session_terminal(name)
+        .or_else(|| run_terminal(name))
+        .with_context(|| format!("{name} is not running"))?;
+    hc::attach(&terminal.address)
 }
 
-/// Attach to a specific window of a session (selects it first).
-pub fn attach_session_window(session_name: &str, window_idx: usize) -> Result<()> {
-    let _ = Command::new("tmux")
-        .args([
-            "select-window",
-            "-t",
-            &format!("{session_name}:{window_idx}"),
-        ])
-        .output();
-
-    let status = Command::new("tmux")
-        .args(["attach-session", "-t", session_name])
-        .status()?;
-
-    if !status.success() {
-        bail!("Failed to attach to tmux session");
-    }
-    Ok(())
+/// Attach to the session's shell terminal.
+pub fn attach_terminal_window(session_name: &str) -> Result<()> {
+    let terminal = terminal_windows(session_name)
+        .into_iter()
+        .next()
+        .with_context(|| format!("{session_name} has no terminal"))?;
+    hc::attach(&terminal.address)
 }
 
-/// Number of terminal windows in a session (windows past index 0, the agent).
+fn terminal_windows(session_name: &str) -> Vec<hc::Terminal> {
+    hc::list(&[(LABEL_TERMINAL, session_name)]).unwrap_or_default()
+}
+
+/// Number of shell terminals open for a session.
 pub fn count_terminal_windows(session_name: &str) -> usize {
-    let output = Command::new("tmux")
-        .args(["list-windows", "-t", session_name, "-F", "#{window_index}"])
-        .output();
-    match output {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
-            .lines()
-            .filter(|line| line.trim().parse::<usize>().is_ok_and(|i| i > 0))
-            .count(),
-        _ => 0,
-    }
+    terminal_windows(session_name).len()
 }
 
-/// Create a terminal window in the session rooted at `work_dir`. Returns its
-/// window index.
-pub fn create_terminal_window(session_name: &str, work_dir: &str) -> Result<usize> {
-    let output = Command::new("tmux")
-        .args([
-            "new-window",
-            "-t",
-            session_name,
-            "-c",
-            work_dir,
-            "-P",
-            "-F",
-            "#{window_index}",
-        ])
-        .output()?;
-
-    if !output.status.success() {
-        bail!("Failed to create terminal window");
-    }
-
-    let idx = String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse::<usize>()
-        .unwrap_or(1);
-    Ok(idx)
+/// Open a shell terminal for the session rooted at `work_dir`.
+pub fn create_terminal_window(session_name: &str, work_dir: &str) -> Result<()> {
+    hc::run(work_dir, None, &[(LABEL_TERMINAL, session_name)])?;
+    Ok(())
 }
 
-/// Launch `command` in a dedicated, detached tmux session rooted at `work_dir`
-/// and return its tmux session name. Any prior run session with the same name
-/// is replaced so "Run" always starts fresh. The shell stays alive after the
-/// command exits so its output (and any error) remains visible on attach. The
-/// `cmrun-` name prefix is deliberately unparseable by `from_tmux_name`, so run
-/// sessions never appear in the managed session list.
-/// tmux session name hosting the run command for `label`. Shared by the
-/// launcher and the UI so an item can find its own run session.
+/// Name of the terminal hosting the run command for `label`. Shared by the
+/// launcher and the UI so an item can find its own run terminal. The `cmrun-`
+/// prefix is deliberately unparseable by `from_name`.
 pub fn run_session_name(label: &str) -> String {
     format!("cmrun-{}", sanitize(label))
 }
 
-/// Live run sessions (`cmrun-*`) mapped to whether their command is still
-/// executing (`true`) versus having dropped to an interactive shell (`false`,
-/// i.e. the command finished). Uses one `list-panes` call across all sessions.
-pub fn list_run_sessions() -> HashMap<String, bool> {
-    let mut map = HashMap::new();
-    let output = Command::new("tmux")
-        .args([
-            "list-panes",
-            "-a",
-            "-F",
-            "#{session_name}\t#{pane_current_command}",
-        ])
-        .output();
-    if let Ok(o) = output
-        && o.status.success()
-    {
-        for line in String::from_utf8_lossy(&o.stdout).lines() {
-            if let Some((name, cmd)) = line.split_once('\t')
-                && name.starts_with("cmrun-")
-            {
-                let active = !is_shell_command(cmd);
-                map.entry(name.to_string())
-                    .and_modify(|v| *v |= active)
-                    .or_insert(active);
-            }
-        }
-    }
-    map
+fn run_terminal(name: &str) -> Option<hc::Terminal> {
+    hc::list(&[(LABEL_RUN, name)]).ok()?.into_iter().next()
 }
 
-/// Whether `cmd` (a tmux `pane_current_command`) is an interactive shell, i.e.
-/// the run command has finished and left the keep-alive shell in the foreground.
+/// Live run terminals mapped to whether their command is still executing
+/// (`true`) versus having dropped to its shell (`false`, i.e. the command
+/// finished).
+pub fn list_run_sessions() -> HashMap<String, bool> {
+    hc::list(&[])
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|t| {
+            let name = t.label(LABEL_RUN)?.to_string();
+            let active = t
+                .foreground
+                .as_ref()
+                .is_some_and(|f| !is_shell_command(&f.name) || f.argv.iter().any(|a| a == "-c"));
+            Some((name, active))
+        })
+        .collect()
+}
+
+/// Whether `cmd` (a foreground process name) is a shell: running the command
+/// line (`sh -c`), or, once it finished, the interactive keep-alive shell.
 fn is_shell_command(cmd: &str) -> bool {
     matches!(
         cmd.trim_start_matches('-'),
@@ -1362,73 +1148,85 @@ fn is_shell_command(cmd: &str) -> bool {
     )
 }
 
+/// Launch `command` in a dedicated run terminal rooted at `work_dir` and
+/// return its name. A prior run terminal of the same name is replaced so "Run"
+/// always starts fresh. The shell stays alive after the command exits so its
+/// output (and any error) remains visible on attach.
 pub fn run_command_session(label: &str, work_dir: &str, command: &str) -> Result<String> {
-    let tmux_name = run_session_name(label);
-
-    // Replace any existing run session so re-running restarts the command.
-    let _ = Command::new("tmux")
-        .args(["kill-session", "-t", &tmux_name])
-        .output();
-
+    let name = run_session_name(label);
+    kill_session_only(&name)?;
     let shell_cmd = format!("{command}; exec \"${{SHELL:-/bin/sh}}\"");
-    let output = Command::new("tmux")
-        .args([
-            "new-session",
-            "-d",
-            "-s",
-            &tmux_name,
-            "-c",
-            work_dir,
-            "sh",
-            "-c",
-            &shell_cmd,
-        ])
-        .output()?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("Failed to start run session: {}", stderr.trim());
-    }
-
-    Ok(tmux_name)
-}
-
-/// Record which agent runs in the session, for status probing and transcript
-/// trimming after the fact.
-fn set_session_agent(tmux_name: &str, agent: AgentKind) {
-    let _ = Command::new("tmux")
-        .args(["set-environment", "-t", tmux_name, "CM_AGENT", agent.id()])
-        .output();
+    hc::run(work_dir, Some(&shell_cmd), &[(LABEL_RUN, &name)])?;
+    Ok(name)
 }
 
 fn new_claude_session_id(agent: AgentKind) -> Option<String> {
     (agent == AgentKind::Claude).then(|| uuid::Uuid::new_v4().to_string())
 }
 
-fn set_claude_session_id(tmux_name: &str, id: Option<&str>) {
-    if let Some(id) = id {
-        let _ = Command::new("tmux")
-            .args(["set-environment", "-t", tmux_name, "CM_CLAUDE_SESSION", id])
-            .output();
-    }
-}
-
 /// The Claude conversation id a session was created with, for its record.
-pub fn claude_session_id(tmux_name: &str) -> Option<String> {
-    get_session_env(tmux_name, "CM_CLAUDE_SESSION").map(|id| id.trim().to_string())
+pub fn claude_session_id(cm_name: &str) -> Option<String> {
+    session_label(cm_name, LABEL_CLAUDE_SESSION)
 }
 
-/// The status a session's agent reports in `CM_STATUS` (set by the
-/// showrunner Claude mod).
+/// The status the session's agent reports itself (OSC 7501; Claude Code does).
 pub fn reported_status(session_name: &str) -> Option<SessionStatus> {
-    get_session_env(session_name, "CM_STATUS").and_then(|s| SessionStatus::parse(s.trim()))
+    session_terminal(session_name).and_then(|t| status_of(&t))
 }
 
-/// The agent running in a session. Sessions created before agents were
-/// tracked have no `CM_AGENT` and default to Claude.
+fn status_of(terminal: &hc::Terminal) -> Option<SessionStatus> {
+    Some(match terminal.status.as_ref()?.state.as_str() {
+        "working" => SessionStatus::Running,
+        "blocked" | "error" => SessionStatus::WaitingForPermission,
+        _ => SessionStatus::WaitingForInput,
+    })
+}
+
+/// How a turn started by [`send_and_wait`] ended.
+pub enum TurnEnd {
+    Done,
+    /// Blocked on a dialog or question, or failed: the person is needed.
+    NeedsUser,
+    TimedOut,
+    NotStarted,
+}
+
+/// Submit `text` and wait up to `timeout_secs` for the turn it starts. `None`
+/// (nothing sent) when the agent doesn't report its status, so hc can't tell
+/// when a turn ends.
+pub fn send_and_wait(session_name: &str, text: &str, timeout_secs: u64) -> Result<Option<TurnEnd>> {
+    let terminal = session_terminal_required(session_name)?;
+    if terminal.status.is_none() {
+        return Ok(None);
+    }
+    let Some(wait) = hc::send(&terminal.address, text, Some(timeout_secs))?.wait else {
+        return Ok(Some(TurnEnd::Done));
+    };
+    Ok(Some(if wait.reason == "not_started" {
+        TurnEnd::NotStarted
+    } else if !wait.ended {
+        TurnEnd::TimedOut
+    } else if matches!(wait.status.as_deref(), Some("blocked" | "error")) {
+        TurnEnd::NeedsUser
+    } else {
+        TurnEnd::Done
+    }))
+}
+
+/// The session a terminal belongs to: the one whose agent it runs, or whose
+/// shell terminal it is.
+pub fn session_of_terminal(address: &str) -> Option<String> {
+    let terminal = hc::get(address).ok()?;
+    terminal
+        .label(LABEL_SESSION)
+        .or(terminal.label(LABEL_TERMINAL))
+        .map(str::to_string)
+}
+
+/// The agent running in a session.
 pub fn session_agent(session_name: &str) -> AgentKind {
-    get_session_env(session_name, "CM_AGENT")
-        .and_then(|id| AgentKind::from_id(id.trim()))
+    session_label(session_name, LABEL_AGENT)
+        .and_then(|id| AgentKind::from_id(&id))
         .unwrap_or_default()
 }
 
@@ -1451,9 +1249,8 @@ pub fn connect_remote_control(session_name: &str, name: &str) -> Result<()> {
 pub fn disconnect_remote_control(session_name: &str) -> Result<()> {
     send_text(session_name, "/remote-control", true)?;
     std::thread::sleep(std::time::Duration::from_millis(1500));
-    send_key(session_name, "Up")?;
-    send_key(session_name, "Up")?;
-    send_key(session_name, "Enter")
+    let terminal = session_terminal_required(session_name)?;
+    hc::keys(&terminal.address, &["up", "up", "enter"])
 }
 
 fn format_remote_control_name(
@@ -1579,22 +1376,8 @@ fn ensure_codex_trust(work_dir: &str) {
     let _ = fs::write(&config_path, updated);
 }
 
-fn get_session_env(session_name: &str, var: &str) -> Option<String> {
-    let output = Command::new("tmux")
-        .args(["show-environment", "-t", session_name, var])
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    let line = String::from_utf8_lossy(&output.stdout);
-    line.trim().split_once('=').map(|(_, v)| v.to_string())
-}
-
-/// Fallback paths for cleaning up a session when the tmux session is already dead
-/// and environment variables are unavailable.
+/// Fallback paths for cleaning up a session whose terminal is already gone
+/// and its labels are unavailable.
 pub struct SessionCleanupInfo {
     pub project_path: String,
     pub worktree_path: String,
@@ -1609,27 +1392,38 @@ pub fn kill_session(name: &str) -> Result<()> {
     kill_session_with_fallback(name, None)
 }
 
-/// Kill the tmux session only — leave worktrees, branches, and session records intact.
-/// Used when archiving a task so the session can be recreated later.
+/// End the session's terminals only — leave worktrees, branches, and session
+/// records intact. Used when archiving a task so the session can be recreated
+/// later. Also ends run terminals, by their `cmrun-` name.
 pub fn kill_session_only(name: &str) -> Result<()> {
-    let _ = Command::new("tmux")
-        .args(["kill-session", "-t", name])
-        .output();
+    let terminals = [
+        hc::list_all(&[(LABEL_SESSION, name)])?,
+        hc::list(&[(LABEL_TERMINAL, name)])?,
+        hc::list_all(&[(LABEL_RUN, name)])?,
+    ];
+    for terminal in terminals.iter().flatten() {
+        hc::kill(&terminal.address);
+    }
     Ok(())
 }
 
 pub fn kill_session_with_fallback(name: &str, fallback: Option<SessionCleanupInfo>) -> Result<()> {
-    // Try to get paths from tmux env vars first, fall back to provided info
-    let project_path = get_session_env(name, "CM_PROJECT_PATH")
-        .or_else(|| fallback.as_ref().map(|f| f.project_path.clone()));
-    let worktree_path = get_session_env(name, "CM_WORKTREE_PATH")
-        .or_else(|| fallback.as_ref().map(|f| f.worktree_path.clone()));
-    let task_branch_fallback = fallback.as_ref().and_then(|f| f.task_branch.clone());
+    // Labels go with the terminal: read them before the kill.
+    let terminal = session_terminal(name);
+    let label = |key| {
+        terminal
+            .as_ref()
+            .and_then(|t| t.label(key))
+            .map(str::to_string)
+    };
+    let project_path =
+        label(LABEL_PROJECT_PATH).or_else(|| fallback.as_ref().map(|f| f.project_path.clone()));
+    let worktree_path =
+        label(LABEL_WORKTREE_PATH).or_else(|| fallback.as_ref().map(|f| f.worktree_path.clone()));
+    let task_branch =
+        label(LABEL_TASK_BRANCH).or_else(|| fallback.as_ref().and_then(|f| f.task_branch.clone()));
 
-    // Kill the tmux session (ignore errors — it may already be dead)
-    let _ = Command::new("tmux")
-        .args(["kill-session", "-t", name])
-        .output();
+    kill_session_only(name)?;
 
     // Clean up worktree and its branch if applicable
     if let (Some(proj_path), Some(wt_path)) = (project_path, worktree_path) {
@@ -1655,7 +1449,6 @@ pub fn kill_session_with_fallback(name: &str, fallback: Option<SessionCleanupInf
 
         // Delete the worktree branch — never the task branch, which the main
         // session has checked out.
-        let task_branch = get_session_env(name, "CM_TASK_BRANCH").or(task_branch_fallback);
         if let Some(branch_name) = branch {
             if !branch_name.is_empty()
                 && branch_name != "main"
@@ -2414,9 +2207,7 @@ impl DiffStats {
 /// The branch currently checked out in the session's worktree (or the project
 /// directory for no-worktree sessions).
 pub fn get_session_branch(session_name: &str) -> Option<String> {
-    let path = get_session_env(session_name, "CM_WORKTREE_PATH")
-        .or_else(|| get_session_env(session_name, "CM_PROJECT_PATH"))?;
-    current_branch(&path)
+    current_branch(&session_work_dir(session_name)?)
 }
 
 fn count_diff(diff: &str) -> DiffStats {
@@ -2435,24 +2226,23 @@ fn count_diff(diff: &str) -> DiffStats {
 /// Full unified diff of a session's worktree against its task branch
 /// (includes committed + uncommitted changes).
 pub fn get_session_diff_text(session_name: &str) -> Option<String> {
-    let worktree_path = get_session_env(session_name, "CM_WORKTREE_PATH")
-        .or_else(|| get_session_env(session_name, "CM_PROJECT_PATH"))?;
+    let terminal = session_terminal(session_name)?;
+    let worktree_path = terminal
+        .label(LABEL_WORKTREE_PATH)
+        .or(terminal.label(LABEL_PROJECT_PATH))?;
+    let diff_target = terminal.label(LABEL_TASK_BRANCH)?;
 
-    // Try task branch first, fall back to base commit for older sessions
-    let diff_target = get_session_env(session_name, "CM_TASK_BRANCH")
-        .or_else(|| get_session_env(session_name, "CM_BASE_COMMIT"))?;
-
-    if !std::path::Path::new(&worktree_path).exists() {
+    if !std::path::Path::new(worktree_path).exists() {
         return None;
     }
 
     // Stage intent-to-add for untracked files so they show up in diff
     let _ = Command::new("git")
-        .args(["-C", &worktree_path, "add", "-N", "."])
+        .args(["-C", worktree_path, "add", "-N", "."])
         .output();
 
     let output = Command::new("git")
-        .args(["-C", &worktree_path, "--no-pager", "diff", &diff_target])
+        .args(["-C", worktree_path, "--no-pager", "diff", diff_target])
         .output()
         .ok()?;
 
@@ -2522,86 +2312,65 @@ pub fn get_branch_diff(project_path: &str, branch: &str, base_branch: &str) -> O
     )?))
 }
 
-/// Raw signals from a tmux session for status detection.
+/// Raw signals from a session's agent for status detection. A session whose
+/// agent ended has no live terminal, so no probe.
 pub struct SessionProbe {
-    pub agent_alive: bool,
     pub content_hash: u64,
     pub has_permission_prompt: bool,
-    /// Status the agent reports itself (the showrunner Claude mod), trusted
-    /// over the pane heuristics.
+    /// Status the agent reports itself (OSC 7501), trusted over the screen
+    /// heuristics, which are left out when it reports.
     pub reported: Option<SessionStatus>,
 }
 
 /// Probe a session for raw status signals.
 pub fn probe_session(session_name: &str) -> Option<SessionProbe> {
-    let target = format!("{session_name}:0");
-    // Check pane_pid and pane_dead
-    let output = Command::new("tmux")
-        .args([
-            "display-message",
-            "-t",
-            &target,
-            "-p",
-            "#{pane_pid} #{pane_dead}",
-        ])
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    let info = String::from_utf8_lossy(&output.stdout);
-    let parts: Vec<&str> = info.trim().split(' ').collect();
-
-    if parts.len() >= 2 && parts[1] == "1" {
-        return None; // pane is dead
-    }
-
-    let pane_pid = parts.first().and_then(|p| p.parse::<u32>().ok())?;
-
-    let agent = session_agent(session_name);
-    let process_name = agent.process_name();
-
-    // Check if the pane process itself is the agent, or if the agent is a
-    // child (e.g. codex runs under a node wrapper).
-    let pane_comm = Command::new("ps")
-        .args(["-o", "comm=", "-p", &pane_pid.to_string()])
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default();
-
-    let agent_alive = pane_comm == process_name
-        || Command::new("pgrep")
-            .args(["-P", &pane_pid.to_string(), "-x", process_name])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-
-    let content = capture_pane_plain(&target).unwrap_or_default();
-    let content_hash = hash_content(&content);
-    let has_permission_prompt = detect_attention_dialog(&content, agent);
-
-    Some(SessionProbe {
-        agent_alive,
-        content_hash,
-        has_permission_prompt,
-        reported: reported_status(session_name),
-    })
+    Some(probe_terminal(&session_terminal(session_name)?))
 }
 
-/// Whether the pane shows an active dialog needing the user (permission
+/// All live sessions with their probes, from one listing.
+pub fn probe_sessions() -> Vec<(LiveSession, SessionProbe)> {
+    agent_terminals()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|t| {
+            let session = LiveSession::from_name(t.label(LABEL_SESSION)?)?;
+            Some((session, probe_terminal(t)))
+        })
+        .collect()
+}
+
+fn probe_terminal(terminal: &hc::Terminal) -> SessionProbe {
+    let reported = status_of(terminal);
+    if reported.is_some() {
+        return SessionProbe {
+            content_hash: 0,
+            has_permission_prompt: false,
+            reported,
+        };
+    }
+    let agent = terminal
+        .label(LABEL_AGENT)
+        .and_then(AgentKind::from_id)
+        .unwrap_or_default();
+    let content = hc::read(&terminal.address, 0).unwrap_or_default();
+    SessionProbe {
+        content_hash: hash_content(&content),
+        has_permission_prompt: detect_attention_dialog(&content, agent),
+        reported,
+    }
+}
+
+/// Whether the screen shows an active dialog needing the user (permission
 /// prompt or question selector).
 ///
 /// Two guards against false positives from dialog text merely echoed in the
-/// transcript: markers must appear near the bottom of the pane (active
-/// dialogs render there), and — for Claude — the pane must not currently show
+/// transcript: markers must appear near the bottom of the screen (active
+/// dialogs render there), and — for Claude — the screen must not currently show
 /// the regular input prompt (a bare `❯`/`>` line), which Claude Code replaces
 /// while a dialog is open. Codex has no such guard: its selector line (`› 1.`)
 /// uses the same glyph as its input line, and its idle placeholder never
 /// matches the marker.
-fn detect_attention_dialog(content: &str, agent: AgentKind) -> bool {
+pub(crate) fn detect_attention_dialog(content: &str, agent: AgentKind) -> bool {
     let nonempty: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
 
     if agent == AgentKind::Claude {
@@ -2622,19 +2391,6 @@ fn hash_content(s: &str) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     s.hash(&mut hasher);
     hasher.finish()
-}
-
-fn capture_pane_plain(session_name: &str) -> Option<String> {
-    let output = Command::new("tmux")
-        .args(["capture-pane", "-t", session_name, "-p"])
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    Some(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2838,7 +2594,7 @@ fn ci_rollup(runs: &[serde_json::Value]) -> CiStatus {
     }
 }
 
-pub fn next_session_number(project_name: &str, task_name: &str, sessions: &[TmuxSession]) -> u32 {
+pub fn next_session_number(project_name: &str, task_name: &str, sessions: &[LiveSession]) -> u32 {
     let max = sessions
         .iter()
         .filter(|s| s.project_name == project_name && s.task_name == task_name)
@@ -2851,9 +2607,9 @@ pub fn next_session_number(project_name: &str, task_name: &str, sessions: &[Tmux
 pub fn sessions_for_task(
     project_name: &str,
     task_name: &str,
-    sessions: &[TmuxSession],
-) -> Vec<TmuxSession> {
-    let mut task_sessions: Vec<TmuxSession> = sessions
+    sessions: &[LiveSession],
+) -> Vec<LiveSession> {
+    let mut task_sessions: Vec<LiveSession> = sessions
         .iter()
         .filter(|s| s.project_name == sanitize(project_name) && s.task_name == sanitize(task_name))
         .cloned()
@@ -2866,8 +2622,8 @@ pub fn sessions_for_task(
 /// All adhoc sessions belonging to a project.
 pub fn adhoc_sessions_for_project(
     project_name: &str,
-    sessions: &[TmuxSession],
-) -> Vec<TmuxSession> {
+    sessions: &[LiveSession],
+) -> Vec<LiveSession> {
     sessions
         .iter()
         .filter(|s| s.project_name == sanitize(project_name) && is_adhoc_marker(&s.task_name))
@@ -2882,28 +2638,28 @@ pub fn delete_task(
     project_path: &str,
     task_name: &str,
     task_branch: &str,
-    sessions: &[TmuxSession],
+    sessions: &[LiveSession],
 ) -> String {
     let task_sessions = sessions_for_task(project_name, task_name, sessions);
     let session_count = task_sessions.len();
 
-    // Collect tmux names of live sessions so we can identify orphaned records
+    // Collect names of live sessions so we can identify orphaned records
     let live_names: std::collections::HashSet<&str> =
         task_sessions.iter().map(|s| s.name.as_str()).collect();
 
-    // Kill all live tmux sessions (this also removes worktrees + session branches)
+    // Kill all live sessions (this also removes worktrees + session branches)
     for session in &task_sessions {
         let _ = kill_session(&session.name);
     }
 
-    // Also clean up any orphaned session records (tmux session already dead)
+    // Also clean up any orphaned session records (terminal already gone)
     let records = crate::config::load_sessions();
-    for (tmux_name, record) in &records {
+    for (cm_name, record) in &records {
         if record.project_name == sanitize(project_name)
             && record.task_name == sanitize(task_name)
-            && !live_names.contains(tmux_name.as_str())
+            && !live_names.contains(cm_name.as_str())
         {
-            // This record's tmux session is dead — clean up its worktree and branch
+            // This record's session is dead — clean up its worktree and branch
             let wt_path = worktree_dir(
                 &record.project_name,
                 &record.task_name,
@@ -2916,7 +2672,7 @@ pub fn delete_task(
                     sanitize(&record.session_name)
                 );
                 let _ = kill_session_with_fallback(
-                    tmux_name,
+                    cm_name,
                     Some(SessionCleanupInfo {
                         project_path: record.project_path.clone(),
                         worktree_path: wt_path.to_string_lossy().to_string(),
@@ -3089,7 +2845,7 @@ mod tests {
     fn run_session_name_is_prefixed_and_sanitized() {
         assert_eq!(run_session_name("My App"), "cmrun-My-App");
         // The prefix is intentionally unparseable as a managed session.
-        assert!(TmuxSession::from_tmux_name(&run_session_name("App")).is_none());
+        assert!(LiveSession::from_name(&run_session_name("App")).is_none());
     }
 
     #[test]
@@ -3124,11 +2880,11 @@ mod tests {
         assert_eq!(to_branch_name(" hello "), "hello");
     }
 
-    // --- TmuxSession::from_tmux_name ---
+    // --- LiveSession::from_name ---
 
     #[test]
     fn parse_valid_session_name() {
-        let session = TmuxSession::from_tmux_name("cm__myproject__mytask__mysession").unwrap();
+        let session = LiveSession::from_name("cm__myproject__mytask__mysession").unwrap();
         assert_eq!(session.project_name, "myproject");
         assert_eq!(session.task_name, "mytask");
         assert_eq!(session.session_name, "mysession");
@@ -3137,7 +2893,7 @@ mod tests {
 
     #[test]
     fn parse_session_with_hyphens() {
-        let session = TmuxSession::from_tmux_name("cm__my-project__my-task__my-session").unwrap();
+        let session = LiveSession::from_name("cm__my-project__my-task__my-session").unwrap();
         assert_eq!(session.project_name, "my-project");
         assert_eq!(session.task_name, "my-task");
         assert_eq!(session.session_name, "my-session");
@@ -3145,39 +2901,39 @@ mod tests {
 
     #[test]
     fn parse_rejects_no_prefix() {
-        assert!(TmuxSession::from_tmux_name("myproject__task__session").is_none());
+        assert!(LiveSession::from_name("myproject__task__session").is_none());
     }
 
     #[test]
     fn parse_rejects_too_few_parts() {
-        assert!(TmuxSession::from_tmux_name("cm__project__task").is_none());
+        assert!(LiveSession::from_name("cm__project__task").is_none());
     }
 
     #[test]
     fn parse_rejects_unrelated_session() {
-        assert!(TmuxSession::from_tmux_name("random-session").is_none());
+        assert!(LiveSession::from_name("random-session").is_none());
     }
 
-    // --- build_tmux_name ---
+    // --- build_session_name ---
 
     #[test]
-    fn build_tmux_name_basic() {
+    fn build_session_name_basic() {
         assert_eq!(
-            build_tmux_name("proj", "task", "sess"),
+            build_session_name("proj", "task", "sess"),
             "cm__proj__task__sess"
         );
     }
 
     #[test]
-    fn build_tmux_name_sanitizes_parts() {
-        let name = build_tmux_name("my project", "my task", "my session");
+    fn build_session_name_sanitizes_parts() {
+        let name = build_session_name("my project", "my task", "my session");
         assert_eq!(name, "cm__my-project__my-task__my-session");
     }
 
     #[test]
-    fn build_tmux_name_roundtrips() {
-        let name = build_tmux_name("proj", "task", "sess");
-        let parsed = TmuxSession::from_tmux_name(&name).unwrap();
+    fn build_session_name_roundtrips() {
+        let name = build_session_name("proj", "task", "sess");
+        let parsed = LiveSession::from_name(&name).unwrap();
         assert_eq!(parsed.project_name, "proj");
         assert_eq!(parsed.task_name, "task");
         assert_eq!(parsed.session_name, "sess");
@@ -3200,19 +2956,19 @@ mod tests {
     }
 
     #[test]
-    fn adhoc_tmux_name_uses_marker_slot() {
-        let name = build_tmux_name("proj", ADHOC_MARKER, "explore");
+    fn adhoc_session_name_uses_marker_slot() {
+        let name = build_session_name("proj", ADHOC_MARKER, "explore");
         assert_eq!(name, "cm__proj__adhoc__explore");
-        let parsed = TmuxSession::from_tmux_name(&name).unwrap();
+        let parsed = LiveSession::from_name(&name).unwrap();
         assert!(is_adhoc_marker(&parsed.task_name));
     }
 
     #[test]
     fn adhoc_sessions_for_project_filters() {
         let sessions = vec![
-            TmuxSession::from_tmux_name("cm__proj__adhoc__a").unwrap(),
-            TmuxSession::from_tmux_name("cm__proj__task1__1").unwrap(),
-            TmuxSession::from_tmux_name("cm__other__adhoc__a").unwrap(),
+            LiveSession::from_name("cm__proj__adhoc__a").unwrap(),
+            LiveSession::from_name("cm__proj__task1__1").unwrap(),
+            LiveSession::from_name("cm__other__adhoc__a").unwrap(),
         ];
         let adhoc = adhoc_sessions_for_project("proj", &sessions);
         assert_eq!(adhoc.len(), 1);

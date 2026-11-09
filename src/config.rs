@@ -415,7 +415,7 @@ pub struct Project {
     )]
     pub setup_commands: Vec<String>,
     /// Command run by the "Run" action (e.g. "npm run dev"). Prompted for and
-    /// saved on first use; executed in a dedicated tmux session in the selected
+    /// saved on first use; executed in a dedicated terminal in the selected
     /// item's working directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_command: Option<String>,
@@ -782,9 +782,8 @@ fn legacy_base_dir() -> PathBuf {
 /// One-time migration of the data dir from ~/.claude-manager to ~/.showrunner,
 /// run at startup before anything touches `base_dir()`. Renames the directory,
 /// then heals what stored absolute paths into the old location: the git
-/// back-pointers of the worktrees living inside it, and `CM_WORKTREE_PATH` on
-/// live tmux sessions. A no-op when there is nothing to migrate or the new
-/// dir already exists.
+/// back-pointers of the worktrees living inside it. A no-op when there is
+/// nothing to migrate or the new dir already exists.
 pub fn migrate_legacy_base_dir() {
     let old = legacy_base_dir();
     let new = base_dir();
@@ -813,39 +812,6 @@ pub fn migrate_legacy_base_dir() {
                     .arg("worktree")
                     .arg("repair")
                     .arg(wt.path())
-                    .output();
-            }
-        }
-    }
-
-    // Point live sessions' CM_WORKTREE_PATH at the new location.
-    let (old_s, new_s) = (old.to_string_lossy(), new.to_string_lossy());
-    if let Ok(out) = std::process::Command::new("tmux")
-        .args(["list-sessions", "-F", "#{session_name}"])
-        .output()
-    {
-        for session in String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .filter(|s| s.starts_with("cm__"))
-        {
-            let env = std::process::Command::new("tmux")
-                .args(["show-environment", "-t", session, "CM_WORKTREE_PATH"])
-                .output();
-            if let Ok(env) = env
-                && env.status.success()
-                && let Some((_, value)) =
-                    String::from_utf8_lossy(&env.stdout).trim().split_once('=')
-                && value.starts_with(old_s.as_ref())
-            {
-                let updated = value.replacen(old_s.as_ref(), new_s.as_ref(), 1);
-                let _ = std::process::Command::new("tmux")
-                    .args([
-                        "set-environment",
-                        "-t",
-                        session,
-                        "CM_WORKTREE_PATH",
-                        &updated,
-                    ])
                     .output();
             }
         }
@@ -882,8 +848,8 @@ pub fn save_theme(name: &str) {
 pub fn task_dir(project_name: &str, branch: &str) -> PathBuf {
     base_dir()
         .join("tasks")
-        .join(crate::tmux::sanitize(project_name))
-        .join(crate::tmux::sanitize(branch))
+        .join(crate::session::sanitize(project_name))
+        .join(crate::session::sanitize(branch))
 }
 
 /// Path to the cached PR URL file for a given project/branch.
@@ -902,7 +868,7 @@ pub fn pr_cache_path(project_name: &str, branch: &str) -> PathBuf {
     task_dir(project_name, branch).join("pr.json")
 }
 
-/// Metadata needed to recreate a tmux session after tmux dies.
+/// Metadata needed to recreate a session after its terminal is gone.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionRecord {
     pub project_name: String,
@@ -938,7 +904,7 @@ pub fn sessions_path() -> PathBuf {
     base_dir().join("sessions.json")
 }
 
-/// Load all saved session records, keyed by tmux session name.
+/// Load all saved session records, keyed by session name.
 pub fn load_sessions() -> HashMap<String, SessionRecord> {
     let path = sessions_path();
     fs::read_to_string(&path)
@@ -958,37 +924,37 @@ fn save_sessions(sessions: &HashMap<String, SessionRecord>) -> Result<()> {
 }
 
 /// Add a session record and persist.
-pub fn add_session_record(tmux_name: &str, record: SessionRecord) {
+pub fn add_session_record(cm_name: &str, record: SessionRecord) {
     let _g = IO_LOCK.lock().unwrap();
     let mut sessions = load_sessions();
-    sessions.insert(tmux_name.to_string(), record);
+    sessions.insert(cm_name.to_string(), record);
     let _ = save_sessions(&sessions);
 }
 
-/// Remove a session record by tmux name and persist.
-pub fn remove_session_record(tmux_name: &str) {
+/// Remove a session record by session name and persist.
+pub fn remove_session_record(cm_name: &str) {
     let _g = IO_LOCK.lock().unwrap();
     let mut sessions = load_sessions();
-    if sessions.remove(tmux_name).is_some() {
+    if sessions.remove(cm_name).is_some() {
         let _ = save_sessions(&sessions);
     }
 }
 
 /// Set a session record's Remote Control flag and persist.
-pub fn set_session_record_remote_control(tmux_name: &str, on: bool) {
+pub fn set_session_record_remote_control(cm_name: &str, on: bool) {
     let _g = IO_LOCK.lock().unwrap();
     let mut sessions = load_sessions();
-    if let Some(record) = sessions.get_mut(tmux_name) {
+    if let Some(record) = sessions.get_mut(cm_name) {
         record.remote_control = on;
         let _ = save_sessions(&sessions);
     }
 }
 
 /// Set the Claude conversation a session record resumes and persist.
-pub fn set_session_record_claude_session_id(tmux_name: &str, id: &str) -> bool {
+pub fn set_session_record_claude_session_id(cm_name: &str, id: &str) -> bool {
     let _g = IO_LOCK.lock().unwrap();
     let mut sessions = load_sessions();
-    let Some(record) = sessions.get_mut(tmux_name) else {
+    let Some(record) = sessions.get_mut(cm_name) else {
         return false;
     };
     if record.claude_session_id.as_deref() != Some(id) {

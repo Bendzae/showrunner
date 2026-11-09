@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 
 use crate::config::{self, Config};
 use crate::ops;
-use crate::tmux::{self, DiffStats, PrInfo, TmuxSession};
+use crate::session::{self, DiffStats, LiveSession, PrInfo};
 use crate::worker::{TaskInfo, Worker, WorkerUpdate};
 
 struct ServerState {
@@ -110,12 +110,12 @@ fn pr_json(p: &PrInfo) -> Value {
     p.to_json()
 }
 
-fn session_json(s: &TmuxSession, u: &WorkerUpdate) -> Value {
+fn session_json(s: &LiveSession, u: &WorkerUpdate) -> Value {
     json!({
         "tmux_name": s.name,
         "name": s.session_name,
         "status": u.statuses.get(&s.name).map(|st| st.as_str()),
-        "agent": tmux::session_agent(&s.name).id(),
+        "agent": session::session_agent(&s.name).id(),
         "branch": u.session_branches.get(&s.name),
         "diff": u.diff_stats.get(&s.name).map(diff_json),
     })
@@ -131,7 +131,7 @@ fn build_state(cfg: &Config, u: &WorkerUpdate, hostname: &str) -> Value {
                 .iter()
                 .map(|t| {
                     let sessions: Vec<Value> =
-                        tmux::sessions_for_task(&p.name, &t.name, &u.sessions)
+                        session::sessions_for_task(&p.name, &t.name, &u.sessions)
                             .iter()
                             .map(|s| session_json(s, u))
                             .collect();
@@ -148,7 +148,7 @@ fn build_state(cfg: &Config, u: &WorkerUpdate, hostname: &str) -> Value {
                     })
                 })
                 .collect();
-            let adhoc: Vec<Value> = tmux::adhoc_sessions_for_project(&p.name, &u.sessions)
+            let adhoc: Vec<Value> = session::adhoc_sessions_for_project(&p.name, &u.sessions)
                 .iter()
                 .map(|s| session_json(s, u))
                 .collect();
@@ -180,7 +180,7 @@ async fn api_state(State(state): State<Arc<ServerState>>) -> Result<Response, Ap
                 // the next poll).
                 None => {
                     let u = WorkerUpdate {
-                        sessions: tmux::list_sessions().unwrap_or_default(),
+                        sessions: session::list_sessions().unwrap_or_default(),
                         statuses: Default::default(),
                         diff_stats: Default::default(),
                         task_diff_stats: Default::default(),
@@ -226,7 +226,7 @@ async fn api_output(
     validate_session_name(&name)?;
     let lines = params.lines.unwrap_or(300).clamp(50, 5000);
 
-    let (text, width) = tokio::task::spawn_blocking(move || tmux::capture_output(&name, lines))
+    let (text, width) = tokio::task::spawn_blocking(move || session::capture_output(&name, lines))
         .await
         .map_err(internal)?
         .ok_or((StatusCode::NOT_FOUND, "session not found".to_string()))?;
@@ -252,7 +252,7 @@ async fn api_diff(Query(params): Query<DiffParams>) -> Result<Response, ApiError
 
     let text = tokio::task::spawn_blocking(move || {
         if let Some(name) = params.session {
-            tmux::get_session_diff_text(&name)
+            session::get_session_diff_text(&name)
         } else {
             let (project_name, branch) = (params.project.unwrap(), params.branch.unwrap());
             let cfg = Config::load().ok()?;
@@ -263,7 +263,7 @@ async fn api_diff(Query(params): Query<DiffParams>) -> Result<Response, ApiError
                 .find(|t| t.branch == branch)
                 .map(|t| t.base_branch().to_string())
                 .unwrap_or_else(|| "main".to_string());
-            tmux::get_branch_diff_text(&project.path, &branch, &base)
+            session::get_branch_diff_text(&project.path, &branch, &base)
         }
     })
     .await
@@ -293,12 +293,12 @@ async fn api_send(
     tokio::task::spawn_blocking(move || {
         if body.text.is_empty() {
             if body.submit {
-                tmux::send_key(&name, "Enter")
+                session::send_key(&name, "Enter")
             } else {
                 Ok(())
             }
         } else {
-            tmux::send_text(&name, &body.text, body.submit)
+            session::send_text(&name, &body.text, body.submit)
         }
     })
     .await
@@ -328,7 +328,7 @@ async fn api_keys(
         return Err(bad_request(format!("key '{}' not allowed", body.key)));
     }
 
-    tokio::task::spawn_blocking(move || tmux::send_key(&name, &body.key))
+    tokio::task::spawn_blocking(move || session::send_key(&name, &body.key))
         .await
         .map_err(internal)?
         .map_err(internal)?;
@@ -338,7 +338,7 @@ async fn api_keys(
 
 async fn api_kill(Path(name): Path<String>) -> Result<StatusCode, ApiError> {
     validate_session_name(&name)?;
-    if name.ends_with(&format!("__{}", tmux::MAIN_SESSION)) {
+    if name.ends_with(&format!("__{}", session::MAIN_SESSION)) {
         return Err(bad_request(
             "the main session can't be killed — delete the task instead",
         ));
@@ -418,13 +418,13 @@ struct CreateTaskBody {
 async fn api_create_task(
     axum::Json(body): axum::Json<CreateTaskBody>,
 ) -> Result<Response, ApiError> {
-    let tmux_name = tokio::task::spawn_blocking(move || {
+    let cm_name = tokio::task::spawn_blocking(move || {
         let cfg = Config::load()?;
         let project = ops::find_project(&cfg, &body.project)?.clone();
 
         let agent = ops::resolve_agent(&cfg, body.agent.as_deref())?;
         // A new task starts with its main session, like the TUI.
-        let (_, tmux_name) = ops::create_task(
+        let (_, cm_name) = ops::create_task(
             &cfg,
             &project,
             body.name.trim(),
@@ -435,13 +435,13 @@ async fn api_create_task(
             None,
             agent,
         )?;
-        Ok::<_, anyhow::Error>(tmux_name)
+        Ok::<_, anyhow::Error>(cm_name)
     })
     .await
     .map_err(internal)?
     .map_err(internal)?;
 
-    Ok(axum::Json(json!({ "tmux_name": tmux_name })).into_response())
+    Ok(axum::Json(json!({ "tmux_name": cm_name })).into_response())
 }
 
 #[derive(Deserialize)]
@@ -455,7 +455,7 @@ struct CreateSessionBody {
 async fn api_create_session(
     axum::Json(body): axum::Json<CreateSessionBody>,
 ) -> Result<Response, ApiError> {
-    let tmux_name = tokio::task::spawn_blocking(move || {
+    let cm_name = tokio::task::spawn_blocking(move || {
         let cfg = Config::load()?;
         let project = ops::find_project(&cfg, &body.project)?.clone();
         let task = project
@@ -480,7 +480,7 @@ async fn api_create_session(
     .map_err(internal)?
     .map_err(internal)?;
 
-    Ok(axum::Json(json!({ "tmux_name": tmux_name })).into_response())
+    Ok(axum::Json(json!({ "tmux_name": cm_name })).into_response())
 }
 
 #[derive(Deserialize)]
@@ -518,7 +518,7 @@ struct CreateAdhocBody {
 async fn api_create_adhoc(
     axum::Json(body): axum::Json<CreateAdhocBody>,
 ) -> Result<Response, ApiError> {
-    let tmux_name = tokio::task::spawn_blocking(move || {
+    let cm_name = tokio::task::spawn_blocking(move || {
         let cfg = Config::load()?;
         let project = cfg
             .projects
@@ -532,19 +532,19 @@ async fn api_create_adhoc(
             anyhow::bail!("adhoc session name is required");
         }
 
-        let tmux_name = format!(
+        let cm_name = format!(
             "cm__{}__{}__{}",
-            tmux::sanitize(&project.name),
-            tmux::ADHOC_MARKER,
-            tmux::sanitize(&name),
+            session::sanitize(&project.name),
+            session::ADHOC_MARKER,
+            session::sanitize(&name),
         );
-        let sessions = tmux::list_sessions().unwrap_or_default();
-        if sessions.iter().any(|s| s.name == tmux_name) {
+        let sessions = session::list_sessions().unwrap_or_default();
+        if sessions.iter().any(|s| s.name == cm_name) {
             anyhow::bail!("adhoc session '{name}' already exists");
         }
 
         let agent = ops::resolve_agent(&cfg, body.agent.as_deref())?;
-        let tmux_name = tmux::create_adhoc_session(
+        let cm_name = session::create_adhoc_session(
             &project.name,
             &project.path,
             &name,
@@ -552,27 +552,27 @@ async fn api_create_adhoc(
             agent,
         )?;
         config::add_session_record(
-            &tmux_name,
+            &cm_name,
             config::SessionRecord {
                 project_name: project.name.clone(),
                 project_path: project.path.clone(),
-                task_name: tmux::ADHOC_MARKER.to_string(),
+                task_name: session::ADHOC_MARKER.to_string(),
                 task_branch: String::new(),
                 session_name: name,
                 use_worktree: false,
                 archived: false,
                 agent: agent.id().to_string(),
                 remote_control: false,
-                claude_session_id: tmux::claude_session_id(&tmux_name),
+                claude_session_id: session::claude_session_id(&cm_name),
             },
         );
-        Ok(tmux_name)
+        Ok(cm_name)
     })
     .await
     .map_err(internal)?
     .map_err(|e: anyhow::Error| bad_request(e.to_string()))?;
 
-    Ok(axum::Json(json!({ "tmux_name": tmux_name })).into_response())
+    Ok(axum::Json(json!({ "tmux_name": cm_name })).into_response())
 }
 
 async fn index() -> Response {

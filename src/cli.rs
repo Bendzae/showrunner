@@ -15,7 +15,7 @@ use crate::config::{self, Config};
 use crate::ops;
 use crate::remote;
 use crate::server;
-use crate::tmux::{self, SessionStatus, TmuxSession};
+use crate::session::{self, LiveSession, SessionStatus, TurnEnd};
 
 const HELP: &str = "\
 showrunner — TUI for managing coding agent sessions
@@ -53,15 +53,18 @@ Managing tasks and sessions (usable from inside a session):
 
 Housekeeping:
   showrunner restore                            recreate saved sessions that
-                                                    are gone from tmux (reboot)
+                                                    are no longer running (reboot)
+  showrunner migrate                            move idle sessions still running
+                                                    in tmux (older versions) into hc
 
 Talking to another session:
   showrunner ask <session> <question> [--timeout <secs>]
   showrunner send <session> <text> [--no-submit]
   showrunner output <session> [--lines <n>]
+  showrunner attach <session>                   take over its terminal (ctrl+\\ detaches)
 
 <session> is a ref from `list` — `<project>/<task>/<session>`, `<project>/<task>`
-for that task's main session, or a raw tmux session name.
+for that task's main session, or a raw `cm__…` session name.
 
 With a [remote] configured, prefix a project or session ref with `<name>:` to
 run the command on that host (`showrunner ask ec2:myapp/fix-auth <question>`).
@@ -86,7 +89,9 @@ pub fn dispatch(args: &[String]) -> Option<Result<()>> {
         Some("ask") => Some(cmd_ask(rest)),
         Some("send") => Some(cmd_send(rest)),
         Some("output") => Some(cmd_output(rest)),
+        Some("attach") => Some(cmd_attach(rest)),
         Some("restore") => Some(cmd_restore(rest)),
+        Some("migrate") => Some(cmd_migrate(rest)),
         Some("--help" | "-h" | "help") => {
             print!("{HELP}");
             Some(Ok(()))
@@ -122,6 +127,26 @@ fn dispatch_remote(args: &[String]) -> Option<Result<()>> {
             std::process::exit(status.code().unwrap_or(1));
         }
     }))
+}
+
+fn cmd_migrate(args: &[String]) -> Result<()> {
+    if let Some(extra) = args.first() {
+        bail!("unexpected argument '{extra}' (usage: migrate)");
+    }
+    let report = crate::migrate::migrate(&Config::load()?)?;
+    for reference in &report.migrated {
+        println!("moved to hc: {reference}");
+    }
+    for (reference, why) in &report.skipped {
+        println!("left in tmux: {reference} — {why}");
+    }
+    for failure in &report.failures {
+        eprintln!("could not move {failure}");
+    }
+    if report.migrated.is_empty() && report.skipped.is_empty() && report.failures.is_empty() {
+        println!("no tmux sessions to move");
+    }
+    Ok(())
 }
 
 fn cmd_restore(args: &[String]) -> Result<()> {
@@ -217,34 +242,19 @@ fn cmd_serve(args: &[String]) -> Result<()> {
 }
 
 /// Canonical `<project>/<task>/<session>` ref for a session.
-fn session_ref(s: &TmuxSession) -> String {
+fn session_ref(s: &LiveSession) -> String {
     format!("{}/{}/{}", s.project_name, s.task_name, s.session_name)
 }
 
-/// The tmux session this process runs in, when invoked from inside one.
+/// The session this process runs in, when invoked from inside one of its
+/// terminals.
 fn current_session_name() -> Option<String> {
-    std::env::var_os("TMUX")?;
-    let pane = std::env::var("TMUX_PANE").ok();
-    let mut args = vec!["display-message", "-p"];
-    if let Some(pane) = &pane {
-        args.extend(["-t", pane]);
-    }
-    args.push("#S");
-
-    let out = std::process::Command::new("tmux")
-        .args(&args)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if name.is_empty() { None } else { Some(name) }
+    session::session_of_terminal(&std::env::var("HC_TERMINAL_ID").ok()?)
 }
 
-/// Resolve a session ref to a live session. Accepts a raw tmux name,
+/// Resolve a session ref to a live session. Accepts a raw `cm__…` name,
 /// `<project>/<task>/<session>`, or `<project>/<task>` (its main session).
-fn resolve_session(reference: &str, sessions: &[TmuxSession]) -> Result<TmuxSession> {
+fn resolve_session(reference: &str, sessions: &[LiveSession]) -> Result<LiveSession> {
     let reference = reference.trim().trim_matches('/');
     if reference.is_empty() {
         bail!("a session ref is required");
@@ -256,15 +266,15 @@ fn resolve_session(reference: &str, sessions: &[TmuxSession]) -> Result<TmuxSess
         let parts: Vec<&str> = reference.split('/').collect();
         let (project, task, session) = match parts.as_slice() {
             [project, task, session] => (*project, *task, *session),
-            [project, task] => (*project, *task, tmux::MAIN_SESSION),
+            [project, task] => (*project, *task, session::MAIN_SESSION),
             _ => bail!(
-                "'{reference}' is not a session ref (expected <project>/<task>[/<session>] or a tmux name)"
+                "'{reference}' is not a session ref (expected <project>/<task>[/<session>] or a cm__ name)"
             ),
         };
         sessions.iter().find(|s| {
-            s.project_name == tmux::sanitize(project)
-                && s.task_name == tmux::sanitize(task)
-                && s.session_name == tmux::sanitize(session)
+            s.project_name == session::sanitize(project)
+                && s.task_name == session::sanitize(task)
+                && s.session_name == session::sanitize(session)
         })
     };
 
@@ -279,14 +289,14 @@ fn resolve_session(reference: &str, sessions: &[TmuxSession]) -> Result<TmuxSess
 /// Running…") and an "esc to interrupt" hint. Notifications can render below the
 /// spinner, so look at the last few transcript lines rather than just the last.
 fn session_looks_busy(session_name: &str) -> bool {
-    let Some(text) = tmux::capture_output_plain(session_name, 100) else {
+    let Some(text) = session::capture_output_plain(session_name, 100) else {
         return false;
     };
     if tail(&text, 6).contains("esc to interrupt") {
         return true;
     }
 
-    let transcript = trim_pane(&text, tmux::session_agent(session_name));
+    let transcript = trim_pane(&text, session::session_agent(session_name));
     transcript
         .lines()
         .rev()
@@ -305,10 +315,10 @@ fn is_spinner_line(line: &str) -> bool {
 
 /// Sample session statuses the way the TUI's worker does: a session counts as
 /// running while its pane keeps changing, so this probes twice.
-fn sample_statuses(sessions: &[TmuxSession]) -> HashMap<String, SessionStatus> {
-    let first: HashMap<String, Option<tmux::SessionProbe>> = sessions
+fn sample_statuses(sessions: &[LiveSession]) -> HashMap<String, SessionStatus> {
+    let first: HashMap<String, Option<session::SessionProbe>> = sessions
         .iter()
-        .map(|s| (s.name.clone(), tmux::probe_session(&s.name)))
+        .map(|s| (s.name.clone(), session::probe_session(&s.name)))
         .collect();
 
     sleep(Duration::from_millis(800));
@@ -316,13 +326,12 @@ fn sample_statuses(sessions: &[TmuxSession]) -> HashMap<String, SessionStatus> {
     sessions
         .iter()
         .map(|s| {
-            let probe = tmux::probe_session(&s.name);
+            let probe = session::probe_session(&s.name);
             let status = match (first.get(&s.name).and_then(|p| p.as_ref()), probe) {
                 (_, None) => SessionStatus::Finished,
-                (_, Some(p)) if !p.agent_alive => SessionStatus::Finished,
                 (
                     _,
-                    Some(tmux::SessionProbe {
+                    Some(session::SessionProbe {
                         reported: Some(status),
                         ..
                     }),
@@ -351,14 +360,14 @@ fn cmd_list(args: &[String]) -> Result<()> {
     let stats = flags.contains_key("stats");
 
     let cfg = Config::load()?;
-    let sessions = tmux::list_sessions().unwrap_or_default();
+    let sessions = session::list_sessions().unwrap_or_default();
     let statuses = sample_statuses(&sessions);
     let current = current_session_name();
     let project_filter = flags.get("project");
     // Set when a remote lists on behalf of the caller, so printed refs are
     // usable as-is from the caller's side.
     let ref_prefix = flags.get("ref-prefix").cloned().unwrap_or_default();
-    let session_ref = |s: &TmuxSession| format!("{ref_prefix}{}", session_ref(s));
+    let session_ref = |s: &LiveSession| format!("{ref_prefix}{}", session_ref(s));
     // `--project` names a local project, so a filtered list stays local.
     let host_listings: Vec<(remote::Host, Result<String>)> =
         if ref_prefix.is_empty() && project_filter.is_none() {
@@ -382,21 +391,21 @@ fn cmd_list(args: &[String]) -> Result<()> {
         bail!("project '{filter}' not found");
     }
 
-    let session_value = |s: &TmuxSession| {
+    let session_value = |s: &LiveSession| {
         let mut v = json!({
             "ref": session_ref(s),
-            "tmux_name": s.name,
+            "cm_name": s.name,
             "name": s.session_name,
             "status": statuses.get(&s.name).map(|st| st.as_str()),
-            "agent": tmux::session_agent(&s.name).id(),
+            "agent": session::session_agent(&s.name).id(),
             "current": current.as_deref() == Some(s.name.as_str()),
         });
         if stats {
-            v["diff"] = tmux::get_diff_stats(&s.name)
+            v["diff"] = session::get_diff_stats(&s.name)
                 .map(|d| d.to_json())
                 .unwrap_or(Value::Null);
-            v["branch"] = json!(tmux::get_session_branch(&s.name));
-            v["last_active"] = json!(tmux::last_active(&s.name));
+            v["branch"] = json!(session::get_session_branch(&s.name));
+            v["last_active"] = json!(session::last_active(&s.name));
         }
         v
     };
@@ -420,15 +429,16 @@ fn cmd_list(args: &[String]) -> Result<()> {
                             "stack": stacks.get(&t.branch).map(|(pos, total)| {
                                 json!({ "position": pos, "size": total })
                             }),
-                            "sessions": tmux::sessions_for_task(&p.name, &t.name, &sessions)
+                            "sessions": session::sessions_for_task(&p.name, &t.name, &sessions)
                                 .iter()
                                 .map(session_value)
                                 .collect::<Vec<_>>(),
                         });
                         if stats && !t.archived {
-                            v["diff"] = tmux::get_branch_diff(&p.path, &t.branch, t.base_branch())
-                                .map(|d| d.to_json())
-                                .unwrap_or(Value::Null);
+                            v["diff"] =
+                                session::get_branch_diff(&p.path, &t.branch, t.base_branch())
+                                    .map(|d| d.to_json())
+                                    .unwrap_or(Value::Null);
                             v["pr"] = ops::cached_pr_info(
                                 &p.name,
                                 &p.path,
@@ -445,13 +455,13 @@ fn cmd_list(args: &[String]) -> Result<()> {
                     "name": p.name,
                     "path": p.path,
                     "tasks": tasks,
-                    "adhoc_sessions": tmux::adhoc_sessions_for_project(&p.name, &sessions)
+                    "adhoc_sessions": session::adhoc_sessions_for_project(&p.name, &sessions)
                         .iter()
                         .map(session_value)
                         .collect::<Vec<_>>(),
                 });
                 if stats {
-                    v["branch"] = json!(tmux::current_branch(&p.path));
+                    v["branch"] = json!(session::current_branch(&p.path));
                 }
                 v
             })
@@ -481,12 +491,12 @@ fn cmd_list(args: &[String]) -> Result<()> {
         return Ok(());
     }
 
-    let print_session = |s: &TmuxSession| {
+    let print_session = |s: &LiveSession| {
         let status = statuses
             .get(&s.name)
             .map(|st| st.as_str())
             .unwrap_or("unknown");
-        let agent = tmux::session_agent(&s.name);
+        let agent = session::session_agent(&s.name);
         let agent = if agent == AgentKind::default() {
             String::new()
         } else {
@@ -525,7 +535,7 @@ fn cmd_list(args: &[String]) -> Result<()> {
                 task.branch,
                 task.base_branch()
             );
-            let task_sessions = tmux::sessions_for_task(&project.name, &task.name, &sessions);
+            let task_sessions = session::sessions_for_task(&project.name, &task.name, &sessions);
             if task_sessions.is_empty() {
                 println!("    (no live sessions)");
             }
@@ -533,7 +543,7 @@ fn cmd_list(args: &[String]) -> Result<()> {
                 print_session(s);
             }
         }
-        let adhoc = tmux::adhoc_sessions_for_project(&project.name, &sessions);
+        let adhoc = session::adhoc_sessions_for_project(&project.name, &sessions);
         if !adhoc.is_empty() {
             println!("  adhoc sessions");
             for s in &adhoc {
@@ -608,7 +618,7 @@ fn cmd_task_create(args: &[String]) -> Result<()> {
         .map(|r| config::linear_ticket_url(r, cfg.linear_workspace.as_deref()))
         .transpose()?;
     let base = flags.get("base").map(String::as_str);
-    let (branch, tmux_name) = ops::create_task(
+    let (branch, cm_name) = ops::create_task(
         &cfg,
         project,
         task_name,
@@ -623,9 +633,9 @@ fn cmd_task_create(args: &[String]) -> Result<()> {
         agent,
     )?;
 
-    let session = TmuxSession::from_tmux_name(&tmux_name)
+    let session = LiveSession::from_name(&cm_name)
         .map(|s| session_ref(&s))
-        .unwrap_or(tmux_name);
+        .unwrap_or(cm_name);
     match base.map(str::trim).filter(|b| !b.is_empty()) {
         Some(base) => println!("created task '{task_name}' on branch {branch} (base {base})"),
         None => println!("created task '{task_name}' on branch {branch}"),
@@ -649,7 +659,7 @@ fn cmd_task_set_base(args: &[String]) -> Result<()> {
     let base = base.trim();
     let new_base = Some(base.to_string()).filter(|b| !b.is_empty() && b != "main");
     if let Some(b) = &new_base
-        && !tmux::branch_exists(&project.path, b)
+        && !session::branch_exists(&project.path, b)
     {
         bail!(
             "base branch '{b}' does not exist in {} (create it first, or check the name)",
@@ -859,7 +869,7 @@ fn cmd_session_move(args: &[String]) -> Result<()> {
         remote::Target::Host(h) => format!("{}:", h.name()),
     };
     if moving_self {
-        // Releasing kills the tmux session we run in: report before, not after.
+        // Releasing kills the session we run in: report before, not after.
         println!(
             "moved {reference} → {dest_prefix}{created_ref}; this session ends now — continue there"
         );
@@ -892,23 +902,23 @@ fn handoff_prompt(export: &ops::SessionExport, from: &str, note: Option<&str>) -
     prompt
 }
 
-/// Resolve a session ref to the tmux name of a *recorded* session, live or
+/// Resolve a session ref to the name of a *recorded* session, live or
 /// not — a session whose agent died can still be moved.
 fn resolve_recorded_session(reference: &str) -> Result<String> {
     let reference = reference.trim().trim_matches('/');
-    let tmux_name = if reference.starts_with("cm__") {
+    let cm_name = if reference.starts_with("cm__") {
         reference.to_string()
     } else {
         match reference.split('/').collect::<Vec<_>>().as_slice() {
-            [project, task, session] => tmux::build_tmux_name(project, task, session),
-            [project, task] => tmux::build_tmux_name(project, task, tmux::MAIN_SESSION),
+            [project, task, session] => session::build_session_name(project, task, session),
+            [project, task] => session::build_session_name(project, task, session::MAIN_SESSION),
             _ => bail!("'{reference}' is not a session ref"),
         }
     };
-    if !config::load_sessions().contains_key(&tmux_name) {
+    if !config::load_sessions().contains_key(&cm_name) {
         bail!("no session matching '{reference}' (see `showrunner list`)");
     }
-    Ok(tmux_name)
+    Ok(cm_name)
 }
 
 fn cmd_session_export(args: &[String]) -> Result<()> {
@@ -917,8 +927,8 @@ fn cmd_session_export(args: &[String]) -> Result<()> {
         bail!("usage: session export <session>");
     };
     let cfg = Config::load()?;
-    let tmux_name = resolve_recorded_session(reference)?;
-    let export = ops::export_session(&cfg, &tmux_name)?;
+    let cm_name = resolve_recorded_session(reference)?;
+    let export = ops::export_session(&cfg, &cm_name)?;
     println!("{}", serde_json::to_string(&export)?);
     Ok(())
 }
@@ -931,10 +941,10 @@ fn cmd_session_import(args: &[String]) -> Result<()> {
     let cfg = Config::load()?;
     let export: ops::SessionExport = serde_json::from_str(spec)?;
     let prompt = flags.get("prompt").cloned().unwrap_or_default();
-    let tmux_name = ops::import_session(&cfg, &export, &prompt)?;
-    let session = TmuxSession::from_tmux_name(&tmux_name)
+    let cm_name = ops::import_session(&cfg, &export, &prompt)?;
+    let session = LiveSession::from_name(&cm_name)
         .map(|s| session_ref(&s))
-        .unwrap_or(tmux_name);
+        .unwrap_or(cm_name);
     println!("created session: {session}");
     Ok(())
 }
@@ -942,16 +952,16 @@ fn cmd_session_import(args: &[String]) -> Result<()> {
 /// The PR of a session's task, fetched live, as JSON.
 fn cmd_session_pr(args: &[String]) -> Result<()> {
     let (positional, _) = parse_args(args, &[], &[])?;
-    let tmux_name = match positional.as_slice() {
+    let cm_name = match positional.as_slice() {
         [reference] => resolve_recorded_session(reference)?,
         [] => current_session_name()
             .ok_or_else(|| anyhow::anyhow!("not inside a showrunner session; pass <session>"))?,
         _ => bail!("usage: session pr [<session>]"),
     };
     let record = config::load_sessions()
-        .remove(&tmux_name)
-        .ok_or_else(|| anyhow::anyhow!("no session record for {tmux_name}"))?;
-    if tmux::is_adhoc_marker(&record.task_name) {
+        .remove(&cm_name)
+        .ok_or_else(|| anyhow::anyhow!("no session record for {cm_name}"))?;
+    if session::is_adhoc_marker(&record.task_name) {
         bail!("adhoc sessions have no PR");
     }
     let pr = ops::pr_details(&record.project_path, &record.task_branch)?;
@@ -966,23 +976,23 @@ fn cmd_session_set_conversation(args: &[String]) -> Result<()> {
     let [reference, id] = positional.as_slice() else {
         bail!("usage: session set-conversation <session> <id>");
     };
-    let tmux_name = resolve_recorded_session(reference)?;
-    config::set_session_record_claude_session_id(&tmux_name, id);
+    let cm_name = resolve_recorded_session(reference)?;
+    config::set_session_record_claude_session_id(&cm_name, id);
     Ok(())
 }
 
 /// The Linear ticket linked to a session's task, fetched live, as JSON.
 fn cmd_session_ticket(args: &[String]) -> Result<()> {
     let (positional, _) = parse_args(args, &[], &[])?;
-    let tmux_name = match positional.as_slice() {
+    let cm_name = match positional.as_slice() {
         [reference] => resolve_recorded_session(reference)?,
         [] => current_session_name()
             .ok_or_else(|| anyhow::anyhow!("not inside a showrunner session; pass <session>"))?,
         _ => bail!("usage: session ticket [<session>]"),
     };
     let record = config::load_sessions()
-        .remove(&tmux_name)
-        .ok_or_else(|| anyhow::anyhow!("no session record for {tmux_name}"))?;
+        .remove(&cm_name)
+        .ok_or_else(|| anyhow::anyhow!("no session record for {cm_name}"))?;
     let cfg = Config::load()?;
     let url = cfg
         .find_task(&record.project_name, &record.task_name)
@@ -999,22 +1009,22 @@ fn cmd_session_ticket(args: &[String]) -> Result<()> {
 /// task, branch, PR (cached), diff and siblings with their reported status.
 fn cmd_session_info(args: &[String]) -> Result<()> {
     let (positional, _) = parse_args(args, &[], &[])?;
-    let tmux_name = match positional.as_slice() {
+    let cm_name = match positional.as_slice() {
         [reference] => resolve_recorded_session(reference)?,
         [] => current_session_name()
             .ok_or_else(|| anyhow::anyhow!("not inside a showrunner session; pass <session>"))?,
         _ => bail!("usage: session info [<session>]"),
     };
     let record = config::load_sessions()
-        .remove(&tmux_name)
-        .ok_or_else(|| anyhow::anyhow!("no session record for {tmux_name}"))?;
+        .remove(&cm_name)
+        .ok_or_else(|| anyhow::anyhow!("no session record for {cm_name}"))?;
     let cfg = Config::load()?;
-    let sessions = tmux::list_sessions().unwrap_or_default();
-    let is_adhoc = tmux::is_adhoc_marker(&record.task_name);
+    let sessions = session::list_sessions().unwrap_or_default();
+    let is_adhoc = session::is_adhoc_marker(&record.task_name);
     let siblings = if is_adhoc {
-        tmux::adhoc_sessions_for_project(&record.project_name, &sessions)
+        session::adhoc_sessions_for_project(&record.project_name, &sessions)
     } else {
-        tmux::sessions_for_task(&record.project_name, &record.task_name, &sessions)
+        session::sessions_for_task(&record.project_name, &record.task_name, &sessions)
     };
     let task = (!is_adhoc)
         .then(|| cfg.find_task(&record.project_name, &record.task_name))
@@ -1024,15 +1034,15 @@ fn cmd_session_info(args: &[String]) -> Result<()> {
         "project": record.project_name,
         "task": (!is_adhoc).then_some(&record.task_name),
         "session": record.session_name,
-        "branch": tmux::get_session_branch(&tmux_name),
-        "session_diff": tmux::get_diff_stats(&tmux_name).map(|d| d.to_json()),
+        "branch": session::get_session_branch(&cm_name),
+        "session_diff": session::get_diff_stats(&cm_name).map(|d| d.to_json()),
         "siblings": siblings
             .iter()
-            .filter(|s| s.name != tmux_name)
+            .filter(|s| s.name != cm_name)
             .map(|s| json!({
                 "name": s.session_name,
-                "agent": tmux::session_agent(&s.name).id(),
-                "status": tmux::reported_status(&s.name).map(|st| st.as_str()),
+                "agent": session::session_agent(&s.name).id(),
+                "status": session::reported_status(&s.name).map(|st| st.as_str()),
             }))
             .collect::<Vec<_>>(),
     });
@@ -1052,7 +1062,7 @@ fn cmd_session_info(args: &[String]) -> Result<()> {
                 ))
         );
         out["task_diff"] = json!(
-            tmux::get_branch_diff(&record.project_path, &task.branch, task.base_branch())
+            session::get_branch_diff(&record.project_path, &task.branch, task.base_branch())
                 .map(|d| d.to_json())
         );
         out["pr"] = json!(
@@ -1078,10 +1088,10 @@ fn cmd_session_remote_control(args: &[String]) -> Result<()> {
         [reference, state] => (reference, Some(state.as_str())),
         _ => bail!("usage: session remote-control <session> [on|off]"),
     };
-    let tmux_name = resolve_recorded_session(reference)?;
+    let cm_name = resolve_recorded_session(reference)?;
     let record = config::load_sessions()
-        .remove(&tmux_name)
-        .ok_or_else(|| anyhow::anyhow!("no session record for {tmux_name}"))?;
+        .remove(&cm_name)
+        .ok_or_else(|| anyhow::anyhow!("no session record for {cm_name}"))?;
     if record.agent_kind() != AgentKind::Claude {
         bail!("Remote Control is only available for Claude sessions");
     }
@@ -1091,7 +1101,7 @@ fn cmd_session_remote_control(args: &[String]) -> Result<()> {
         Some("off") => false,
         Some(other) => bail!("expected 'on' or 'off', got '{other}'"),
     };
-    let name = tmux::remote_control_name(
+    let name = session::remote_control_name(
         &record.project_name,
         &record.task_name,
         &record.session_name,
@@ -1104,18 +1114,18 @@ fn cmd_session_remote_control(args: &[String]) -> Result<()> {
         return Ok(());
     }
 
-    let live = tmux::list_sessions()
+    let live = session::list_sessions()
         .unwrap_or_default()
         .iter()
-        .any(|s| s.name == tmux_name);
+        .any(|s| s.name == cm_name);
     if live {
         if on {
-            tmux::connect_remote_control(&tmux_name, &name)?;
+            session::connect_remote_control(&cm_name, &name)?;
         } else {
-            tmux::disconnect_remote_control(&tmux_name)?;
+            session::disconnect_remote_control(&cm_name)?;
         }
     }
-    config::set_session_record_remote_control(&tmux_name, on);
+    config::set_session_record_remote_control(&cm_name, on);
     println!("Remote Control {}: {name}", if on { "on" } else { "off" });
     Ok(())
 }
@@ -1125,14 +1135,14 @@ fn cmd_session_release(args: &[String]) -> Result<()> {
     let ([reference], true) = (positional.as_slice(), flags.contains_key("yes")) else {
         bail!("usage: session release <session> --yes");
     };
-    let tmux_name = resolve_recorded_session(reference)?;
+    let cm_name = resolve_recorded_session(reference)?;
     // Releasing the session we run in ends this process too — say so first.
-    let from_inside = current_session_name().as_deref() == Some(tmux_name.as_str());
+    let from_inside = current_session_name().as_deref() == Some(cm_name.as_str());
     if from_inside {
         println!("released session: {reference} (this one — ending now)");
         let _ = std::io::stdout().flush();
     }
-    ops::release_session(&tmux_name, from_inside)?;
+    ops::release_session(&cm_name, from_inside)?;
     if !from_inside {
         println!("released session: {reference}");
     }
@@ -1156,7 +1166,7 @@ fn cmd_session_create(args: &[String]) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("task '{task_name}' not found"))?;
 
     let agent = ops::resolve_agent(&cfg, flags.get("agent").map(String::as_str))?;
-    let tmux_name = ops::create_session(
+    let cm_name = ops::create_session(
         &cfg,
         project,
         &task.name,
@@ -1169,9 +1179,9 @@ fn cmd_session_create(args: &[String]) -> Result<()> {
         agent,
     )?;
 
-    let session = TmuxSession::from_tmux_name(&tmux_name)
+    let session = LiveSession::from_name(&cm_name)
         .map(|s| session_ref(&s))
-        .unwrap_or(tmux_name);
+        .unwrap_or(cm_name);
     println!("created session: {session}");
     Ok(())
 }
@@ -1188,7 +1198,7 @@ fn cmd_session_kill(args: &[String]) -> Result<()> {
         );
     }
 
-    let sessions = tmux::list_sessions().unwrap_or_default();
+    let sessions = session::list_sessions().unwrap_or_default();
     let session = resolve_session(reference, &sessions)?;
     if current_session_name().as_deref() == Some(session.name.as_str()) {
         bail!("that is this session — ask the user to kill it instead");
@@ -1209,11 +1219,19 @@ fn cmd_send(args: &[String]) -> Result<()> {
         bail!("nothing to send");
     }
 
-    let sessions = tmux::list_sessions().unwrap_or_default();
+    let sessions = session::list_sessions().unwrap_or_default();
     let session = resolve_session(reference, &sessions)?;
-    tmux::send_text(&session.name, &text, !flags.contains_key("no-submit"))?;
+    session::send_text(&session.name, &text, !flags.contains_key("no-submit"))?;
     println!("sent to {}", session_ref(&session));
     Ok(())
+}
+
+fn cmd_attach(args: &[String]) -> Result<()> {
+    let [reference] = args else {
+        bail!("usage: attach <session>");
+    };
+    let sessions = session::list_sessions().unwrap_or_default();
+    session::attach_session(&resolve_session(reference, &sessions)?.name)
 }
 
 fn cmd_output(args: &[String]) -> Result<()> {
@@ -1228,11 +1246,14 @@ fn cmd_output(args: &[String]) -> Result<()> {
         None => 200,
     };
 
-    let sessions = tmux::list_sessions().unwrap_or_default();
+    let sessions = session::list_sessions().unwrap_or_default();
     let session = resolve_session(reference, &sessions)?;
-    let text = tmux::capture_output_plain(&session.name, lines.clamp(10, 5000))
+    let text = session::capture_output_plain(&session.name, lines.clamp(10, 5000))
         .ok_or_else(|| anyhow::anyhow!("could not capture output for {reference}"))?;
-    println!("{}", trim_pane(&text, tmux::session_agent(&session.name)));
+    println!(
+        "{}",
+        trim_pane(&text, session::session_agent(&session.name))
+    );
     Ok(())
 }
 
@@ -1261,7 +1282,7 @@ fn cmd_ask(args: &[String]) -> Result<()> {
         None => Duration::from_secs(300),
     };
 
-    let sessions = tmux::list_sessions().unwrap_or_default();
+    let sessions = session::list_sessions().unwrap_or_default();
     let session = resolve_session(reference, &sessions)?;
     let name = &session.name;
     if current_session_name().as_deref() == Some(name.as_str()) {
@@ -1277,10 +1298,41 @@ fn cmd_ask(args: &[String]) -> Result<()> {
          [cm-ask {token}]"
     );
 
-    let mut last_hash = tmux::probe_session(name)
+    if let Some(end) = session::send_and_wait(name, &message, timeout.as_secs())? {
+        return match end {
+            TurnEnd::Done => {
+                print_reply(name, &token);
+                Ok(())
+            }
+            TurnEnd::NeedsUser => {
+                print_reply(name, &token);
+                bail!(
+                    "session {} is waiting for the user (permission or question dialog) — \
+                     its answer is incomplete",
+                    session_ref(&session)
+                )
+            }
+            TurnEnd::TimedOut => {
+                print_reply(name, &token);
+                bail!(
+                    "session {} was still working after {}s — the answer above is partial \
+                     (retry with --timeout, or read more with `showrunner output`)",
+                    session_ref(&session),
+                    timeout.as_secs()
+                )
+            }
+            TurnEnd::NotStarted => bail!(
+                "session {} did not react to the question (is its agent running there?)",
+                session_ref(&session)
+            ),
+        };
+    }
+
+    // Agents that don't report their status: watch the screen until it settles.
+    let mut last_hash = session::probe_session(name)
         .ok_or_else(|| anyhow::anyhow!("session {} is not running claude", session_ref(&session)))?
         .content_hash;
-    tmux::send_text(name, &message, true)?;
+    session::send_text(name, &message, true)?;
 
     let start = Instant::now();
     let mut idle_polls = 0;
@@ -1289,7 +1341,7 @@ fn cmd_ask(args: &[String]) -> Result<()> {
     loop {
         sleep(POLL_INTERVAL);
 
-        let Some(probe) = tmux::probe_session(name) else {
+        let Some(probe) = session::probe_session(name) else {
             bail!("session {} died while answering", session_ref(&session));
         };
 
@@ -1343,8 +1395,8 @@ fn ask_token() -> String {
 }
 
 fn print_reply(session_name: &str, token: &str) {
-    let agent = tmux::session_agent(session_name);
-    match tmux::capture_output_plain(session_name, 2000) {
+    let agent = session::session_agent(session_name);
+    match session::capture_output_plain(session_name, 2000) {
         Some(pane) => match extract_reply(&pane, token, agent) {
             Some(reply) => println!("{reply}"),
             None => {
@@ -1372,7 +1424,7 @@ fn extract_reply(pane: &str, token: &str, agent: AgentKind) -> Option<String> {
     after_marker(last).or_else(|| after_marker(pane.find(token)?))
 }
 
-/// Drop the input area and status hints tmux captured below the transcript,
+/// Drop the input area and status hints captured below the transcript,
 /// plus surrounding blank lines and trailing spaces. Chrome differs per agent:
 /// Claude frames its prompt in a box or between horizontal rules, codex's
 /// input line starts with `›` (its ─ rules are transcript content).
@@ -1440,15 +1492,15 @@ mod tests {
         assert!(parse_args(&args(&["--json=1"]), &[], &["json"]).is_err());
     }
 
-    fn sessions() -> Vec<TmuxSession> {
+    fn sessions() -> Vec<LiveSession> {
         ["cm__my-app__fix-auth__main", "cm__my-app__fix-auth__2"]
             .iter()
-            .map(|n| TmuxSession::from_tmux_name(n).unwrap())
+            .map(|n| LiveSession::from_name(n).unwrap())
             .collect()
     }
 
     #[test]
-    fn resolve_session_accepts_refs_tmux_names_and_task_shorthand() {
+    fn resolve_session_accepts_refs_cm_names_and_task_shorthand() {
         let sessions = sessions();
         let resolve = |r: &str| resolve_session(r, &sessions).map(|s| s.name);
 
@@ -1465,7 +1517,7 @@ mod tests {
             "cm__my-app__fix-auth__main"
         );
         // Names as written in the config resolve too — they get sanitized the
-        // same way the tmux session name was built.
+        // same way the session name was built.
         assert_eq!(
             resolve("my app/fix-auth/2").unwrap(),
             "cm__my-app__fix-auth__2"

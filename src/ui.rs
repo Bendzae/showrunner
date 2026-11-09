@@ -10,8 +10,8 @@ use ratatui::widgets::{
 
 use crate::app::{self, App, InputMode};
 use crate::config::{Task, linear_ticket_id};
+use crate::session::{self, CiStatus, PrInfo, PrReview, PrState, SessionStatus};
 use crate::theme::current;
-use crate::tmux::{self, CiStatus, PrInfo, PrReview, PrState, SessionStatus};
 
 const PAD_LEFT: u16 = 1;
 const PAD_TOP: u16 = 1;
@@ -44,10 +44,10 @@ fn run_indicator(app: &App, item: &app::ListItem) -> Option<Span<'static>> {
 
 /// Dim glyph identifying the harness a session runs (✻ claude, ⬡ codex, π pi).
 /// Nothing until the worker has resolved the session's agent.
-fn agent_icon_span(app: &App, tmux_name: &str) -> Option<Span<'static>> {
+fn agent_icon_span(app: &App, cm_name: &str) -> Option<Span<'static>> {
     let agent = app
         .session_agents
-        .get(tmux_name)
+        .get(cm_name)
         .and_then(|id| crate::agent::AgentKind::from_id(id))?;
     Some(Span::styled(
         format!(" {}", agent.icon()),
@@ -85,7 +85,7 @@ fn is_hot(app: &App, project_name: &str, project_path: &str, task: &Task) -> boo
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    tmux::sessions_for_task(project_name, &task.name, app.sessions_at(project_path))
+    session::sessions_for_task(project_name, &task.name, app.sessions_at(project_path))
         .iter()
         .filter_map(|s| app.last_active.get(&s.key()))
         .any(|at| now.saturating_sub(*at) < HOT_WINDOW_SECS)
@@ -924,7 +924,7 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
                 let mut meta: Vec<Span> = Vec::new();
                 if collapsed {
                     let task_count = project.tasks.len();
-                    let sanitized = tmux::sanitize(&project.name);
+                    let sanitized = session::sanitize(&project.name);
                     let active_sessions = app
                         .sessions_at(&project.path)
                         .iter()
@@ -1069,7 +1069,7 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
                     app::scoped_project(project_name, project_path),
                     task.name
                 )) {
-                    let sessions = tmux::sessions_for_task(
+                    let sessions = session::sessions_for_task(
                         project_name,
                         &task.name,
                         app.sessions_at(project_path),
@@ -1126,7 +1126,7 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
                     _ => task.branch.clone(),
                 };
 
-                let needs_you = tmux::sessions_for_task(
+                let needs_you = session::sessions_for_task(
                     project_name,
                     &task.name,
                     app.sessions_at(project_path),
@@ -1244,7 +1244,7 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
             } => {
                 let indicator = if is_selected { " ▸ " } else { "   " };
                 // The main session sits on the task branch itself — mark it out.
-                let is_main = tmux::is_main_session(&session.session_name);
+                let is_main = session::is_main_session(&session.session_name);
                 let name_color = if is_main {
                     current().accent
                 } else {
@@ -1303,7 +1303,7 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
             } => {
                 let indicator = if is_selected { " ▸ " } else { "   " };
                 // The main session sits on the task branch itself — mark it out.
-                let is_main = tmux::is_main_session(&session.session_name);
+                let is_main = session::is_main_session(&session.session_name);
                 let name_color = if is_main {
                     current().accent
                 } else {

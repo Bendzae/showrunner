@@ -7,7 +7,7 @@ license = "MIT"
 repository = "https://github.com/Bendzae/showrunner"
 homepage = "https://github.com/Bendzae/showrunner"
 readme = "README.md"
-keywords = ["agents", "tui", "tmux", "ai", "cli"]
+keywords = ["agents", "tui", "terminal", "ai", "cli"]
 categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]

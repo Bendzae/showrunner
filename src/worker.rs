@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use crate::tmux::{self, DiffStats, PrInfo, PrState, SessionProbe, SessionStatus, TmuxSession};
+use crate::session::{self, DiffStats, LiveSession, PrInfo, PrState, SessionProbe, SessionStatus};
 
 /// Task info for computing branch diffs.
 #[derive(Clone)]
@@ -23,23 +23,23 @@ pub struct WorkerHints {
 
 /// Data produced by the background worker for the UI to consume.
 pub struct WorkerUpdate {
-    pub sessions: Vec<TmuxSession>,
+    pub sessions: Vec<LiveSession>,
     pub statuses: HashMap<String, SessionStatus>,
     pub diff_stats: HashMap<String, DiffStats>,
     /// Keyed by branch name.
     pub task_diff_stats: HashMap<String, DiffStats>,
-    /// Branch checked out in each session's worktree, keyed by session tmux name.
+    /// Branch checked out in each session's worktree, keyed by session name.
     pub session_branches: HashMap<String, String>,
-    /// Agent harness id per session, keyed by session tmux name.
+    /// Agent harness id per session, keyed by session name.
     pub session_agents: HashMap<String, String>,
     /// When each session's agent last wrote its conversation (Unix seconds),
-    /// keyed by session tmux name.
+    /// keyed by session name.
     pub last_active: HashMap<String, u64>,
     /// PR details keyed by branch name.
     pub prs: HashMap<String, PrInfo>,
     /// Current git branch for each project, keyed by project name.
     pub project_branches: HashMap<String, String>,
-    /// Live "Run" sessions, keyed by tmux name (`cmrun-*`); value is true while
+    /// Live "Run" terminals, keyed by name (`cmrun-*`); value is true while
     /// the command is still executing, false once it dropped to a shell.
     pub run_sessions: HashMap<String, bool>,
 }
@@ -48,7 +48,7 @@ pub struct Worker {
     pub hints: Arc<Mutex<WorkerHints>>,
     /// Single-slot handoff: the worker overwrites this each tick; the UI takes
     /// it. Using a mutex instead of an unbounded channel prevents updates from
-    /// piling up while the main thread is blocked (e.g. during `tmux attach`).
+    /// piling up while the main thread is blocked (e.g. during `hc attach`).
     pub latest: Arc<Mutex<Option<WorkerUpdate>>>,
 }
 
@@ -81,31 +81,22 @@ fn worker_loop(hints: Arc<Mutex<WorkerHints>>, latest: Arc<Mutex<Option<WorkerUp
     let mut tick: u64 = 0;
 
     loop {
-        let sessions = tmux::list_sessions().unwrap_or_default();
+        let probed = session::probe_sessions();
+        let sessions: Vec<LiveSession> = probed.iter().map(|(s, _)| s.clone()).collect();
+        content_hashes.retain(|k, _| sessions.iter().any(|s| s.name == *k));
+        stable_ticks.retain(|k, _| sessions.iter().any(|s| s.name == *k));
 
         // Compute statuses
         let mut statuses = HashMap::new();
         const STABLE_THRESHOLD: u32 = 3;
 
-        for session in &sessions {
-            let probe = tmux::probe_session(&session.name);
-
+        for (session, probe) in &probed {
             let status = match probe {
-                None => {
-                    content_hashes.remove(&session.name);
-                    stable_ticks.remove(&session.name);
-                    SessionStatus::Finished
-                }
-                Some(probe) if !probe.agent_alive => {
-                    content_hashes.remove(&session.name);
-                    stable_ticks.remove(&session.name);
-                    SessionStatus::Finished
-                }
-                Some(SessionProbe {
+                SessionProbe {
                     reported: Some(status),
                     ..
-                }) => status,
-                Some(probe) => {
+                } => *status,
+                probe => {
                     let prev_hash = content_hashes.get(&session.name).copied();
                     let content_changed = prev_hash.is_some_and(|h| h != probe.content_hash);
 
@@ -145,7 +136,7 @@ fn worker_loop(hints: Arc<Mutex<WorkerHints>>, latest: Arc<Mutex<Option<WorkerUp
             task_diff_stats: task_diff_stats.clone(),
             prs: prs.clone(),
             project_branches: project_branches.clone(),
-            run_sessions: tmux::list_run_sessions(),
+            run_sessions: session::list_run_sessions(),
         });
 
         // Refresh diff stats and terminal counts less frequently (~every 2 seconds)
@@ -157,16 +148,16 @@ fn worker_loop(hints: Arc<Mutex<WorkerHints>>, latest: Arc<Mutex<Option<WorkerUp
             last_active.retain(|k, _| session_names.contains(k));
 
             for session in &sessions {
-                if let Some(stats) = tmux::get_diff_stats(&session.name) {
+                if let Some(stats) = session::get_diff_stats(&session.name) {
                     diff_stats.insert(session.name.clone(), stats);
                 }
-                if let Some(branch) = tmux::get_session_branch(&session.name) {
+                if let Some(branch) = session::get_session_branch(&session.name) {
                     session_branches.insert(session.name.clone(), branch);
                 }
                 session_agents
                     .entry(session.name.clone())
-                    .or_insert_with(|| tmux::session_agent(&session.name).id().to_string());
-                if let Some(at) = tmux::last_active(&session.name) {
+                    .or_insert_with(|| session::session_agent(&session.name).id().to_string());
+                if let Some(at) = session::last_active(&session.name) {
                     last_active.insert(session.name.clone(), at);
                 }
             }
@@ -183,7 +174,7 @@ fn worker_loop(hints: Arc<Mutex<WorkerHints>>, latest: Arc<Mutex<Option<WorkerUp
             task_diff_stats.retain(|k, _| tasks.iter().any(|t| t.branch == *k));
             for task in &tasks {
                 if let Some(stats) =
-                    tmux::get_branch_diff(&task.project_path, &task.branch, &task.base_branch)
+                    session::get_branch_diff(&task.project_path, &task.branch, &task.base_branch)
                 {
                     task_diff_stats.insert(task.branch.clone(), stats);
                 }
@@ -200,7 +191,7 @@ fn worker_loop(hints: Arc<Mutex<WorkerHints>>, latest: Arc<Mutex<Option<WorkerUp
                 if known.is_some() && !refresh {
                     continue;
                 }
-                if let Some(info) = tmux::get_pr_info(&task.project_path, &task.branch) {
+                if let Some(info) = session::get_pr_info(&task.project_path, &task.branch) {
                     if known.is_none_or(|p| p.url != info.url) {
                         // Write PR URL to file so hooks can read it without network calls
                         let pr_path = crate::config::pr_url_path(&task.project_name, &task.branch);
@@ -234,7 +225,7 @@ fn worker_loop(hints: Arc<Mutex<WorkerHints>>, latest: Arc<Mutex<Option<WorkerUp
             task_diff_stats: task_diff_stats.clone(),
             prs: prs.clone(),
             project_branches: project_branches.clone(),
-            run_sessions: tmux::list_run_sessions(),
+            run_sessions: session::list_run_sessions(),
         };
 
         *latest.lock().unwrap() = Some(update);

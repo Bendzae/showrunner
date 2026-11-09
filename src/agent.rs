@@ -1,6 +1,6 @@
 //! Agent harness profiles: which coding-agent CLI a session runs and the
 //! agent-specific bits of launching, resuming, and observing it. Everything
-//! else (tmux, worktrees, status polling) is agent-agnostic.
+//! else (terminals, worktrees, status polling) is agent-agnostic.
 
 use std::fmt;
 
@@ -53,13 +53,6 @@ impl AgentKind {
 
     /// All known agents, in picker order.
     pub const ALL: &[AgentKind] = &[AgentKind::Claude, AgentKind::Codex, AgentKind::Pi];
-
-    /// Process name to look for when checking whether the agent is still
-    /// alive in a pane (either as the pane process or one of its children —
-    /// codex installed via npm runs as a `node` wrapper with a `codex` child).
-    pub fn process_name(self) -> &'static str {
-        self.id()
-    }
 
     /// Markers for dialogs that need the user's attention (permission prompts
     /// and question selectors), matched against the bottom of the pane.

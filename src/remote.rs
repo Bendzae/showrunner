@@ -27,7 +27,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{self, Config, Project, Remote, Task};
-use crate::tmux::{DiffStats, PrInfo, SessionStatus, TmuxSession};
+use crate::session::{DiffStats, LiveSession, PrInfo, SessionStatus};
 
 /// Subcommands the peer may run here through the link.
 const LINK_ALLOWED: &[&str] = &["list", "ask", "send", "output", "task", "session"];
@@ -240,13 +240,17 @@ fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// Attach to a tmux session on the remote, on this terminal.
-pub fn attach(remote: &Remote, tmux_name: &str) -> Result<()> {
+/// Attach to a session on the remote, on this terminal.
+pub fn attach(remote: &Remote, cm_name: &str) -> Result<()> {
     let status = ssh_base(remote)
         .args([
             "-t",
             &remote.ssh,
-            &format!("tmux attach-session -t {}", shell_escape(tmux_name)),
+            &format!(
+                "{} attach {}",
+                shell_escape(&remote.bin),
+                shell_escape(cm_name)
+            ),
         ])
         .status()?;
     if !status.success() {
@@ -270,8 +274,8 @@ pub struct HostSnapshot {
     pub host: String,
     pub location: String,
     pub projects: Vec<Project>,
-    pub sessions: Vec<TmuxSession>,
-    /// Keyed by `TmuxSession::key()`.
+    pub sessions: Vec<LiveSession>,
+    /// Keyed by `LiveSession::key()`.
     pub statuses: HashMap<String, SessionStatus>,
     pub agents: HashMap<String, String>,
     pub last_active: HashMap<String, u64>,
@@ -318,7 +322,7 @@ fn snapshot_from_listing(
 
     let str_of = |v: &serde_json::Value, k: &str| v[k].as_str().unwrap_or_default().to_string();
     let add_session = |snapshot: &mut HostSnapshot, v: &serde_json::Value| {
-        let Some(mut session) = TmuxSession::from_tmux_name(&str_of(v, "tmux_name")) else {
+        let Some(mut session) = LiveSession::from_name(&str_of(v, "cm_name")) else {
             return;
         };
         session.host = Some(snapshot.host.clone());
@@ -402,9 +406,9 @@ impl HostPoller {
         let slot = latest.clone();
         thread::spawn(move || {
             // Hosts seen reachable on the previous round. A host that just
-            // (re)appeared may have rebooted with its sessions gone from
-            // tmux, and nobody opens a TUI there to bring them back: run its
-            // `restore` once before listing it.
+            // (re)appeared may have rebooted with its sessions gone, and nobody
+            // opens a TUI there to bring them back: run its `restore` once
+            // before listing it.
             let mut reachable: HashSet<String> = HashSet::new();
             loop {
                 let hosts = Config::load().map(|cfg| hosts(&cfg)).unwrap_or_default();
@@ -512,9 +516,8 @@ fn serve_link_connection(stream: TcpStream) -> Result<()> {
 
     let mut child = Command::new(std::env::current_exe()?)
         .args(&args)
-        // The peer's command is not "inside" whatever tmux session hosts us.
-        .env_remove("TMUX")
-        .env_remove("TMUX_PANE")
+        // The peer's command is not "inside" whatever session hosts us.
+        .env_remove("HC_TERMINAL_ID")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -867,13 +870,13 @@ mod tests {
                     "diff": { "added": 12, "removed": 3 },
                     "pr": { "url": "https://x/pr/7", "state": "open", "review": "approved", "checks": "passing" },
                     "sessions": [{
-                        "ref": "-App/Fix-auth/main", "tmux_name": "cm__App__Fix-auth__main",
+                        "ref": "-App/Fix-auth/main", "cm_name": "cm__App__Fix-auth__main",
                         "name": "main", "status": "waiting_input", "agent": "codex",
                         "diff": { "added": 1, "removed": 0 }, "branch": "fix-auth"
                     }]
                 }],
                 "adhoc_sessions": [{
-                    "ref": "-App/adhoc/scratch", "tmux_name": "cm__App__adhoc__scratch",
+                    "ref": "-App/adhoc/scratch", "cm_name": "cm__App__adhoc__scratch",
                     "name": "scratch", "status": "running", "agent": "claude"
                 }]
             }]
@@ -910,7 +913,7 @@ mod tests {
 
     #[test]
     fn pr_info_round_trips_through_json() {
-        use crate::tmux::{CiStatus, PrReview, PrState};
+        use crate::session::{CiStatus, PrReview, PrState};
         let pr = PrInfo {
             url: "https://x/pr/7".into(),
             state: PrState::Draft,

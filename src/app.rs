@@ -11,7 +11,7 @@ use anyhow::Result;
 use crate::agent::AgentKind;
 use crate::config::{self, Config, KeyBindings, Project, ReviewTool, Task};
 use crate::remote::{self, HostPoller, HostSnapshot, Link, Target};
-use crate::tmux::{self, DiffStats, PrInfo, SessionStatus, TmuxSession};
+use crate::session::{self, DiffStats, LiveSession, PrInfo, SessionStatus};
 use crate::worker::{TaskInfo, Worker};
 
 #[derive(Debug, Clone)]
@@ -28,7 +28,7 @@ pub enum ListItem {
         project_name: String,
         project_path: String,
         task: Task,
-        session: TmuxSession,
+        session: LiveSession,
     },
     AdhocGroup {
         project_name: String,
@@ -45,7 +45,7 @@ pub enum ListItem {
     AdhocSession {
         project_name: String,
         project_path: String,
-        session: TmuxSession,
+        session: LiveSession,
     },
 }
 
@@ -165,9 +165,9 @@ enum MoveTarget {
 /// state; `None` for sessions not running Claude.
 fn remote_control_menu_item(
     cm: &config::ContextMenuKeyBindings,
-    tmux_name: &str,
+    cm_name: &str,
 ) -> Option<ContextMenuItem> {
-    let record = config::load_sessions().remove(tmux_name)?;
+    let record = config::load_sessions().remove(cm_name)?;
     (record.agent_kind() == AgentKind::Claude).then_some(ContextMenuItem {
         key: cm.remote_control,
         label: if record.remote_control {
@@ -192,7 +192,7 @@ pub enum PickerEntry {
 }
 
 /// Where a "Run" action should execute: the owning project (whose `run_command`
-/// is read/saved), the working directory, and a label used to name the tmux run
+/// is read/saved), the working directory, and a label used to name the run
 /// session.
 #[derive(Debug, Clone)]
 pub struct RunContext {
@@ -201,7 +201,7 @@ pub struct RunContext {
     pub label: String,
 }
 
-/// Label identifying the run session for a list item (the basis of its tmux
+/// Label identifying the run session for a list item (the basis of its run
 /// run-session name). `None` for items that can't be run (e.g. adhoc groups).
 /// Single source of truth so the launcher and the UI indicator agree.
 pub fn run_label(item: &ListItem) -> Option<String> {
@@ -342,13 +342,13 @@ pub fn extract_difit_comments(stdout: &str) -> Option<String> {
 }
 
 /// A pending foreground hunk review: working dir, hunk CLI args, and the
-/// candidate sessions its comments forward to (`(tmux name, display name)`).
+/// candidate sessions its comments forward to (`(session name, display name)`).
 type HunkReview = (String, Vec<String>, Vec<(String, String)>);
 
 pub struct App {
     pub config: Config,
     pub keybindings: KeyBindings,
-    pub sessions: Vec<TmuxSession>,
+    pub sessions: Vec<LiveSession>,
     pub items: Vec<ListItem>,
     pub selected: usize,
     pub input_mode: InputMode,
@@ -357,9 +357,9 @@ pub struct App {
     pub status_message: Option<String>,
     pub should_quit: bool,
     pub should_attach: Option<String>,
-    /// Attach to a specific (session, window index) — used for terminals.
-    pub should_attach_window: Option<(String, usize)>,
-    /// Attach over ssh to `(host name, tmux session name)` on the remote.
+    /// Attach to a session's shell terminal (`t`).
+    pub should_attach_window: Option<String>,
+    /// Attach over ssh to `(host name, session name)` on the remote.
     pub should_attach_remote: Option<(String, String)>,
     /// Pending foreground hunk review: `(cwd, hunk args, candidate sessions)`.
     /// Set by the review action when the configured tool is `hunk`; the main loop
@@ -384,11 +384,11 @@ pub struct App {
     pub collapsed: HashSet<String>,
     pub session_statuses: HashMap<String, SessionStatus>,
     /// When each session's agent last wrote its conversation (Unix seconds),
-    /// keyed by `TmuxSession::key()`.
+    /// keyed by `LiveSession::key()`.
     pub last_active: HashMap<String, u64>,
     pub diff_stats: HashMap<String, DiffStats>,
     pub session_branches: HashMap<String, String>,
-    /// Agent harness id per session, keyed by tmux name (from the worker).
+    /// Agent harness id per session, keyed by session name (from the worker).
     pub session_agents: HashMap<String, String>,
     pub task_diff_stats: HashMap<String, DiffStats>,
     /// PR details keyed by branch name
@@ -408,7 +408,7 @@ pub struct App {
     pub review_sender: mpsc::Sender<PendingReview>,
     /// Review comments awaiting forwarding once a session is picked.
     pub pending_review_comments: Option<String>,
-    /// Candidate sessions shown in the picker as `(tmux name, display name)`.
+    /// Candidate sessions shown in the picker as `(session name, display name)`.
     pub review_candidates: Vec<(String, String)>,
     /// Selected index into `review_candidates`.
     pub review_selected: usize,
@@ -439,7 +439,7 @@ pub struct App {
     pub picker_selected: usize,
     /// Context awaiting a run command entered via the `RunCommand` prompt.
     pub pending_run: Option<RunContext>,
-    /// Live "Run" sessions keyed by tmux name; value true while the command is
+    /// Live "Run" terminals keyed by name; value true while the command is
     /// still executing. Populated by the background worker.
     pub run_sessions: HashMap<String, bool>,
     /// Index into `theme::THEMES` of the active color theme.
@@ -470,7 +470,7 @@ pub struct OpResult {
 /// same picker via [`App::open_review_session_picker`] from the main thread.
 pub struct PendingReview {
     pub comments: String,
-    /// Candidate sessions as `(tmux session name, display name)`.
+    /// Candidate sessions as `(session name, display name)`.
     pub candidates: Vec<(String, String)>,
 }
 
@@ -611,9 +611,9 @@ impl App {
     pub fn new() -> Result<Self> {
         let config = Config::load()?;
         let keybindings = KeyBindings::load();
-        // Recreate any saved sessions that are no longer in tmux (e.g. tmux died)
+        // Recreate any saved sessions that are no longer running (e.g. after a reboot)
         let restore_failures = crate::ops::restore_sessions(&config).failures;
-        let sessions = tmux::list_sessions().unwrap_or_default();
+        let sessions = session::list_sessions().unwrap_or_default();
         let (tx, rx) = mpsc::channel();
         let (review_tx, review_rx) = mpsc::channel();
         let link = config.remote.as_ref().and_then(|r| Link::start(r).ok());
@@ -762,7 +762,7 @@ impl App {
             }
             self.hosts = hosts;
         }
-        // Host entries are keyed by `<host>:<tmux name>` / `<host>:<branch>` /
+        // Host entries are keyed by `<host>:<session name>` / `<host>:<branch>` /
         // `<host>:<project>`, so they can share the maps with local ones.
         for host in &self.hosts {
             self.session_statuses
@@ -796,7 +796,7 @@ impl App {
     }
 
     /// Post a notification for each session that just started needing the
-    /// person, skipping sessions someone is attached to. Nothing on the first
+    /// person. Nothing on the first
     /// update, so sessions already waiting at startup stay quiet.
     fn notify_needs_you(&self, previous: &HashMap<String, SessionStatus>) {
         if !self.config.notifications.unwrap_or(true) || previous.is_empty() {
@@ -816,21 +816,20 @@ impl App {
         if newly_waiting.is_empty() {
             return;
         }
-        let attached = tmux::attached_sessions();
         let all_sessions = self
             .sessions
             .iter()
             .chain(self.hosts.iter().flat_map(|h| h.sessions.iter()));
         for session in all_sessions {
             let key = session.key();
-            if !newly_waiting.contains(&&key) || attached.contains(&key) {
+            if !newly_waiting.contains(&&key) {
                 continue;
             }
             let project = match &session.host {
                 Some(host) => format!("{host}:{}", session.project_name),
                 None => session.project_name.clone(),
             };
-            let place = if tmux::is_adhoc_marker(&session.task_name) {
+            let place = if session::is_adhoc_marker(&session.task_name) {
                 session.session_name.clone()
             } else {
                 format!(
@@ -843,21 +842,21 @@ impl App {
         }
     }
 
-    /// The task's name as configured, for a session whose tmux name carries
+    /// The task's name as configured, for a session whose name carries
     /// it sanitized.
-    fn task_display_name(&self, session: &TmuxSession) -> String {
+    fn task_display_name(&self, session: &LiveSession) -> String {
         self.config
             .projects
             .iter()
-            .filter(|p| tmux::sanitize(&p.name) == session.project_name)
+            .filter(|p| session::sanitize(&p.name) == session.project_name)
             .flat_map(|p| p.tasks.iter())
-            .find(|t| tmux::sanitize(&t.name) == session.task_name)
+            .find(|t| session::sanitize(&t.name) == session.task_name)
             .map_or_else(|| session.task_name.clone(), |t| t.name.clone())
     }
 
     /// The sessions living where the project at `project_path` lives: on a
     /// host for `<host>:` paths, else here.
-    pub fn sessions_at(&self, project_path: &str) -> &[TmuxSession] {
+    pub fn sessions_at(&self, project_path: &str) -> &[LiveSession] {
         match remote::host_of_path(project_path) {
             Some((host, _)) => self
                 .hosts
@@ -1013,8 +1012,8 @@ impl App {
                     Some("Review finished; no session to forward comments to".into());
             }
             1 => {
-                let (tmux_name, display) = req.candidates[0].clone();
-                self.forward_review_comments(&req.comments, &tmux_name, &display);
+                let (cm_name, display) = req.candidates[0].clone();
+                self.forward_review_comments(&req.comments, &cm_name, &display);
             }
             _ => {
                 self.pending_review_comments = Some(req.comments);
@@ -1032,8 +1031,8 @@ impl App {
         let target = self.review_candidates.get(self.review_selected).cloned();
         self.reset_review_picker();
         match (comments, target) {
-            (Some(comments), Some((tmux_name, display))) => {
-                self.forward_review_comments(&comments, &tmux_name, &display);
+            (Some(comments), Some((cm_name, display))) => {
+                self.forward_review_comments(&comments, &cm_name, &display);
             }
             _ => self.status_message = Some("No session to forward comments to".into()),
         }
@@ -1041,9 +1040,9 @@ impl App {
 
     /// Forward review comments to a session as a new prompt, reporting the
     /// outcome in the status bar.
-    fn forward_review_comments(&mut self, comments: &str, tmux_name: &str, display: &str) {
+    fn forward_review_comments(&mut self, comments: &str, cm_name: &str, display: &str) {
         self.status_message = Some(
-            match tmux::send_text(tmux_name, &review_prompt(comments), true) {
+            match session::send_text(cm_name, &review_prompt(comments), true) {
                 Ok(()) => format!("Forwarded review comments to {display}"),
                 Err(e) => format!("Failed to forward comments: {e}"),
             },
@@ -1205,7 +1204,7 @@ impl App {
             }
 
             // Adhoc group: only rendered when the project has at least one adhoc session.
-            let adhoc_sessions = tmux::adhoc_sessions_for_project(&project.name, &pool);
+            let adhoc_sessions = session::adhoc_sessions_for_project(&project.name, &pool);
             if !adhoc_sessions.is_empty() {
                 self.items.push(ListItem::AdhocGroup {
                     project_name: project.name.clone(),
@@ -1254,12 +1253,12 @@ impl App {
                     continue;
                 }
 
-                // Archived tasks have no live tmux sessions; skip session rendering.
+                // Archived tasks have no live sessions; skip session rendering.
                 if task.archived {
                     continue;
                 }
 
-                for session in tmux::sessions_for_task(&project.name, &task.name, &pool) {
+                for session in session::sessions_for_task(&project.name, &task.name, &pool) {
                     self.items.push(ListItem::Session {
                         project_name: project.name.clone(),
                         project_path: project.path.clone(),
@@ -1457,13 +1456,13 @@ impl App {
                 project_path,
                 task,
             }) if !task.archived => {
-                let main = tmux::sessions_for_task(
+                let main = session::sessions_for_task(
                     project_name,
                     &task.name,
                     self.sessions_at(project_path),
                 )
                 .into_iter()
-                .find(|s| tmux::is_main_session(&s.session_name));
+                .find(|s| session::is_main_session(&s.session_name));
                 match main {
                     Some(session) => self.attach_to(&session),
                     None => self.toggle_collapse(),
@@ -1474,7 +1473,7 @@ impl App {
         }
     }
 
-    fn attach_to(&mut self, session: &TmuxSession) {
+    fn attach_to(&mut self, session: &LiveSession) {
         match &session.host {
             Some(host) => match self.host_named(host) {
                 Some(remote::Host::Ssh(_)) => {
@@ -1583,7 +1582,7 @@ impl App {
                         action: ContextAction::RemoteControl,
                     },
                 ];
-                if !tmux::is_main_session(&session.session_name) {
+                if !session::is_main_session(&session.session_name) {
                     items.push(ContextMenuItem {
                         key: cm.delete,
                         label: "Delete",
@@ -1789,7 +1788,11 @@ impl App {
                     }
                     items.extend(remote_control_menu_item(
                         &cm,
-                        &tmux::build_tmux_name(project_name, &task.name, tmux::MAIN_SESSION),
+                        &session::build_session_name(
+                            project_name,
+                            &task.name,
+                            session::MAIN_SESSION,
+                        ),
                     ));
                     if remote_name.is_some() {
                         items.push(ContextMenuItem {
@@ -1816,7 +1819,7 @@ impl App {
             Some(ListItem::Session { session, .. }) => {
                 // The main session is on the task branch itself, so merging into
                 // it / rebasing onto it are no-ops, and it can't be deleted.
-                let is_main = tmux::is_main_session(&session.session_name);
+                let is_main = session::is_main_session(&session.session_name);
                 let mut items = vec![ContextMenuItem {
                     key: cm.review,
                     label: review_label,
@@ -1923,7 +1926,7 @@ impl App {
     }
 
     /// The selected session, or the main session of the selected task.
-    fn selected_session_or_main(&self) -> Option<TmuxSession> {
+    fn selected_session_or_main(&self) -> Option<LiveSession> {
         match self.selected_item() {
             Some(ListItem::Session { session, .. } | ListItem::AdhocSession { session, .. }) => {
                 Some(session.clone())
@@ -1932,9 +1935,11 @@ impl App {
                 project_name,
                 project_path,
                 task,
-            }) => tmux::sessions_for_task(project_name, &task.name, self.sessions_at(project_path))
-                .into_iter()
-                .find(|s| tmux::is_main_session(&s.session_name)),
+            }) => {
+                session::sessions_for_task(project_name, &task.name, self.sessions_at(project_path))
+                    .into_iter()
+                    .find(|s| session::is_main_session(&s.session_name))
+            }
             _ => None,
         }
     }
@@ -2044,7 +2049,7 @@ impl App {
             }
         };
 
-        let task_sessions = tmux::sessions_for_task(&project_name, &task_name, &self.sessions);
+        let task_sessions = session::sessions_for_task(&project_name, &task_name, &self.sessions);
         let live_names: Vec<String> = task_sessions.iter().map(|s| s.name.clone()).collect();
         let session_count = live_names.len();
 
@@ -2060,11 +2065,11 @@ impl App {
 
         self.start_op("Archiving task...", move || {
             for name in &live_names {
-                let _ = tmux::kill_session_only(name);
+                let _ = session::kill_session_only(name);
             }
             for record in config::load_sessions().values() {
                 if record.project_name == project_name && record.task_name == task_name {
-                    tmux::remove_record_worktree(record);
+                    session::remove_record_worktree(record);
                 }
             }
             OpResult {
@@ -2110,9 +2115,9 @@ impl App {
             let records = config::load_sessions();
             let mut recreated = 0;
             let mut failed = Vec::new();
-            for (tmux_name, record) in &records {
+            for (cm_name, record) in &records {
                 if record.project_name == project_name && record.task_name == task_name {
-                    match crate::ops::recreate_task_session(project.as_ref(), tmux_name, record) {
+                    match crate::ops::recreate_task_session(project.as_ref(), cm_name, record) {
                         Ok(true) => recreated += 1,
                         Ok(false) => {}
                         Err(e) => failed.push(format!("{}: {e}", record.session_name)),
@@ -2162,7 +2167,7 @@ impl App {
     /// review comments to the agent session on exit.
     pub fn start_review(&mut self) {
         // (cwd, difit args, hunk args, candidate sessions, description). Each
-        // candidate is `(tmux session name, display name)`; comments forward to it.
+        // candidate is `(session name, display name)`; comments forward to it.
         let (cwd, difit_args, hunk_args, candidates, description) =
             match self.selected_item().cloned() {
                 Some(ListItem::Task {
@@ -2174,11 +2179,11 @@ impl App {
                         .base_branch
                         .clone()
                         .unwrap_or_else(|| "main".to_string());
-                    let base_ref = tmux::resolve_base_ref(&project_path, &base);
+                    let base_ref = session::resolve_base_ref(&project_path, &base);
                     // All of the task's sessions are candidates: a lone one is
                     // forwarded to directly, several trigger the picker popup.
                     let candidates =
-                        tmux::sessions_for_task(&project_name, &task.name, &self.sessions)
+                        session::sessions_for_task(&project_name, &task.name, &self.sessions)
                             .into_iter()
                             .map(|s| (s.name, s.session_name))
                             .collect();
@@ -2245,8 +2250,8 @@ impl App {
                             0 => "Review finished; no session to forward comments to".into(),
                             // Exactly one candidate: forward straight away.
                             1 => {
-                                let (tmux_name, display) = &candidates[0];
-                                match tmux::send_text(tmux_name, &review_prompt(&comments), true) {
+                                let (cm_name, display) = &candidates[0];
+                                match session::send_text(cm_name, &review_prompt(&comments), true) {
                                     Ok(()) => format!("Forwarded review comments to {display}"),
                                     Err(e) => format!("Failed to forward comments: {e}"),
                                 }
@@ -2341,7 +2346,7 @@ impl App {
     }
 
     /// Resolve the "Run" context for the selected item: the owning project plus
-    /// the working directory and a label for the tmux run session. Sets a status
+    /// the working directory and a label for the run terminal. Sets a status
     /// message and returns `None` when the selection can't be run.
     fn resolve_run_context(&mut self) -> Option<RunContext> {
         let item = self.selected_item().cloned()?;
@@ -2358,7 +2363,7 @@ impl App {
             } => {
                 // Prefer a session worktree so the command runs against the
                 // task's code; fall back to the project dir when none exists.
-                let cwd = tmux::sessions_for_task(&project_name, &task.name, &self.sessions)
+                let cwd = session::sessions_for_task(&project_name, &task.name, &self.sessions)
                     .first()
                     .and_then(|s| s.worktree_path())
                     .map(|p| p.to_string_lossy().to_string())
@@ -2399,7 +2404,7 @@ impl App {
     pub fn run_state_for(&self, item: &ListItem) -> Option<bool> {
         let label = run_label(item)?;
         self.run_sessions
-            .get(&tmux::run_session_name(&label))
+            .get(&session::run_session_name(&label))
             .copied()
     }
 
@@ -2413,7 +2418,7 @@ impl App {
         };
         if self
             .run_sessions
-            .contains_key(&tmux::run_session_name(&ctx.label))
+            .contains_key(&session::run_session_name(&ctx.label))
         {
             self.open_run_menu();
         } else {
@@ -2468,7 +2473,7 @@ impl App {
         let Some(ctx) = self.resolve_run_context() else {
             return;
         };
-        let name = tmux::run_session_name(&ctx.label);
+        let name = session::run_session_name(&ctx.label);
         if self.run_sessions.contains_key(&name) {
             self.should_attach = Some(name);
         } else {
@@ -2489,8 +2494,8 @@ impl App {
         let Some(ctx) = self.resolve_run_context() else {
             return;
         };
-        let name = tmux::run_session_name(&ctx.label);
-        match tmux::kill_session_only(&name) {
+        let name = session::run_session_name(&ctx.label);
+        match session::kill_session_only(&name) {
             Ok(()) => {
                 self.run_sessions.remove(&name);
                 self.status_message = Some("Run session killed".into());
@@ -2525,12 +2530,12 @@ impl App {
         self.launch_run(ctx, command);
     }
 
-    /// Launch `command` in a dedicated tmux run session for `ctx` and attach.
+    /// Launch `command` in a dedicated run terminal for `ctx` and attach.
     fn launch_run(&mut self, ctx: RunContext, command: String) {
-        match tmux::run_command_session(&ctx.label, &ctx.cwd, &command) {
-            Ok(tmux_name) => {
+        match session::run_command_session(&ctx.label, &ctx.cwd, &command) {
+            Ok(cm_name) => {
                 self.status_message = Some(format!("Running: {command}"));
-                self.should_attach = Some(tmux_name);
+                self.should_attach = Some(cm_name);
             }
             Err(e) => self.status_message = Some(format!("Run failed: {e}")),
         }
@@ -2561,14 +2566,13 @@ impl App {
                 return;
             }
         };
-        if tmux::count_terminal_windows(&name) == 0 {
-            if let Err(e) = tmux::create_terminal_window(&name, &cwd) {
+        if session::count_terminal_windows(&name) == 0 {
+            if let Err(e) = session::create_terminal_window(&name, &cwd) {
                 self.status_message = Some(format!("Error: {e}"));
                 return;
             }
         }
-        // Window 0 is the agent; the first terminal is window 1.
-        self.should_attach_window = Some((name, 1));
+        self.should_attach_window = Some(name);
     }
 
     pub fn start_search(&mut self) {
@@ -2948,7 +2952,7 @@ impl App {
                 let issue = crate::ops::linear_issue(&reference)?;
                 let branch = Some(issue.branch_name)
                     .filter(|b| !b.is_empty())
-                    .unwrap_or_else(|| tmux::to_branch_name(&issue.title));
+                    .unwrap_or_else(|| session::to_branch_name(&issue.title));
                 let prompt = crate::ops::ticket_prompt(&issue.identifier);
                 if let Some((host, host_name)) = host {
                     let host =
@@ -2974,7 +2978,7 @@ impl App {
                 }
                 let cfg = Config::load()?;
                 let project = crate::ops::find_project(&cfg, &project_name)?;
-                let (branch, tmux_name) = crate::ops::create_task(
+                let (branch, cm_name) = crate::ops::create_task(
                     &cfg,
                     project,
                     &issue.title,
@@ -2986,7 +2990,7 @@ impl App {
                     agent,
                 )?;
                 Ok(format!(
-                    "Created task '{}' on branch {branch} and session {tmux_name}",
+                    "Created task '{}' on branch {branch} and session {cm_name}",
                     issue.title
                 ))
             })();
@@ -3011,13 +3015,13 @@ impl App {
             self.cancel_input();
             return;
         }
-        if tmux::is_adhoc_marker(&task_name) {
+        if session::is_adhoc_marker(&task_name) {
             self.status_message = Some("'adhoc' is reserved — pick a different task name".into());
             return;
         }
 
         self.pending_task_name = Some(task_name.clone());
-        self.input_buffer = tmux::to_branch_name(&task_name);
+        self.input_buffer = session::to_branch_name(&task_name);
         self.input_mode = InputMode::AddTaskBranch;
         self.status_message = Some("Branch name (existing or new): ".into());
     }
@@ -3133,10 +3137,10 @@ impl App {
             .unwrap_or_default();
 
         self.start_op("Creating task...", move || {
-            let branch_exists = tmux::branch_exists(&project_path, &branch);
+            let branch_exists = session::branch_exists(&project_path, &branch);
 
             if !branch_exists {
-                if let Err(e) = tmux::create_task_branch(&project_path, &branch, None) {
+                if let Err(e) = session::create_task_branch(&project_path, &branch, None) {
                     return OpResult {
                         message: format!("Error: {e}"),
                         rebuild: false,
@@ -3165,9 +3169,9 @@ impl App {
                 };
             }
 
-            let session_name = tmux::MAIN_SESSION.to_string();
+            let session_name = session::MAIN_SESSION.to_string();
 
-            match tmux::create_session(
+            match session::create_session(
                 &project_name,
                 &project_path,
                 &task_name,
@@ -3180,9 +3184,9 @@ impl App {
                 &startup_skills,
                 agent,
             ) {
-                Ok(tmux_name) => {
+                Ok(cm_name) => {
                     config::add_session_record(
-                        &tmux_name,
+                        &cm_name,
                         config::SessionRecord {
                             project_name: project_name.clone(),
                             project_path: project_path.clone(),
@@ -3193,7 +3197,7 @@ impl App {
                             archived: false,
                             agent: agent.id().to_string(),
                             remote_control: false,
-                            claude_session_id: tmux::claude_session_id(&tmux_name),
+                            claude_session_id: session::claude_session_id(&cm_name),
                         },
                     );
                     let task_msg = if branch_exists {
@@ -3202,7 +3206,7 @@ impl App {
                         format!("task '{task_name}' on branch {branch}")
                     };
                     OpResult {
-                        message: format!("Created {task_msg} and session {tmux_name}"),
+                        message: format!("Created {task_msg} and session {cm_name}"),
                         rebuild: true,
                         reload_config: true,
                     }
@@ -3241,13 +3245,13 @@ impl App {
             }
         };
 
-        let tmux_name_to_create = format!(
+        let name_to_create = format!(
             "cm__{}__{}__{}",
-            tmux::sanitize(&project_name),
-            tmux::ADHOC_MARKER,
-            tmux::sanitize(&name),
+            session::sanitize(&project_name),
+            session::ADHOC_MARKER,
+            session::sanitize(&name),
         );
-        if self.sessions.iter().any(|s| s.name == tmux_name_to_create) {
+        if self.sessions.iter().any(|s| s.name == name_to_create) {
             self.status_message = Some(format!("Adhoc session '{name}' already exists"));
             return;
         }
@@ -3265,31 +3269,31 @@ impl App {
 
         self.start_op(
             "Creating adhoc session...",
-            move || match tmux::create_adhoc_session(
+            move || match session::create_adhoc_session(
                 &proj_name_for_op,
                 &proj_path_for_op,
                 &session_name,
                 &startup_skills,
                 agent,
             ) {
-                Ok(tmux_name) => {
+                Ok(cm_name) => {
                     config::add_session_record(
-                        &tmux_name,
+                        &cm_name,
                         config::SessionRecord {
                             project_name: proj_name_for_op.clone(),
                             project_path: proj_path_for_op.clone(),
-                            task_name: tmux::ADHOC_MARKER.to_string(),
+                            task_name: session::ADHOC_MARKER.to_string(),
                             task_branch: String::new(),
                             session_name: session_name.clone(),
                             use_worktree: false,
                             archived: false,
                             agent: agent.id().to_string(),
                             remote_control: false,
-                            claude_session_id: tmux::claude_session_id(&tmux_name),
+                            claude_session_id: session::claude_session_id(&cm_name),
                         },
                     );
                     OpResult {
-                        message: format!("Created adhoc session {tmux_name}"),
+                        message: format!("Created adhoc session {cm_name}"),
                         rebuild: true,
                         reload_config: false,
                     }
@@ -3319,7 +3323,7 @@ impl App {
                 return;
             }
             self.input_mode = InputMode::AddSessionName;
-            let next = tmux::next_session_number(&project_name, &task_name, &self.sessions);
+            let next = session::next_session_number(&project_name, &task_name, &self.sessions);
             self.status_message = Some(format!(
                 "Session name (default: {next}){}:",
                 if use_worktree { " [worktree]" } else { "" }
@@ -3339,16 +3343,16 @@ impl App {
         };
 
         let session_name = if self.input_buffer.trim().is_empty() {
-            tmux::next_session_number(&project_name, &task.name, &self.sessions).to_string()
+            session::next_session_number(&project_name, &task.name, &self.sessions).to_string()
         } else {
             self.input_buffer.trim().to_string()
         };
 
-        if tmux::is_main_session(&session_name) {
+        if session::is_main_session(&session_name) {
             self.cancel_input();
             self.status_message = Some(format!(
                 "'{}' is reserved for the task's own session",
-                tmux::MAIN_SESSION
+                session::MAIN_SESSION
             ));
             return;
         }
@@ -3434,8 +3438,9 @@ impl App {
             .unwrap_or_default();
         let startup_skills = self.config.startup_skills.clone();
 
-        self.start_op("Creating session...", move || {
-            match tmux::create_session(
+        self.start_op(
+            "Creating session...",
+            move || match session::create_session(
                 &project_name,
                 &project_path,
                 &task_name,
@@ -3448,9 +3453,9 @@ impl App {
                 &startup_skills,
                 agent,
             ) {
-                Ok(tmux_name) => {
+                Ok(cm_name) => {
                     config::add_session_record(
-                        &tmux_name,
+                        &cm_name,
                         config::SessionRecord {
                             project_name: project_name.clone(),
                             project_path: project_path.clone(),
@@ -3461,11 +3466,11 @@ impl App {
                             archived: false,
                             agent: agent.id().to_string(),
                             remote_control: false,
-                            claude_session_id: tmux::claude_session_id(&tmux_name),
+                            claude_session_id: session::claude_session_id(&cm_name),
                         },
                     );
                     OpResult {
-                        message: format!("Created session {tmux_name}"),
+                        message: format!("Created session {cm_name}"),
                         rebuild: true,
                         reload_config: false,
                     }
@@ -3475,8 +3480,8 @@ impl App {
                     rebuild: false,
                     reload_config: false,
                 },
-            }
-        });
+            },
+        );
     }
 
     pub fn start_delete(&mut self) {
@@ -3494,7 +3499,7 @@ impl App {
                 let session_count = self
                     .sessions
                     .iter()
-                    .filter(|s| s.project_name == tmux::sanitize(&project.name))
+                    .filter(|s| s.project_name == session::sanitize(&project.name))
                     .count();
                 let task_count = project.tasks.len();
                 self.input_mode = InputMode::ConfirmDelete;
@@ -3508,7 +3513,7 @@ impl App {
                 }
             }
             Some(ListItem::Session { session, .. }) => {
-                if tmux::is_main_session(&session.session_name) {
+                if session::is_main_session(&session.session_name) {
                     self.status_message = Some(
                         "The main session can't be deleted — delete or archive the task instead"
                             .into(),
@@ -3527,7 +3532,7 @@ impl App {
                 project_path,
                 task,
             }) => {
-                let active = tmux::sessions_for_task(
+                let active = session::sessions_for_task(
                     project_name,
                     &task.name,
                     self.sessions_at(project_path),
@@ -3632,7 +3637,7 @@ impl App {
                 self.start_op("Deleting project...", move || {
                     let mut total_sessions = 0;
                     for task in &tasks {
-                        let msg = tmux::delete_task(
+                        let msg = session::delete_task(
                             &project_name,
                             &project_path,
                             &task.name,
@@ -3642,12 +3647,13 @@ impl App {
                         // Count sessions from message
                         if msg.contains("session(s)") {
                             total_sessions +=
-                                tmux::sessions_for_task(&project_name, &task.name, &sessions).len();
+                                session::sessions_for_task(&project_name, &task.name, &sessions)
+                                    .len();
                         }
                     }
                     let _ = total_sessions;
                     // Clean up leftover worktree and task config directories
-                    tmux::cleanup_project_dirs(&project_name);
+                    session::cleanup_project_dirs(&project_name);
                     config::remove_project_session_records(&project_name);
                     OpResult {
                         message: format!("Deleted project '{}'", project_name),
@@ -3671,20 +3677,23 @@ impl App {
                         .remove(&name)
                         .filter(|r| r.use_worktree)
                         .map(|r| {
-                            let wt =
-                                tmux::worktree_dir(&r.project_name, &r.task_name, &r.session_name);
-                            tmux::SessionCleanupInfo {
+                            let wt = session::worktree_dir(
+                                &r.project_name,
+                                &r.task_name,
+                                &r.session_name,
+                            );
+                            session::SessionCleanupInfo {
                                 project_path: r.project_path,
                                 worktree_path: wt.to_string_lossy().to_string(),
                                 branch_name: Some(format!(
                                     "{}-{}",
-                                    tmux::sanitize(&r.task_branch),
-                                    tmux::sanitize(&r.session_name),
+                                    session::sanitize(&r.task_branch),
+                                    session::sanitize(&r.session_name),
                                 )),
                                 task_branch: Some(r.task_branch),
                             }
                         });
-                    match tmux::kill_session_with_fallback(&name, fallback) {
+                    match session::kill_session_with_fallback(&name, fallback) {
                         Ok(()) => {
                             config::remove_session_record(&name);
                             OpResult {
@@ -3707,7 +3716,7 @@ impl App {
                 let display_name = session.session_name.clone();
                 self.input_mode = InputMode::Normal;
                 self.start_op("Deleting adhoc session...", move || {
-                    match tmux::kill_session_with_fallback(&name, None) {
+                    match session::kill_session_with_fallback(&name, None) {
                         Ok(()) => {
                             config::remove_session_record(&name);
                             OpResult {
@@ -3738,7 +3747,7 @@ impl App {
                 self.input_mode = InputMode::Normal;
                 self.start_op("Deleting task...", move || {
                     let msg =
-                        tmux::delete_task(&pname, &ppath, &task_name, &task_branch, &sessions);
+                        session::delete_task(&pname, &ppath, &task_name, &task_branch, &sessions);
                     config::remove_task_session_records(&pname, &task_name);
                     OpResult {
                         message: msg,
@@ -3780,10 +3789,10 @@ impl App {
         };
 
         // Check if worktree has uncommitted changes
-        if tmux::worktree_is_dirty(&wt_path) {
+        if session::worktree_is_dirty(&wt_path) {
             self.input_mode = InputMode::MergeCommitMessage;
             self.input_buffer.clear();
-            let default_msg = tmux::next_commit_message(&wt_path, &session.session_name);
+            let default_msg = session::next_commit_message(&wt_path, &session.session_name);
             self.status_message = Some(format!("Commit message (default: {default_msg}): "));
         } else {
             self.do_merge(project_path, task.branch, session.session_name, wt_path);
@@ -3813,7 +3822,7 @@ impl App {
         };
 
         let msg = if self.input_buffer.trim().is_empty() {
-            tmux::next_commit_message(&wt_path, &session.session_name)
+            session::next_commit_message(&wt_path, &session.session_name)
         } else {
             self.input_buffer.trim().to_string()
         };
@@ -3824,14 +3833,14 @@ impl App {
         self.input_mode = InputMode::Normal;
 
         self.start_op("Merging...", move || {
-            if let Err(e) = tmux::commit_all(&wt_path, &msg) {
+            if let Err(e) = session::commit_all(&wt_path, &msg) {
                 return OpResult {
                     message: format!("Error committing: {e}"),
                     rebuild: false,
                     reload_config: false,
                 };
             }
-            match tmux::merge_session_to_task(
+            match session::merge_session_to_task(
                 &project_path,
                 &task_branch,
                 &session_display,
@@ -3859,8 +3868,12 @@ impl App {
         wt_path: String,
     ) {
         self.start_op("Merging...", move || {
-            match tmux::merge_session_to_task(&project_path, &task_branch, &session_name, &wt_path)
-            {
+            match session::merge_session_to_task(
+                &project_path,
+                &task_branch,
+                &session_name,
+                &wt_path,
+            ) {
                 Ok(msg) => OpResult {
                     message: msg,
                     rebuild: false,
@@ -3884,7 +3897,8 @@ impl App {
                 let base_branch = task.base_branch().to_string();
                 self.start_op(
                     "Updating task branch...",
-                    move || match tmux::update_task_branch(&project_path, &branch, &base_branch) {
+                    move || match session::update_task_branch(&project_path, &branch, &base_branch)
+                    {
                         Ok(msg) => OpResult {
                             message: msg,
                             rebuild: false,
@@ -3914,7 +3928,7 @@ impl App {
                 let task_branch = task.branch.clone();
                 self.start_op(
                     "Updating session...",
-                    move || match tmux::rebase_session_on_task(
+                    move || match session::rebase_session_on_task(
                         &project_path,
                         &task_branch,
                         &wt_path,
@@ -3951,7 +3965,7 @@ impl App {
 
         let branch = task.branch.clone();
         self.start_op("Pushing...", move || {
-            match tmux::push_branch(&project_path, &branch) {
+            match session::push_branch(&project_path, &branch) {
                 Ok(msg) => OpResult {
                     message: msg,
                     rebuild: false,
@@ -3975,7 +3989,7 @@ impl App {
                 return;
             }
         };
-        let branches = tmux::list_branches(&project_path);
+        let branches = session::list_branches(&project_path);
         if branches.is_empty() {
             self.status_message = Some("No branches found in this project".into());
             return;
@@ -4090,7 +4104,7 @@ impl App {
             }
         };
         self.start_op(&format!("Fetching all branches for {name}…"), move || {
-            let message = match tmux::fetch_pull_all(&path) {
+            let message = match session::fetch_pull_all(&path) {
                 Ok(msg) => msg,
                 Err(e) => format!("{e}"),
             };
@@ -4194,7 +4208,7 @@ impl App {
 
         self.start_op("Creating PR...", move || {
             // Push branch first
-            if let Err(e) = tmux::push_branch(&project_path, &branch) {
+            if let Err(e) = session::push_branch(&project_path, &branch) {
                 return OpResult {
                     message: format!("Error pushing: {e}"),
                     rebuild: false,

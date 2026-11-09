@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent::AgentKind;
 use crate::config::{self, Config, Project, SessionRecord};
-use crate::tmux;
+use crate::session;
 
 /// The agent new sessions run: an explicit `--agent` value wins, else the
 /// config's `default_agent`, else Claude.
@@ -30,7 +30,7 @@ pub fn create_task_session(
     prompt: Option<&str>,
     agent: AgentKind,
 ) -> Result<String> {
-    let tmux_name = tmux::create_session(
+    let cm_name = session::create_session(
         &project.name,
         &project.path,
         task_name,
@@ -45,7 +45,7 @@ pub fn create_task_session(
     )?;
 
     config::add_session_record(
-        &tmux_name,
+        &cm_name,
         config::SessionRecord {
             project_name: project.name.clone(),
             project_path: project.path.clone(),
@@ -56,18 +56,18 @@ pub fn create_task_session(
             archived: false,
             agent: agent.id().to_string(),
             remote_control: false,
-            claude_session_id: tmux::claude_session_id(&tmux_name),
+            claude_session_id: session::claude_session_id(&cm_name),
         },
     );
 
-    Ok(tmux_name)
+    Ok(cm_name)
 }
 
 /// Create a task (branch + config entry) and its main session.
 /// `branch` defaults to a branch name derived from the task name.
 /// `base` sets the task's base branch (for stacking); a newly created task
 /// branch starts from it instead of main.
-/// Returns the task's branch and the main session's tmux name.
+/// Returns the task's branch and the main session's name.
 pub fn create_task(
     cfg: &Config,
     project: &Project,
@@ -83,7 +83,7 @@ pub fn create_task(
     if task_name.is_empty() {
         bail!("task name is required");
     }
-    if tmux::is_adhoc_marker(task_name) {
+    if session::is_adhoc_marker(task_name) {
         bail!("'adhoc' is a reserved task name");
     }
     if project.tasks.iter().any(|t| t.name == task_name) {
@@ -97,7 +97,7 @@ pub fn create_task(
         .map(str::trim)
         .filter(|b| !b.is_empty())
         .map(str::to_string)
-        .unwrap_or_else(|| tmux::to_branch_name(task_name));
+        .unwrap_or_else(|| session::to_branch_name(task_name));
     if branch.is_empty() {
         bail!("task name produces an empty branch name");
     }
@@ -110,7 +110,7 @@ pub fn create_task(
         if base == branch {
             bail!("base branch can't be the task branch itself");
         }
-        if !tmux::branch_exists(&project.path, base) {
+        if !session::branch_exists(&project.path, base) {
             bail!(
                 "base branch '{base}' does not exist in {} (create it first, or check the name)",
                 project.path
@@ -118,8 +118,8 @@ pub fn create_task(
         }
     }
 
-    if !tmux::branch_exists(&project.path, &branch) {
-        tmux::create_task_branch(&project.path, &branch, base)?;
+    if !session::branch_exists(&project.path, &branch) {
+        session::create_task_branch(&project.path, &branch, base)?;
     }
 
     let (project_name, task, branch_for_config) =
@@ -133,18 +133,18 @@ pub fn create_task(
         c.set_task_linear(&project_name, &task, linear);
     })?;
 
-    let tmux_name = create_task_session(
+    let cm_name = create_task_session(
         cfg,
         project,
         task_name,
         &branch,
-        tmux::MAIN_SESSION.to_string(),
+        session::MAIN_SESSION.to_string(),
         true,
         prompt,
         agent,
     )?;
 
-    Ok((branch, tmux_name))
+    Ok((branch, cm_name))
 }
 
 /// Create an additional session on an existing task, numbered like the TUI does.
@@ -157,8 +157,9 @@ pub fn create_session(
     prompt: Option<&str>,
     agent: AgentKind,
 ) -> Result<String> {
-    let sessions = tmux::list_sessions()?;
-    let session_name = tmux::next_session_number(&project.name, task_name, &sessions).to_string();
+    let sessions = session::list_sessions()?;
+    let session_name =
+        session::next_session_number(&project.name, task_name, &sessions).to_string();
     create_task_session(
         cfg,
         project,
@@ -180,8 +181,8 @@ pub fn delete_task(project: &Project, task_name: &str) -> Result<()> {
         .find(|t| t.name == task_name)
         .ok_or_else(|| anyhow::anyhow!("task '{task_name}' not found"))?;
 
-    let sessions = tmux::list_sessions().unwrap_or_default();
-    tmux::delete_task(
+    let sessions = session::list_sessions().unwrap_or_default();
+    session::delete_task(
         &project.name,
         &project.path,
         &task.name,
@@ -198,36 +199,36 @@ pub fn delete_task(project: &Project, task_name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Whether a tmux session name belongs to a task's main session.
-pub fn is_main_session_name(tmux_name: &str) -> bool {
-    tmux_name.ends_with(&format!("__{}", tmux::MAIN_SESSION))
+/// Whether a session name belongs to a task's main session.
+pub fn is_main_session_name(cm_name: &str) -> bool {
+    cm_name.ends_with(&format!("__{}", session::MAIN_SESSION))
 }
 
 /// Kill a session, removing its worktree and per-session branch.
 /// Main sessions are owned by their task — delete the task instead.
-pub fn kill_session(tmux_name: &str) -> Result<()> {
-    if is_main_session_name(tmux_name) {
+pub fn kill_session(cm_name: &str) -> Result<()> {
+    if is_main_session_name(cm_name) {
         bail!("the main session can't be killed — delete the task instead");
     }
 
     let fallback = config::load_sessions()
-        .get(tmux_name)
+        .get(cm_name)
         .filter(|r| r.use_worktree)
-        .map(|r| tmux::SessionCleanupInfo {
+        .map(|r| session::SessionCleanupInfo {
             project_path: r.project_path.clone(),
-            worktree_path: tmux::worktree_dir(&r.project_name, &r.task_name, &r.session_name)
+            worktree_path: session::worktree_dir(&r.project_name, &r.task_name, &r.session_name)
                 .to_string_lossy()
                 .to_string(),
             branch_name: Some(format!(
                 "{}-{}",
-                tmux::sanitize(&r.task_branch),
-                tmux::sanitize(&r.session_name)
+                session::sanitize(&r.task_branch),
+                session::sanitize(&r.session_name)
             )),
             task_branch: Some(r.task_branch.clone()),
         });
 
-    tmux::kill_session_with_fallback(tmux_name, fallback)?;
-    config::remove_session_record(tmux_name);
+    session::kill_session_with_fallback(cm_name, fallback)?;
+    config::remove_session_record(cm_name);
     Ok(())
 }
 
@@ -255,31 +256,31 @@ pub struct SessionExport {
 
 /// Commit whatever the session's worktree holds and push its branch, so the
 /// session can be recreated from origin elsewhere.
-pub fn export_session(cfg: &Config, tmux_name: &str) -> Result<SessionExport> {
+pub fn export_session(cfg: &Config, cm_name: &str) -> Result<SessionExport> {
     let record = config::load_sessions()
-        .remove(tmux_name)
-        .ok_or_else(|| anyhow::anyhow!("no session record for {tmux_name}"))?;
+        .remove(cm_name)
+        .ok_or_else(|| anyhow::anyhow!("no session record for {cm_name}"))?;
     if !record.use_worktree {
         bail!("sessions without a worktree can't be moved");
     }
-    let worktree = tmux::worktree_dir(
+    let worktree = session::worktree_dir(
         &record.project_name,
         &record.task_name,
         &record.session_name,
     )
     .to_string_lossy()
     .to_string();
-    let branch = tmux::current_branch(&worktree)
+    let branch = session::current_branch(&worktree)
         .ok_or_else(|| anyhow::anyhow!("could not read the branch of {worktree}"))?;
 
-    if tmux::worktree_is_dirty(&worktree) {
+    if session::worktree_is_dirty(&worktree) {
         let message = format!(
             "Handoff: {}",
-            tmux::next_commit_message(&worktree, &record.session_name)
+            session::next_commit_message(&worktree, &record.session_name)
         );
-        tmux::commit_all(&worktree, &message)?;
+        session::commit_all(&worktree, &message)?;
     }
-    tmux::push_branch(&record.project_path, &branch)?;
+    session::push_branch(&record.project_path, &branch)?;
 
     let task = cfg.find_task(&record.project_name, &record.task_name);
     Ok(SessionExport {
@@ -299,10 +300,10 @@ pub fn export_session(cfg: &Config, tmux_name: &str) -> Result<SessionExport> {
 pub fn import_session(cfg: &Config, export: &SessionExport, prompt: &str) -> Result<String> {
     let project = find_project(cfg, &export.project_name)?;
     let agent = crate::agent::parse_agent_id(&export.agent)?;
-    let sessions = tmux::list_sessions().unwrap_or_default();
-    if !tmux::sessions_for_task(&project.name, &export.task_name, &sessions)
+    let sessions = session::list_sessions().unwrap_or_default();
+    if !session::sessions_for_task(&project.name, &export.task_name, &sessions)
         .iter()
-        .all(|s| s.session_name != tmux::sanitize(&export.session_name))
+        .all(|s| s.session_name != session::sanitize(&export.session_name))
     {
         bail!(
             "session {}/{}/{} already exists here",
@@ -326,7 +327,7 @@ pub fn import_session(cfg: &Config, export: &SessionExport, prompt: &str) -> Res
         })?;
     }
 
-    let tmux_name = tmux::create_session_with(
+    let cm_name = session::create_session_with(
         &project.name,
         &project.path,
         &export.task_name,
@@ -338,10 +339,10 @@ pub fn import_session(cfg: &Config, export: &SessionExport, prompt: &str) -> Res
         Some(prompt),
         &cfg.startup_skills,
         agent,
-        tmux::Checkout::PushedBranch,
+        session::Checkout::PushedBranch,
     )?;
     config::add_session_record(
-        &tmux_name,
+        &cm_name,
         config::SessionRecord {
             project_name: project.name.clone(),
             project_path: project.path.clone(),
@@ -352,10 +353,10 @@ pub fn import_session(cfg: &Config, export: &SessionExport, prompt: &str) -> Res
             archived: false,
             agent: agent.id().to_string(),
             remote_control: false,
-            claude_session_id: tmux::claude_session_id(&tmux_name),
+            claude_session_id: session::claude_session_id(&cm_name),
         },
     );
-    Ok(tmux_name)
+    Ok(cm_name)
 }
 
 /// Drop a session that now lives on another machine: kill it and remove its
@@ -363,12 +364,12 @@ pub fn import_session(cfg: &Config, export: &SessionExport, prompt: &str) -> Res
 /// fast-forwards it).
 ///
 /// `from_inside`: the caller runs in that very session (an agent moving
-/// itself) — the record and worktree go first, the tmux kill last.
-pub fn release_session(tmux_name: &str, from_inside: bool) -> Result<()> {
+/// itself) — the record and worktree go first, the kill last.
+pub fn release_session(cm_name: &str, from_inside: bool) -> Result<()> {
     let record = config::load_sessions()
-        .remove(tmux_name)
-        .ok_or_else(|| anyhow::anyhow!("no session record for {tmux_name}"))?;
-    let worktree = tmux::worktree_dir(
+        .remove(cm_name)
+        .ok_or_else(|| anyhow::anyhow!("no session record for {cm_name}"))?;
+    let worktree = session::worktree_dir(
         &record.project_name,
         &record.task_name,
         &record.session_name,
@@ -376,11 +377,11 @@ pub fn release_session(tmux_name: &str, from_inside: bool) -> Result<()> {
     .to_string_lossy()
     .to_string();
     if from_inside {
-        config::remove_session_record(tmux_name);
+        config::remove_session_record(cm_name);
     }
-    tmux::remove_session_keep_branch(tmux_name, &record.project_path, &worktree, from_inside);
+    session::remove_session_keep_branch(cm_name, &record.project_path, &worktree, from_inside);
     if !from_inside {
-        config::remove_session_record(tmux_name);
+        config::remove_session_record(cm_name);
     }
     Ok(())
 }
@@ -393,9 +394,9 @@ pub struct RestoreReport {
     pub failures: Vec<String>,
 }
 
-/// Recreate saved sessions that are no longer in tmux (tmux died, the machine
+/// Recreate saved sessions that are no longer running (the machine
 /// rebooted). Whether to recreate or prune depends on the task still existing
-/// in the config — not on tmux liveness — so sessions come back after a
+/// in the config — not on liveness — so sessions come back after a
 /// restart, while those of deleted tasks are reaped instead of resurrected.
 pub fn restore_sessions(cfg: &Config) -> RestoreReport {
     let mut report = RestoreReport::default();
@@ -403,11 +404,11 @@ pub fn restore_sessions(cfg: &Config) -> RestoreReport {
     if saved.is_empty() {
         return report;
     }
-    let live: Vec<tmux::TmuxSession> = tmux::list_sessions().unwrap_or_default();
+    let live: Vec<session::LiveSession> = session::list_sessions().unwrap_or_default();
     let live_names: HashSet<&str> = live.iter().map(|s| s.name.as_str()).collect();
 
-    for (tmux_name, record) in &saved {
-        if record.archived || live_names.contains(tmux_name.as_str()) {
+    for (cm_name, record) in &saved {
+        if record.archived || live_names.contains(cm_name.as_str()) {
             continue;
         }
         let reference = format!(
@@ -415,13 +416,13 @@ pub fn restore_sessions(cfg: &Config) -> RestoreReport {
             record.project_name, record.task_name, record.session_name
         );
 
-        if tmux::is_adhoc_marker(&record.task_name) {
+        if session::is_adhoc_marker(&record.task_name) {
             // Adhoc sessions are project-scoped: recreate while the project
             // exists, otherwise prune.
             if !cfg.project_exists(&record.project_path) {
-                config::remove_session_record(tmux_name);
+                config::remove_session_record(cm_name);
             } else {
-                match tmux::recreate_adhoc_session(tmux_name, record) {
+                match session::recreate_adhoc_session(cm_name, record) {
                     Ok(_) => report.restored.push(reference),
                     Err(e) => report.failures.push(format!("{reference}: {e}")),
                 }
@@ -434,7 +435,7 @@ pub fn restore_sessions(cfg: &Config) -> RestoreReport {
         match cfg.find_task_by_branch(&record.project_path, &record.task_branch) {
             Some(_) => {
                 let project = cfg.projects.iter().find(|p| p.path == record.project_path);
-                match recreate_task_session(project, tmux_name, record) {
+                match recreate_task_session(project, cm_name, record) {
                     Ok(true) => report.restored.push(reference),
                     Ok(false) => {}
                     Err(e) => report.failures.push(format!("{reference}: {e}")),
@@ -443,8 +444,8 @@ pub fn restore_sessions(cfg: &Config) -> RestoreReport {
             None => {
                 // The task is gone from the config: reap the orphan (worktree,
                 // cached context, record); the git branch is kept.
-                tmux::cleanup_orphan_session(record);
-                config::remove_session_record(tmux_name);
+                session::cleanup_orphan_session(record);
+                config::remove_session_record(cm_name);
             }
         }
     }
@@ -457,20 +458,20 @@ pub fn restore_sessions(cfg: &Config) -> RestoreReport {
 /// branch is gone too the record is dropped and `Ok(false)` returned.
 pub fn recreate_task_session(
     project: Option<&Project>,
-    tmux_name: &str,
+    cm_name: &str,
     record: &SessionRecord,
 ) -> Result<bool> {
-    if tmux::record_worktree_missing(record) {
-        if !tmux::branch_exists(&record.project_path, &tmux::record_branch(record)) {
-            config::remove_session_record(tmux_name);
+    if session::record_worktree_missing(record) {
+        if !session::branch_exists(&record.project_path, &session::record_branch(record)) {
+            config::remove_session_record(cm_name);
             return Ok(false);
         }
         let (copy_patterns, setup_commands) = project
             .map(|p| (&p.copy_patterns[..], &p.setup_commands[..]))
             .unwrap_or_default();
-        tmux::restore_record_worktree(record, copy_patterns, setup_commands)?;
+        session::restore_record_worktree(record, copy_patterns, setup_commands)?;
     }
-    tmux::recreate_session(tmux_name, record)?;
+    session::recreate_session(cm_name, record)?;
     Ok(true)
 }
 
@@ -482,7 +483,7 @@ pub fn cached_pr_info(
     project_path: &str,
     branch: &str,
     max_age: std::time::Duration,
-) -> Option<tmux::PrInfo> {
+) -> Option<session::PrInfo> {
     let path = config::pr_cache_path(project_name, branch);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -495,10 +496,10 @@ pub fn cached_pr_info(
             .as_u64()
             .is_some_and(|t| now.saturating_sub(t) < max_age.as_secs())
     {
-        return tmux::PrInfo::from_json(&cached["pr"]);
+        return session::PrInfo::from_json(&cached["pr"]);
     }
 
-    let info = tmux::get_pr_info(project_path, branch);
+    let info = session::get_pr_info(project_path, branch);
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }

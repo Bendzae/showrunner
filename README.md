@@ -7,13 +7,13 @@
 
 A terminal UI (TUI) for managing multiple coding-agent sessions — Claude Code, Codex CLI and Pi today, more harnesses planned — organized by projects and tasks. Built with Rust using [ratatui](https://github.com/ratatui/ratatui).
 
-Showrunner uses tmux to run agent sessions in the background, letting you organize them into projects and tasks, monitor their status, review diffs, and attach/detach freely.
+Showrunner runs agent sessions in the background in [herdr-core](https://github.com/herdrdev/herdr-core) (`hc`) terminals, letting you organize them into projects and tasks, monitor their status, review diffs, and attach/detach freely.
 <img width="800" height="430" alt="showcase-gif" src="https://github.com/user-attachments/assets/63b6a5b1-b821-44b3-b764-481ee40fd33f" />
 
 ## Prerequisites
 
 - **Cargo** (Rust 1.85+) — [install via rustup](https://rustup.rs/)
-- **tmux** — `brew install tmux` (macOS) or `apt install tmux` (Linux)
+- **herdr-core** (`hc`) — the terminal runtime sessions run in; see [herdr-core](https://github.com/herdrdev/herdr-core) for install. Its terminals survive hc restarts and updates, and show up in the Herdr app
 - **An agent CLI** on your PATH — **Claude Code** (`claude`, the default), **Codex CLI** (`codex`) and/or **Pi** (`pi`) — see [Agent harnesses](#agent-harnesses)
 - **git** — for worktree and branch management
 - **gh** (optional) — GitHub CLI, for PR creation features
@@ -58,13 +58,15 @@ showrunner
 
 Launch from any directory. Configuration is stored in `~/.showrunner/config.toml`.
 
-> **Tip:** When you attach to a session (with `Enter`), you're inside a tmux session. To detach and get back to showrunner, use your tmux detach binding — with the default prefix that's `Ctrl-b d`. The session keeps running in the background.
+> **Tip:** When you attach to a session (with `Enter`), you're on its hc terminal. Detach with `Ctrl-\` to get back to showrunner; the session keeps running in the background.
+
+> **Moving from tmux:** Older showrunner versions ran sessions in tmux. `showrunner migrate` moves every idle session still running there into hc (killing its tmux session and resuming its conversation in hc), and lists what it left alone: sessions that are working or waiting for you, and Codex/Pi sessions (or Claude ones without a recorded conversation id) that share their folder with other sessions, where resuming would pick the folder's latest conversation rather than their own.
 
 ### Concepts
 
 - **Project** — A git repository you want to manage agent sessions for. Added by its filesystem path (`p` prompts for path and name).
 - **Task** — A unit of work within a project, tied to a git branch. Each task can have multiple sessions.
-- **Session** — An agent instance (Claude Code, Codex CLI or Pi, per `default_agent`/`--agent`) running in a tmux session. Sessions can be created with an optional initial prompt, and (by default) in their own git worktree so they don't collide.
+- **Session** — An agent instance (Claude Code, Codex CLI or Pi, per `default_agent`/`--agent`) running in its own hc terminal. Sessions can be created with an optional initial prompt, and (by default) in their own git worktree so they don't collide.
 - **Main session** (`◆ main`) — Every task has one, created with the task. It works in a worktree with the **task branch itself** checked out, so its commits land on the task branch directly — no merge step. Extra sessions (`n`) get their own `<task-branch>-<name>` branch and merge back into it.
 - **Adhoc session** — A project-scoped session that runs the agent directly in the project directory on whatever branch is checked out, with no task or worktree. Created with `A` from a project's context menu and grouped under the project. Handy for quick, throwaway work that doesn't warrant a task.
 
@@ -110,9 +112,9 @@ The context menu shows actions relevant to the selected item. Press the hotkey c
 
 The branch checkout picker opens a fuzzy finder over the project's local and remote branches — type to filter, `↑/↓` to navigate, `Enter` to check out (a remote-only branch is checked out as a new local tracking branch).
 
-**Run command** (`x`, available on projects, tasks, and sessions) launches a per-project command in a dedicated tmux session and attaches to it. The first time you run it for a project you're prompted for the command (e.g. `npm run dev`); it's saved to that project's `run_command` config and reused everywhere afterwards. It runs in the selected item's working directory: the session's worktree for a session, the task's first session worktree (or the project dir) for a task, and the project dir for a project.
+**Run command** (`x`, available on projects, tasks, and sessions) launches a per-project command in a dedicated hc terminal and attaches to it. The first time you run it for a project you're prompted for the command (e.g. `npm run dev`); it's saved to that project's `run_command` config and reused everywhere afterwards. It runs in the selected item's working directory: the session's worktree for a session, the task's first session worktree (or the project dir) for a task, and the project dir for a project.
 
-Each item shows a green run indicator while it has a live run session — an animated spinner (`⠙`) while the command is still executing, and a static `▷` once it finishes (the shell stays open so you can read its output). Detaching with `Ctrl-b d` leaves the command running in the background.
+Each item shows a green run indicator while it has a live run session — an animated spinner (`⠙`) while the command is still executing, and a static `▷` once it finishes (the shell stays open so you can read its output). Detaching with `Ctrl-\` leaves the command running in the background.
 
 Pressing Run (`x`) again on an item that **already has a live run session** opens a small menu instead of relaunching:
 
@@ -122,7 +124,7 @@ Pressing Run (`x`) again on an item that **already has a live run session** open
 | `r` | **Restart** — kill and relaunch the run command |
 | `k` | **Kill** — stop the run session |
 
-Run sessions are independent per item, so running on a different item starts a separate session. (Outside the TUI you can also list them with `tmux ls` and attach via `tmux attach -t cmrun-<name>`.)
+Run sessions are independent per item, so running on a different item starts a separate session. (Outside the TUI they show in `hc ls`, labeled `showrunner.run=cmrun-<name>`, and `hc attach <t>` attaches.)
 
 **Task actions:**
 
@@ -159,7 +161,7 @@ Run sessions are independent per item, so running on a different item starts a s
 | `r` | Review uncommitted changes (difit or hunk) | `review` |
 | `m` | Merge into task branch | `merge` |
 | `u` | Update/rebase onto task branch | `update` |
-| `t` | Open/attach a terminal in the worktree | `terminal` |
+| `t` | Open/attach a shell terminal in the worktree | `terminal` |
 | `x` | Run the project's configured run command | `run` |
 | `y` | Copy worktree path to clipboard | `copy_path` |
 | `R` | Enable/disable Remote Control (Claude sessions) | `remote_control` |
@@ -167,7 +169,7 @@ Run sessions are independent per item, so running on a different item starts a s
 
 The main session only offers Review, Terminal, Run, Copy path and Remote Control: it is already on the task branch, so Merge and Update have nothing to do, and it can't be deleted on its own — delete or archive the task instead.
 
-**Remote Control** (`R`, Claude sessions, also adhoc and on a remote host) makes a session show up in the Claude desktop and mobile apps and on claude.ai/code, by sending `/remote-control <name>` into it — no restart. It's named `<machine> · <project> / <task>[ / <session>]`, with `<machine>` from `machine_name` in that machine's config (default: its hostname). Pressing `R` again disconnects it. The setting is kept on the session, so a session recreated after tmux dies comes back connected. Same from the CLI: `showrunner session remote-control <session> [on|off]`. Needs a claude.ai login with Remote Control allowed by your org; the first time on a machine Claude asks for consent in the session.
+**Remote Control** (`R`, Claude sessions, also adhoc and on a remote host) makes a session show up in the Claude desktop and mobile apps and on claude.ai/code, by sending `/remote-control <name>` into it — no restart. It's named `<machine> · <project> / <task>[ / <session>]`, with `<machine>` from `machine_name` in that machine's config (default: its hostname). Pressing `R` again disconnects it. The setting is kept on the session, so a session recreated after a reboot comes back connected. Same from the CLI: `showrunner session remote-control <session> [on|off]`. Needs a claude.ai login with Remote Control allowed by your org; the first time on a machine Claude asks for consent in the session.
 
 The **Review** action (`r`) launches the configured diff review tool on the relevant diff — branch-vs-base for a task, uncommitted changes for a session. Choose the tool with `review_tool` in `~/.showrunner/config.toml` (`"hunk"`, the default, or `"difit"`):
 
@@ -184,7 +186,7 @@ review_tool = "difit"   # or "hunk" (default)
 Sessions display their current status:
 - **Running** — the agent is actively working
 - **Waiting for input** — the agent is waiting for your response
-- **Needs you** — the agent stopped on a permission or question dialog, or (with the Claude mod) ended its answer with questions for you; shown as a solid orange ` ! ` badge (each theme's own orange, used for nothing else) at the end of the session's line; its task's line turns orange (with the badge after the name while collapsed), and a collapsed project shows how many of its sessions need you. While the TUI runs, a session that starts needing you also posts a macOS notification (not for the session you're attached to) — through `terminal-notifier` when installed, so a click brings your terminal forward, else `osascript`; set `notifications = false` in `config.toml` to turn them off
+- **Needs you** — the agent stopped on a permission or question dialog (or, for Claude, hit an error such as a lost login); shown as a solid orange ` ! ` badge (each theme's own orange, used for nothing else) at the end of the session's line; its task's line turns orange (with the badge after the name while collapsed), and a collapsed project shows how many of its sessions need you. While the TUI runs, a session that starts needing you also posts a macOS notification — through `terminal-notifier` when installed, so a click brings your terminal forward, else `osascript`; set `notifications = false` in `config.toml` to turn them off
 - **Finished** — the agent process has exited
 
 ### Hot tasks
@@ -304,26 +306,12 @@ The default harness (`claude`).
 
 - Launches with `--dangerously-skip-permissions`; the session briefing is passed via `--append-system-prompt`.
 - The showrunner skills are loaded as a Claude Code plugin (`--plugin-dir`), so they're available as `/commit-push-task` and `/manage-sessions` slash commands.
-- Permission prompts and question dialogs surface as **Needs you**.
+- Claude Code reports its own status to hc (OSC 7501: working, blocked, done), which showrunner uses instead of reading the screen; permission prompts and question dialogs surface as **Needs you**.
 - Dead sessions resume their own conversation (`--session-id` at creation, `--resume <id>` after); sessions from before that use `claude --continue`.
 
-#### Claude mod (optional)
+#### Claude mod
 
-`claude-mod/` is a Claude Code mod that ties Claude sessions closer to showrunner. Inside a showrunner session it:
-
-- reports the session's status itself (`CM_STATUS`: running, waiting for input, needs you), which showrunner trusts over reading the pane — an answer that ends by asking you questions (checked by Claude Code's small model when the reply's tail has a `?`) counts as needing you, like a question dialog;
-- draws a band above the prompt with the project, task, session, diff, PR and Linear ticket (with its state) — both clickable — and the status of sibling sessions (from `showrunner session info`);
-- adds `/ticket`, which opens the task's Linear ticket (description, labels, latest comments) in a pane (from `showrunner session ticket`);
-- adds `/pr`, which opens the task's PR in a pane: checks (failing and pending ones linked), review state and unresolved review comments, with a **Send to Claude** button that puts them in the prompt (from `showrunner session pr`);
-- keeps the session record on the conversation the session runs, so a session recreated after `/clear` resumes the right one.
-
-Ticket state and content need a Linear token: `LINEAR_API_KEY`, or on macOS the one the `linear` CLI keeps in the keychain. Clickable links inside tmux need `set -as terminal-features ',*:hyperlinks'`.
-
-Outside showrunner sessions it does nothing. Install it for every session on a machine:
-
-```
-/plugin install showrunner-mod --marketplace Bendzae/showrunner
-```
+`claude-mod/` (the prompt band, `/ticket`, `/pr`, conversation sync) still finds its session through tmux, so it does nothing in hc sessions. It is to be replaced by Herdr mods.
 
 ### <img src="https://github.com/openai.png" height="20" alt=""/> Codex CLI
 
@@ -353,7 +341,8 @@ All showrunner features work with every harness — what differs is the mechanis
 | Auto-approval | `--dangerously-skip-permissions` | yolo flag + pre-trusted work dir | yolo by design, `--approve` for project files |
 | Attention dialogs | permission & question prompts | selectors (trust dialog etc.) | trust dialog & modal selectors |
 | Resume | `claude --continue` | `codex resume --last` | `pi --continue` |
-| Initial prompt, startup skills, status detection, `ask`/`send`/`output` | ✓ | ✓ | ✓ |
+| Status detection | reported by Claude (OSC 7501) | screen heuristics | screen heuristics |
+| Initial prompt, startup skills, `ask`/`send`/`output` | ✓ | ✓ | ✓ |
 
 ## Mobile web UI (`serve`)
 
@@ -387,10 +376,12 @@ showrunner session kill <session> --yes
 showrunner ask <session> <question> [--timeout <secs>]
 showrunner send <session> <text> [--no-submit]
 showrunner output <session> [--lines <n>]
-showrunner restore                               # recreate saved sessions gone from tmux (after a reboot)
+showrunner attach <session>                      # take over its terminal (Ctrl-\ detaches)
+showrunner restore                               # recreate saved sessions that are no longer running (after a reboot)
+showrunner migrate                               # move idle sessions from tmux (older versions) into hc
 ```
 
-Sessions are addressed by the refs `list` prints — `<project>/<task>/<session>` (e.g. `myapp/fix-auth/2`), `<project>/<task>` for that task's main session, or a raw tmux name. `list` marks the session you're calling from as `(this session)`, and reports the same statuses as the TUI (`running`, `waiting_input`, `waiting_permission`, `finished`); it samples each pane twice, so it takes a moment.
+Sessions are addressed by the refs `list` prints — `<project>/<task>/<session>` (e.g. `myapp/fix-auth/2`), `<project>/<task>` for that task's main session, or a raw `cm__…` name. `list` marks the session you're calling from as `(this session)`, and reports the same statuses as the TUI (`running`, `waiting_input`, `waiting_permission`, `finished`); for agents that don't report their status it samples each screen twice, so it takes a moment.
 
 `task create` and `session create` mirror the TUI's flows exactly — branch, worktree, setup commands, startup skills and initial prompt included. `--base` sets the task's base branch so it joins a [stack](#stacked-prs); a newly created task branch then starts from that base instead of main. `task set-base` changes it later (the same thing the TUI's set-base-branch key does). `--group` puts the new task into a [task group](#task-groups-and-ordering), and `task set-group` moves an existing task into one (or out of its group, when the name is omitted). `task delete` and `session kill` are destructive (worktrees removed, branches deleted) and require `--yes`; a task's main session can only go away with its task.
 

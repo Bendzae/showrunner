@@ -19,7 +19,7 @@ Sessions are addressed as `<project>/<task>/<session>`:
 - `myapp/adhoc/scratch` — an ad-hoc session (no task, runs in the project dir)
 - `myapp/fix-auth` — shorthand for that task's `main` session
 
-Raw tmux names (`cm__myapp__fix-auth__main`) also work. Always take refs from `list` rather than
+Raw session names (`cm__myapp__fix-auth__main`) also work. Always take refs from `list` rather than
 guessing — project and task names are sanitized in refs (spaces and symbols become `-`).
 
 ## Remote host

@@ -15,7 +15,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
 use crate::app::{App, InputMode};
-use crate::{cli, tmux, ui};
+use crate::{cli, session, ui};
 
 fn is_text_input_mode(mode: InputMode) -> bool {
     matches!(
@@ -64,7 +64,7 @@ pub fn run() -> Result<()> {
         }
 
         if let Some(session_name) = app.should_attach.take() {
-            tmux::attach_session(&session_name)?;
+            session::attach_session(&session_name)?;
         } else if let Some((host, session_name)) = app.should_attach_remote.take() {
             let remote = app.config.remote.clone().filter(|r| r.name == host);
             let result = match remote {
@@ -76,8 +76,8 @@ pub fn run() -> Result<()> {
             if let Err(e) = result {
                 app.status_message = Some(format!("Attach failed: {e}"));
             }
-        } else if let Some((session_name, window_idx)) = app.should_attach_window.take() {
-            tmux::attach_session_window(&session_name, window_idx)?;
+        } else if let Some(session_name) = app.should_attach_window.take() {
+            session::attach_terminal_window(&session_name)?;
         } else if let Some((cwd, args, candidates)) = app.should_review_hunk.take() {
             // hunk is a terminal TUI: run it on the real terminal (the TUI is
             // suspended here), polling its live session so comments can be
