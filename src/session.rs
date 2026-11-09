@@ -22,6 +22,19 @@ const LABEL_WORKTREE_PATH: &str = "showrunner.worktree-path";
 const LABEL_TERMINAL: &str = "showrunner.terminal";
 /// On "Run" terminals: their `cmrun-…` name.
 const LABEL_RUN: &str = "showrunner.run";
+/// Herdr shows terminals carrying both in that space and tab: a space per
+/// task (adhoc sessions share their project's), a tab per session.
+const LABEL_HERDR_SPACE: &str = "herdr.space";
+const LABEL_HERDR_TAB: &str = "herdr.tab";
+
+/// Herdr space and tab ids for a session: the session name without, and
+/// with, its session part.
+fn herdr_ids(cm_name: &str) -> (&str, &str) {
+    let space = cm_name
+        .rsplit_once(SESSION_SEP)
+        .map_or(cm_name, |(task, _)| task);
+    (space, cm_name)
+}
 
 /// Sentinel placed in the task slot of a session name to mark an adhoc session.
 /// Adhoc sessions belong to a project but no task; they run in the project dir.
@@ -207,8 +220,18 @@ pub fn list_sessions() -> Result<Vec<LiveSession>> {
 fn agent_terminals() -> Result<Vec<hc::Terminal>> {
     Ok(hc::list(&[])?
         .into_iter()
-        .filter(|t| t.labels.contains_key(LABEL_SESSION))
+        .filter(|t| t.labels.contains_key(LABEL_SESSION) && runs_agent(t))
         .collect())
+}
+
+/// Whether the terminal still runs the agent it was launched with. Herdr
+/// turns on keep for terminals it shows, so a lost agent leaves a live
+/// recovered shell behind, which counts as the session having ended.
+fn runs_agent(terminal: &hc::Terminal) -> bool {
+    terminal
+        .argv
+        .get(2)
+        .is_some_and(|line| line.starts_with("exec "))
 }
 
 /// The live terminal running the session's agent.
@@ -216,7 +239,23 @@ fn session_terminal(cm_name: &str) -> Option<hc::Terminal> {
     hc::list(&[(LABEL_SESSION, cm_name)])
         .ok()?
         .into_iter()
-        .next()
+        .find(runs_agent)
+}
+
+/// Put live sessions started before they carried Herdr's labels into Herdr.
+pub fn label_for_herdr() {
+    for terminal in agent_terminals().unwrap_or_default() {
+        let Some(cm_name) = terminal.label(LABEL_SESSION) else {
+            continue;
+        };
+        if terminal.label(LABEL_HERDR_TAB).is_none() {
+            let (space, tab) = herdr_ids(cm_name);
+            let _ = hc::set_labels(
+                &terminal.address,
+                &[(LABEL_HERDR_SPACE, space), (LABEL_HERDR_TAB, tab)],
+            );
+        }
+    }
 }
 
 fn session_terminal_required(cm_name: &str) -> Result<hc::Terminal> {
@@ -249,15 +288,20 @@ struct Launch<'a> {
 }
 
 fn launch(spec: Launch) -> Result<()> {
-    // A finished terminal of the same session (its agent exited) would
-    // otherwise linger next to the new one.
+    // A finished terminal of the same session (its agent exited), or a
+    // recovered shell, would otherwise linger next to the new one.
     for old in hc::list_all(&[(LABEL_SESSION, spec.cm_name)])? {
         if !old.is_live() {
             hc::remove(&old.address);
+        } else if !runs_agent(&old) {
+            hc::kill(&old.address);
         }
     }
+    let (space, tab) = herdr_ids(spec.cm_name);
     let mut labels = vec![
         (LABEL_SESSION, spec.cm_name),
+        (LABEL_HERDR_SPACE, space),
+        (LABEL_HERDR_TAB, tab),
         (LABEL_AGENT, spec.agent.id()),
         (LABEL_PROJECT_PATH, spec.project_path),
     ];
@@ -1106,7 +1150,16 @@ pub fn count_terminal_windows(session_name: &str) -> usize {
 
 /// Open a shell terminal for the session rooted at `work_dir`.
 pub fn create_terminal_window(session_name: &str, work_dir: &str) -> Result<()> {
-    hc::run(work_dir, None, &[(LABEL_TERMINAL, session_name)])?;
+    let (space, tab) = herdr_ids(session_name);
+    hc::run(
+        work_dir,
+        None,
+        &[
+            (LABEL_TERMINAL, session_name),
+            (LABEL_HERDR_SPACE, space),
+            (LABEL_HERDR_TAB, tab),
+        ],
+    )?;
     Ok(())
 }
 
@@ -2953,6 +3006,32 @@ mod tests {
         assert!(!is_adhoc_marker("ad-hoc"));
         assert!(!is_adhoc_marker("adhocs"));
         assert!(!is_adhoc_marker("explore"));
+    }
+
+    #[test]
+    fn herdr_space_is_the_task_and_tab_the_session() {
+        assert_eq!(
+            herdr_ids("cm__app__fix-auth__2"),
+            ("cm__app__fix-auth", "cm__app__fix-auth__2")
+        );
+        assert_eq!(
+            herdr_ids("cm__app__adhoc__scratch"),
+            ("cm__app__adhoc", "cm__app__adhoc__scratch")
+        );
+    }
+
+    #[test]
+    fn recovered_shell_does_not_run_the_agent() {
+        let launched = hc::Terminal {
+            argv: vec!["sh".into(), "-c".into(), "exec claude".into()],
+            ..Default::default()
+        };
+        let recovered = hc::Terminal {
+            argv: vec!["/bin/zsh".into(), "-l".into()],
+            ..Default::default()
+        };
+        assert!(runs_agent(&launched));
+        assert!(!runs_agent(&recovered));
     }
 
     #[test]

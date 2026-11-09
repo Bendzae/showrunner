@@ -16,6 +16,10 @@ pub struct Terminal {
     pub address: String,
     #[serde(default)]
     pub state: String,
+    /// What it was started with; a recovered shell's after a kept terminal
+    /// lost its program.
+    #[serde(default)]
+    pub argv: Vec<String>,
     #[serde(default)]
     pub labels: HashMap<String, String>,
     /// The program's own OSC 7501 report; `None` if it never sent one.
@@ -181,6 +185,15 @@ pub fn run(cwd: &str, command: Option<&str>, labels: &[(&str, &str)]) -> Result<
         .as_str()
         .map(str::to_string)
         .context("hc did not return the new terminal's address")
+}
+
+pub fn set_labels(terminal: &str, labels: &[(&str, &str)]) -> Result<()> {
+    let labels: HashMap<&str, &str> = labels.iter().copied().collect();
+    call(
+        "terminal.label",
+        json!({"terminal": terminal, "labels": labels}),
+    )?;
+    Ok(())
 }
 
 /// Paste `text` and press Enter. With `wait`, also wait (up to that many

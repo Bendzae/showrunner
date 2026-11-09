@@ -400,6 +400,7 @@ pub struct RestoreReport {
 /// restart, while those of deleted tasks are reaped instead of resurrected.
 pub fn restore_sessions(cfg: &Config) -> RestoreReport {
     let mut report = RestoreReport::default();
+    session::label_for_herdr();
     let saved = config::load_sessions();
     if saved.is_empty() {
         return report;
