@@ -346,6 +346,8 @@ All showrunner features work with every harness — what differs is the mechanis
 
 ## In the Herdr app
 
+Setting up a machine for it (and testing changes in a second Herdr): [herdr/README.md](herdr/README.md).
+
 Sessions run in herdr-core terminals labeled for [Herdr](https://herdr.dev): each task is a Herdr space and each session a tab of it, named after them, with Herdr's live agent status, sounds and notifications. Showrunner also brings a Herdr layout that puts its project/task/session list in the sidebar:
 
 ```sh
