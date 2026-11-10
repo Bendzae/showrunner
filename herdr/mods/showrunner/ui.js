@@ -61,6 +61,19 @@ export function prSummary(pr) {
   return parts.join(" · ");
 }
 
+// How many sessions under a folded row wait for input, work, or are done:
+// `! 1  ⟳ 2  ● 1`. Null when none do.
+export function activityBadge(t, a) {
+  if (!a || !(a.blocked || a.working || a.done)) return null;
+  return h_flex().flex_none().gap(6).items_center().text_size(11)
+    .when(a.blocked > 0, (el) => el.child(h_flex().h(15).px(4).rounded(4).bg(t.blocked).items_center()
+      .font_bold().text_color(t.background).child(`! ${a.blocked}`)))
+    .when(a.working > 0, (el) => el.child(h_flex().gap(3).items_center().text_color(t.working)
+      .child(svg(ICON("spinner")).size(10).spin(900)).child(String(a.working))))
+    .when(a.done > 0, (el) => el.child(h_flex().gap(3).items_center().text_color(t.done)
+      .child(div().size(6).rounded(3).bg(t.done)).child(String(a.done))));
+}
+
 // 1234 → 1.2k, 12345 → 12k.
 export function short(n) {
   if (n < 1000) return String(n);

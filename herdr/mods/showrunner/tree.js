@@ -8,7 +8,7 @@ import { spaces, focused, run, theme, settings, shared, setShared, nextCommand, 
 import { sr, clean, loadConfig, liveSessions, liveRuns, guessedStatus, worst, menuItems, show, runAct } from "./lib.js";
 import { perform, openMenu, form } from "./actions.js";
 import { togglePanel, showPanel, panelEntries } from "./panels.js";
-import { icon, programIcon, statusGlyph, prColor, diffBadge, avatar, avatarColor, linearId, prSummary } from "./ui.js";
+import { icon, programIcon, statusGlyph, prColor, diffBadge, activityBadge, avatar, avatarColor, linearId, prSummary } from "./ui.js";
 
 const H = { project: 34, group: 26, task: 28, session: 26, stopped: 26, "adhoc-group": 26, adhoc: 26, "other-head": 32, space: 28, hint: 30 };
 const HOT_SECONDS = 2 * 3600;
@@ -223,7 +223,7 @@ export class Tree {
       const projectHit = has(p.name);
       const tasks = (p.tasks ?? []).filter((t) => Boolean(t.archived) === this.archived);
       const projectRows = [];
-      let needs = 0, sessionsTotal = 0;
+      let sessionsTotal = 0;
       let lastGroup = null;
       // Adhoc sessions, the project's own space: always first, also when empty.
       if (!this.archived) {
@@ -236,7 +236,6 @@ export class Tree {
         if (hits.length || !f) {
           const akey = `a:${p.name}`;
           const status = worst(running.map((s) => live[s.cm_name].status));
-          needs += running.filter((s) => live[s.cm_name].status === "blocked").length;
           sessionsTotal += running.length;
           projectRows.push({ key: akey, kind: "adhoc-group", depth: 1, parents: [pkey], status, folded: !open(akey), count: hits.length,
             item: { kind: "adhoc-group", project: P, space: p.space } });
@@ -262,7 +261,6 @@ export class Tree {
         const stopped = [...(t.stopped ?? []), ...(t.sessions ?? []).filter((s) => !live[s.cm_name])];
         const statuses = running.map((s) => live[s.cm_name].status);
         const status = worst(statuses);
-        if (status === "blocked") needs += running.filter((s) => live[s.cm_name].status === "blocked").length;
         sessionsTotal += running.length;
         const main = running.find((s) => s.name === "main");
         const taskHit = projectHit || has(t.name, t.branch, linearId(t.linear));
@@ -280,8 +278,7 @@ export class Tree {
         const tkey = `t:${p.name}/${t.name}`;
         const mainInfo = main ? sessionInfo(main, false) : null;
         const taskItem = { kind: "task", project: P, task: T, space, run: t.run, main: mainInfo, counts: { sessions: running.length } };
-        const hot = running.some((s) => (this.stats.sessions[s.cm_name]?.last_active ?? 0) > Date.now() / 1000 - HOT_SECONDS);
-        projectRows.push({ key: tkey, kind: "task", depth: inGroup ? 2 : 1, parents: above, item: taskItem, status, hot, folded: !open(tkey),
+        projectRows.push({ key: tkey, kind: "task", depth: inGroup ? 2 : 1, parents: above, item: taskItem, status, folded: !open(tkey),
           blocked: statuses.filter((s) => s === "blocked").length, diff: this.stats.tasks[`${p.name}/${t.name}`]?.diff });
         const ordered = [...running.map((s) => [s, false]), ...stopped.map((s) => [s, true])]
           .filter(([s]) => sessionHits.includes(s))
@@ -301,7 +298,7 @@ export class Tree {
         this.names[t.run] = "▶ run";
       }
       if (!projectHit && !projectRows.length) continue;
-      rows.push({ key: pkey, kind: "project", depth: 0, folded: !open(pkey), needs, branch: this.stats.projects[p.name]?.branch,
+      rows.push({ key: pkey, kind: "project", depth: 0, folded: !open(pkey), branch: this.stats.projects[p.name]?.branch,
         item: { kind: "project", project: P, space: p.space, run: p.run, counts: { tasks: (p.tasks ?? []).length, sessions: sessionsTotal } } });
       rows.push(...projectRows);
     }
@@ -311,6 +308,19 @@ export class Tree {
       rows.push({ key: "o:head", kind: "other-head" });
       for (const s of others) rows.push({ key: `o:${s.id}`, kind: "space", depth: 0, space: s, status: s.status, item: { kind: "space", space: s.id } });
     }
+    // What the sessions under each row do, for the row to show while folded.
+    const cutoff = Date.now() / 1000 - HOT_SECONDS;
+    const activity = {};
+    for (const r of rows) {
+      if (r.kind !== "session" && r.kind !== "adhoc") continue;
+      r.hot = (this.stats.sessions[r.item.session.cm_name]?.last_active ?? 0) > cutoff;
+      for (const key of r.parents) {
+        const a = (activity[key] ??= { working: 0, blocked: 0, done: 0, hot: false });
+        if (r.status === "working" || r.status === "blocked" || r.status === "done") a[r.status] += 1;
+        a.hot ||= r.hot;
+      }
+    }
+    for (const r of rows) if (activity[r.key]) r.activity = activity[r.key];
     this.allRows = rows;
     return rows.filter((r) => !(r.parents ?? []).some((k) => !open(k)));
   }
@@ -715,6 +725,10 @@ export class Tree {
     const chevron = (folded) => div().id(`sr-fold-${r.key}`).size(12).flex_none().flex().items_center().justify_center().text_color(t.dim)
       .on_click((_e, cx) => { cx.stop_propagation(); this.toggle(r.key); cx.notify(); })
       .child(icon(folded ? "chevron-right" : "chevron-down", 11));
+    // A folded row shows what its hidden sessions do; an open one leaves it
+    // to the rows under it.
+    const hidden = r.folded ? r.activity : null;
+    const fire = div().flex_none().text_size(11).child("🔥");
     const runMark = (name) => {
       const live = name && runs[name];
       if (!live) return null;
@@ -730,9 +744,9 @@ export class Tree {
           .child(chevron(r.folded))
           .child(avatar(project.name))
           .child(div().id(`sr-name-${r.key}`).flex_shrink(0).max_w(170).truncate().font_semibold().text_color(t.foreground).tooltip(project.name).child(project.name))
+          .when(Boolean(hidden?.hot), (el) => el.child(fire))
           .child(div().flex_1())
-          .when(r.folded && r.needs > 0, (el) => el.child(h_flex().h(16).px(5).rounded(4).bg(t.blocked).items_center()
-            .text_size(10.5).font_bold().text_color(t.background).child(`${r.needs} !`)))
+          .when(Boolean(activityBadge(t, hidden)), (el) => el.child(activityBadge(t, hidden)))
           .when(Boolean(runMark(r.item.run)), (el) => el.child(runMark(r.item.run)))
           .when(Boolean(r.branch) && r.branch !== "main" && r.branch !== "master", (el) =>
             el.child(h_flex().flex_shrink(1).min_w(0).gap(3).items_center().text_size(11).text_color(t.dim)
@@ -742,11 +756,14 @@ export class Tree {
         return base
           .child(chevron(r.folded))
           .child(icon("layers", 12, t.dim))
-          .child(div().flex_1().truncate().text_size(12).text_color(t.muted).child(r.label))
-          .when(r.folded, (el) => el.child(div().text_size(11).text_color(t.dim).child(String(r.count))));
+          .child(div().flex_shrink(1).min_w(0).truncate().text_size(12).text_color(t.muted).child(r.label))
+          .when(r.folded, (el) => el.child(div().flex_none().text_size(11).text_color(t.dim).child(String(r.count))))
+          .when(Boolean(hidden?.hot), (el) => el.child(fire))
+          .child(div().flex_1())
+          .when(Boolean(activityBadge(t, hidden)), (el) => el.child(activityBadge(t, hidden)));
       case "task": {
         const { task } = r.item;
-        const needs = r.status === "blocked";
+        const needs = r.folded && r.status === "blocked";
         const ticket = linearId(task.linear);
         // The task's PR or ticket in the right panel; again hides it.
         const panelIcon = (view, name, color, tip) => div().id(`sr-${view}-${r.key}`).size(18).flex_none().flex().items_center().justify_center()
@@ -761,13 +778,13 @@ export class Tree {
           .child(icon(name, 13, color));
         return base
           .child(chevron(r.folded))
-          .child(statusGlyph(t, r.status))
+          .child(statusGlyph(t, r.folded ? r.status : null))
           .child(div().id(`sr-name-${r.key}`).flex_shrink(1).min_w(0).truncate()
             .text_color(needs ? t.blocked : task.archived ? t.muted : t.foreground)
             .when(this.activeSpace(r.item.space), (el) => el.font_semibold())
             .tooltip(task.name)
             .child(task.name))
-          .when(r.hot, (el) => el.child(div().flex_none().text_size(11).child("🔥")))
+          .when(Boolean(hidden?.hot), (el) => el.child(fire))
           .when(task.stack?.size > 1, (el) => el.child(div().flex_none().text_size(10.5).text_color(t.dim).child(`${task.stack.position}/${task.stack.size}`)))
           .child(div().flex_1())
           .when(Boolean(runMark(r.item.run)), (el) => el.child(runMark(r.item.run)))
@@ -779,9 +796,11 @@ export class Tree {
         return base
           .child(r.count ? chevron(r.folded) : div().size(12).flex_none())
           .child(icon("house", 12, t.accent))
-          .child(div().flex_1().text_size(12).text_color(r.count ? t.muted : t.dim).child("adhoc"))
-          .when(r.folded && Boolean(r.status) && r.status !== "idle", (el) => el.child(statusGlyph(t, r.status)))
-          .when(r.folded && r.count > 0, (el) => el.child(div().text_size(11).text_color(t.dim).child(String(r.count))));
+          .child(div().text_size(12).text_color(r.count ? t.muted : t.dim).child("adhoc"))
+          .when(r.folded && r.count > 0, (el) => el.child(div().text_size(11).text_color(t.dim).child(String(r.count))))
+          .when(Boolean(hidden?.hot), (el) => el.child(fire))
+          .child(div().flex_1())
+          .when(Boolean(activityBadge(t, hidden)), (el) => el.child(activityBadge(t, hidden)));
       case "session":
       case "adhoc":
       case "stopped": {
@@ -800,6 +819,7 @@ export class Tree {
             .text_color(stopped ? t.dim : r.status === "blocked" ? t.blocked : t.foreground)
             .when(shown, (el) => el.font_semibold())
             .child(session.name))
+          .when(Boolean(r.hot), (el) => el.child(fire))
           .when(stopped, (el) => el.child(div().text_size(11).text_color(t.dim).child(session.in_tmux ? "in tmux" : "stopped")))
           .when(Boolean(branchTail), (el) => el.child(div().flex_shrink(1).min_w(0).truncate().text_size(11).text_color(t.dim).child(branchTail)))
           .child(div().flex_1())
