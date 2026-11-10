@@ -44,6 +44,6 @@ export default class ShowrunnerStatus extends View {
       .when(!busy.length, (el) => el.child(h_flex().flex_none().gap(12).items_center().text_color(t.dim)
         .child(hint("a", "actions"))
         .child(hint("/", "filter"))
-        .child(hint("⌃\\", "tree ⇄ terminal"))));
+        .child(hint("⌃/", "tree ⇄ terminal"))));
   }
 }

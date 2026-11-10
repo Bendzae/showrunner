@@ -42,10 +42,10 @@ const FILES: &[(&str, &str)] = files![
     "mods/showrunner-status/main.js",
 ];
 
-/// The key, in the layout's own section: `Ctrl-\` jumps between the tree and
-/// the terminal, as detaching from a session did.
+/// The key, in the layout's own section: `Ctrl-/` jumps between the tree and
+/// the terminal.
 const KEY_SECTION: &str = "layout:showrunner";
-const KEY: &str = "ctrl-\\";
+const KEY: &str = "ctrl-/";
 const KEY_ACTION: &str = "showrunner.toggle";
 
 pub fn default_home() -> PathBuf {
@@ -107,15 +107,20 @@ pub fn install(home: &Path, bin: Option<&str>, keys: bool) -> Result<Installed> 
         let text = fs::read_to_string(&path).unwrap_or_else(|_| "{}".into());
         let mut map: Value =
             serde_json::from_str(&text).with_context(|| format!("reading {}", path.display()))?;
-        let bound = map[KEY_SECTION][KEY].as_str() == Some(KEY_ACTION);
-        if !bound {
-            if map.get(KEY_SECTION).is_none() {
-                map[KEY_SECTION] = json!({});
-            }
-            map[KEY_SECTION][KEY] = json!(KEY_ACTION);
+        if map.get(KEY_SECTION).is_none() {
+            map[KEY_SECTION] = json!({});
+        }
+        let section = map[KEY_SECTION]
+            .as_object_mut()
+            .context("keys.json section")?;
+        let before = section.clone();
+        // A key an earlier install bound to the toggle goes: one key does it.
+        section.retain(|key, action| key == KEY || action.as_str() != Some(KEY_ACTION));
+        section.insert(KEY.to_string(), json!(KEY_ACTION));
+        if *section != before {
             fs::write(&path, serde_json::to_string_pretty(&map)? + "\n")?;
             notes.push(
-                "keys.json: ctrl-\\ jumps between the tree and the terminal in the Showrunner \
+                "keys.json: ctrl-/ jumps between the tree and the terminal in the Showrunner \
                  layout (Herdr no longer updates an edited keys.json's defaults: add new ones \
                  by hand)"
                     .to_string(),
@@ -142,7 +147,11 @@ mod tests {
     fn install_writes_files_and_merges_the_key() {
         let home = std::env::temp_dir().join(format!("sr-herdr-{}", std::process::id()));
         fs::create_dir_all(&home).unwrap();
-        fs::write(home.join("keys.json"), r#"{"global":{"cmd-t":"tab.new"}}"#).unwrap();
+        fs::write(
+            home.join("keys.json"),
+            r#"{"global":{"cmd-t":"tab.new"},"layout:showrunner":{"ctrl-\\":"showrunner.toggle"}}"#,
+        )
+        .unwrap();
 
         install(&home, Some("/opt/sr"), true).unwrap();
         install(&home, Some("/opt/sr"), true).unwrap();
@@ -153,6 +162,7 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(home.join("keys.json")).unwrap()).unwrap();
         assert_eq!(keys["global"]["cmd-t"], "tab.new");
         assert_eq!(keys[KEY_SECTION][KEY], KEY_ACTION);
+        assert_eq!(keys[KEY_SECTION].as_object().unwrap().len(), 1);
         let local: Value = serde_json::from_str(
             &fs::read_to_string(home.join("mods/showrunner/local.json")).unwrap(),
         )

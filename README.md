@@ -352,7 +352,7 @@ Sessions run in herdr-core terminals labeled for [Herdr](https://herdr.dev): eac
 showrunner herdr install        # writes the mods and the layout into ~/.config/herdr-app
 ```
 
-Then switch layouts with `Cmd-Shift-L` (or from Settings) to **showrunner**. The sidebar lists projects, task groups, tasks and sessions like the TUI, with the same badges (status, ` ! ` needs you, 🔥, stack position, Linear id, PR/CI, diff) and the same keys: `j/k` move, `Enter` shows a session and puts the keyboard in its terminal (on a task: its main session), `Space` folds, `a` opens the item's menu with the TUI's keys (`n`, `N`, `S`, `r`, `m`, `u`, `x`, `t`, `B`, `P`, `b`, `o`, `g`, `A`, `d`, …), `p` adds a project, `/` filters, `Z` shows archived tasks, `K/J` move items, `t` cycles Herdr's themes. `Ctrl-\` jumps between the list and the terminal, as detaching from the TUI did. A click shows a session, a double click opens it, a right click opens its menu. The status bar shows the selection's branch → base, PR, Linear ticket and diff.
+Then switch layouts with `Cmd-Shift-L` (or from Settings) to **showrunner**. The sidebar lists projects, task groups, tasks and sessions like the TUI, with the same badges (status, ` ! ` needs you, 🔥, stack position, Linear id, PR/CI, diff) and the same keys: `j/k` move, `Enter` shows a session and puts the keyboard in its terminal (on a task: its main session), `Space` folds, `a` opens the item's menu with the TUI's keys (`n`, `N`, `S`, `r`, `m`, `u`, `x`, `t`, `B`, `P`, `b`, `o`, `g`, `A`, `d`, …), `p` adds a project, `/` filters, `Z` shows archived tasks, `K/J` move items, `t` cycles Herdr's themes. `Ctrl-/` jumps between the list and the terminal, where detaching from the TUI got you back to the list. A click shows a session, a double click opens it, a right click opens its menu. The status bar shows the selection's branch → base, PR, Linear ticket and diff.
 
 What works differently there:
 
@@ -362,7 +362,7 @@ What works differently there:
 - Creating a task or session shows its tab; the keyboard stays in the list.
 - Remote hosts (`[remote]`) aren't shown there, only this machine's projects.
 
-`showrunner herdr install` adds `Ctrl-\` to `keys.json` (skip with `--no-keys`); Herdr stops updating the defaults of a `keys.json` once it's edited. Run it again after updating showrunner.
+`showrunner herdr install` adds `Ctrl-/` to `keys.json` (skip with `--no-keys`); Herdr stops updating the defaults of a `keys.json` once it's edited. Run it again after updating showrunner.
 
 ## Mobile web UI (`serve`)
 
