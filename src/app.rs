@@ -2413,10 +2413,17 @@ impl App {
     }
 
     pub fn confirm_set_base_branch(&mut self) {
-        let (project_name, task_name) = match self.selected_item() {
+        let (project_name, project_path, task_name, branch) = match self.selected_item() {
             Some(ListItem::Task {
-                project_name, task, ..
-            }) => (project_name.clone(), task.name.clone()),
+                project_name,
+                project_path,
+                task,
+            }) => (
+                project_name.clone(),
+                project_path.clone(),
+                task.name.clone(),
+                task.branch.clone(),
+            ),
             _ => {
                 self.cancel_input();
                 return;
@@ -2424,7 +2431,8 @@ impl App {
         };
 
         let raw = self.input_buffer.trim().to_string();
-        let new_base = if raw.is_empty() { None } else { Some(raw) };
+        let new_base = Some(raw).filter(|b| !b.is_empty() && b != "main");
+        session::record_base_branch(&project_path, &branch, new_base.as_deref());
 
         self.config.reload();
         self.config

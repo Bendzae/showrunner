@@ -729,9 +729,9 @@ fn cmd_task_set_base(args: &[String]) -> Result<()> {
 
     let cfg = Config::load()?;
     let project = ops::find_project(&cfg, project_name)?;
-    if !project.tasks.iter().any(|t| t.name == *task_name) {
+    let Some(task) = project.tasks.iter().find(|t| t.name == *task_name) else {
         bail!("task '{task_name}' not found in project '{project_name}'");
-    }
+    };
 
     let base = base.trim();
     let new_base = Some(base.to_string()).filter(|b| !b.is_empty() && b != "main");
@@ -744,6 +744,7 @@ fn cmd_task_set_base(args: &[String]) -> Result<()> {
         );
     }
 
+    session::record_base_branch(&project.path, &task.branch, new_base.as_deref());
     let label = new_base.as_deref().unwrap_or("main").to_string();
     let (project_name, task_name) = (project_name.clone(), task_name.clone());
     let task_for_msg = task_name.clone();

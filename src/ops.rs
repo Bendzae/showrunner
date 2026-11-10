@@ -121,6 +121,9 @@ pub fn create_task(
     if !session::branch_exists(&project.path, &branch) {
         session::create_task_branch(&project.path, &branch, base)?;
     }
+    if base.is_some() {
+        session::record_base_branch(&project.path, &branch, base);
+    }
 
     let (project_name, task, branch_for_config) =
         (project.name.clone(), task_name.to_string(), branch.clone());

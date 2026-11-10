@@ -481,6 +481,19 @@ pub fn create_task_branch(project_path: &str, branch_name: &str, base: Option<&s
     Ok(())
 }
 
+/// Keep a task's base in git config where `gh` keeps it
+/// (`branch.<branch>.gh-merge-base`), so `gh pr create` and Herdr's reviewer
+/// compare against it. `None` removes it.
+pub fn record_base_branch(project_path: &str, branch: &str, base: Option<&str>) {
+    let key = format!("branch.{branch}.gh-merge-base");
+    let mut args = vec!["-C", project_path, "config"];
+    match base {
+        Some(base) => args.extend([key.as_str(), base]),
+        None => args.extend(["--unset", key.as_str()]),
+    }
+    let _ = Command::new("git").args(args).output();
+}
+
 /// Where a new session's worktree branch comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Checkout {
