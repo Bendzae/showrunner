@@ -5,9 +5,9 @@
 
 import { div, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, TextView } from "gpui-base";
-import { shared, theme, layout, notify, run } from "herdr";
+import { shared, theme, layout, notify, run, nextCommand, settings } from "herdr";
 import { sr, clean, openUrl, reveal } from "./lib.js";
-import { ICON } from "./ui.js";
+import { ICON, keycap } from "./ui.js";
 
 export const PANELS = [
   { id: "files", label: "Files", key: "f", icon: "mods/files/file.svg" },
@@ -76,20 +76,6 @@ export class PanelBar {
 
 const selection = () => shared("showrunner.selected");
 
-// Laid out like Herdr's Files and Changes: a card with a header (title, a
-// badge, a dim subtitle on the right), a scrolling body and an action bar.
-function frame(t, view, head, body, footer) {
-  return v_flex().id(view).size_full().min_h(0).rounded(10).overflow_hidden().bg(t.background).border_1().border_color(t.border)
-    .text_color(t.foreground).text_size(13)
-    .child(h_flex().h(42).flex_none().px(14).gap(8).items_center().border_b(1).border_color(t.border)
-      .child(div().font_semibold().child(head.title))
-      .when(Boolean(head.badge), (el) => el.child(div().px(5).py(1).flex_none().rounded(4).border_1().border_color(t.border).text_size(10).text_color(t.muted).child(head.badge)))
-      .child(div().flex_1().min_w(0).truncate().text_right().text_size(12).text_color(t.dim).child(head.subtitle ?? ""))
-      .children(head.actions ?? []))
-    .child(v_flex().id(`${view}-body`).flex_1().min_h(0).overflow_y_scrollbar().p(6).child(body))
-    .when(Boolean(footer), (el) => el.child(h_flex().flex_none().p(10).gap(8).items_center().border_t(1).border_color(t.border).children(footer)));
-}
-
 const headButton = (t, id, label, onClick) => h_flex().id(id).h(24).px(7).flex_none().items_center().rounded(6)
   .text_size(11.5).text_color(t.muted).cursor_pointer().hover((s) => s.bg(t.hover).text_color(t.foreground)).on_click(onClick).child(label);
 
@@ -117,26 +103,85 @@ function firstParagraph(body) {
   return (body ?? "").split(/\n\s*\n/).filter((part) => !/^\s*(\[!\[|<|!\[)/.test(part)).slice(0, 2).join("\n\n").trim();
 }
 
+const zoom = () => settings().zoom ?? 1;
+
+// A body that scrolls itself, so the keyboard can scroll it and keep a
+// selected item in view (gpui scrolls only virtual lists from code).
+class Scroller {
+  constructor(id) {
+    this.id = id;
+    this.y = 0;
+    this.view = 0;
+    this.heights = [];
+  }
+
+  content() { return this.heights.reduce((a, b) => a + (b ?? 0), 12); }
+  max() { return Math.max(0, this.content() - this.view); }
+  by(dy) { this.y = Math.max(0, Math.min(this.y + dy, this.max())); }
+
+  reveal(i) {
+    const top = 6 + this.heights.slice(0, i).reduce((a, b) => a + (b ?? 0), 0), h = this.heights[i] ?? 0;
+    if (top < this.y) this.y = top - 6;
+    else if (top + h > this.y + this.view) this.y = top + h + 6 - this.view;
+    this.by(0);
+  }
+
+  render(t, items) {
+    this.heights.length = items.length;
+    this.by(0);
+    const thumb = this.max() > 0 ? Math.max(24, this.view * this.view / this.content()) : 0;
+    return div().id(this.id).flex_1().min_h(0).relative().overflow_hidden()
+      .on_size_change((size, cx) => { this.view = size.height / zoom(); cx.notify(); })
+      .on_scroll_wheel((e, cx) => { this.by(-e.delta.y); cx.notify(); })
+      .child(v_flex().absolute().left(0).right(0).top(-this.y).p(6).children(items))
+      .when(thumb > 0, (el) => el.child(div().absolute().right(2).w(4).rounded(2).bg(t.border)
+        .top((this.view - thumb) * this.y / this.max()).h(thumb)));
+  }
+
+  measured(i, el) {
+    return v_flex().id(`${this.id}-${i}`).flex_none().rounded(7).child(el)
+      .on_size_change((size, cx) => {
+        const h = size.height / zoom();
+        if (this.heights[i] !== h) { this.heights[i] = h; cx.notify(); }
+      });
+  }
+}
+
+// What a panel shows: an element, and what Enter does on it when it can be
+// selected.
+const item = (el, pick) => ({ el, pick });
+
 // Loads a view's data for the selection's task; again when it changes, and
-// every `every` ms while the view is shown.
+// every `every` ms while the view is shown. Takes the keyboard when
+// `pane.go` (Ctrl-B h/l) moves onto it: j/k move (or scroll), Enter picks,
+// h or Esc goes back.
 class Loading {
   init(cx, view, every) {
     this.view = view;
     this.state = { status: "idle" };
     this.loaded = null;
+    this.handle = cx.focus_handle();
+    this.scroller = new Scroller(`${view}-body`);
+    this.pos = 0;
     cx.timer.every(1000, (cx) => {
       const sel = selection();
       const key = this.key(sel);
       if (!visible(view)) return;
-      if (key !== this.loaded || (key && Date.now() - (this.at ?? 0) > every)) this.load(cx, sel, key);
+      if (key !== this.loaded || (key && Date.now() - (this.loadedAt ?? 0) > every)) this.load(cx, sel, key);
+    });
+    cx.spawn(async (cx) => {
+      for (;;) {
+        if ((await nextCommand()) === "focus") this.handle.focus();
+        cx.notify();
+      }
     });
   }
 
   load(cx, sel, key) {
     this.loaded = key;
-    this.at = Date.now();
+    this.loadedAt = Date.now();
     if (!key) { this.state = { status: "idle" }; return cx.notify(); }
-    if (this.state.status !== "ready" || this.state.key !== key) this.state = { status: "loading" };
+    if (this.state.status !== "ready" || this.state.key !== key) { this.state = { status: "loading" }; this.pos = 0; this.scroller.y = 0; }
     cx.notify();
     cx.spawn(async (cx) => {
       const r = await this.fetch(sel);
@@ -159,12 +204,99 @@ class Loading {
   parse(text) {
     return JSON.parse(text);
   }
+
+  // The panel's own keys beyond the shared ones: { key: [hint, action(cx)] }.
+  keys() { return {}; }
+
+  // Into a field: the keyboard goes back to the panel on Esc.
+  typing() { return false; }
+
+  picks() { return (this.items ?? []).map((x, i) => (x.pick ? i : -1)).filter((i) => i >= 0); }
+
+  move(by) {
+    const picks = this.picks();
+    if (!picks.length) return this.scroller.by(by * 48);
+    this.pos = Math.max(0, Math.min(this.pos + by, picks.length - 1));
+    this.scroller.reveal(picks[this.pos]);
+  }
+
+  onKey(e, cx) {
+    if (!this.handle.is_focused()) {
+      if (e.key !== "escape") return;
+      this.escape?.();
+      this.handle.focus();
+    } else if (e.modifiers.control && (e.key === "d" || e.key === "u")) {
+      this.scroller.by((e.key === "d" ? 1 : -1) * this.scroller.view / 2);
+    } else if (e.modifiers.platform || e.modifiers.control || e.modifiers.alt) {
+      return;
+    } else {
+      const k = e.key.length === 1 ? e.key_char ?? e.key : e.key;
+      const picks = this.picks();
+      switch (k) {
+        case "j": case "down": this.move(1); break;
+        case "k": case "up": this.move(-1); break;
+        case "g": this.move(-Infinity); this.scroller.y = 0; break;
+        case "G": this.move(Infinity); this.scroller.y = this.scroller.max(); break;
+        case "enter": this.items?.[picks[this.pos]]?.pick?.(cx); break;
+        case "r": this.reload(cx); break;
+        case "h": case "escape": run("pane.go", { direction: "left" }); break;
+        default: {
+          const own = this.keys()[k];
+          if (!own) return;
+          own[1](cx);
+        }
+      }
+    }
+    cx.stop_propagation();
+    cx.notify();
+  }
+
+  // Laid out like Herdr's Files and Changes: a card with a header (title, a
+  // badge, a dim subtitle on the right), a body and an action bar; with the
+  // keyboard, a line of its keys.
+  frame(t, head, items, footer) {
+    this.items = items;
+    const focused = this.handle.is_focused();
+    const picks = this.picks();
+    this.pos = Math.max(0, Math.min(this.pos, picks.length - 1));
+    const selected = focused && picks.length ? picks[this.pos] : -1;
+    const hints = [
+      [picks.length ? "j/k" : "j/k ⌃d/u", picks.length ? "move" : "scroll"],
+      ...(picks.length && this.pickLabel ? [["↵", this.pickLabel]] : []),
+      ...Object.entries(this.keys()).filter(([, v]) => v[0]).map(([k, v]) => [k, v[0]]),
+      ["r", "refresh"],
+      ["h", "back"],
+    ];
+    return v_flex().id(this.view).size_full().min_h(0).rounded(10).overflow_hidden().bg(t.background).border_1()
+      .border_color(focused || this.typing() ? t.accent : t.border).text_color(t.foreground).text_size(13)
+      .track_focus(this.handle).on_key_down((e, cx) => this.onKey(e, cx))
+      .child(h_flex().h(42).flex_none().px(14).gap(8).items_center().border_b(1).border_color(t.border)
+        .child(div().font_semibold().child(head.title))
+        .when(Boolean(head.badge), (el) => el.child(div().px(5).py(1).flex_none().rounded(4).border_1().border_color(t.border).text_size(10).text_color(t.muted).child(head.badge)))
+        .child(div().flex_1().min_w(0).truncate().text_right().text_size(12).text_color(t.dim).child(head.subtitle ?? ""))
+        .children(head.actions ?? []))
+      .child(this.scroller.render(t, items.map((x, i) => this.scroller.measured(i, x.el).when(i === selected, (el) => el.bg(t.selected)))))
+      .when(focused, (el) => el.child(h_flex().flex_none().flex_wrap().px(14).py(6).gap_x(12).gap_y(4).border_t(1).border_color(t.border)
+        .text_size(11).text_color(t.dim)
+        .children(hints.map(([k, label]) => h_flex().gap(4).items_center().child(keycap(t, k)).child(label)))))
+      .when(Boolean(footer), (el) => el.child(h_flex().flex_none().p(10).gap(8).items_center().border_t(1).border_color(t.border).children(footer)));
+  }
 }
 
 export class PrPanel extends Loading {
   init(cx) { super.init(cx, "pr", 60000); }
   key(sel) { return sel?.ref && sel.task ? `${sel.ref}` : null; }
   fetch(sel) { return sr(["session", "pr", sel.ref], 60000); }
+
+  get pickLabel() { return "open"; }
+
+  keys() {
+    const p = this.state.status === "ready" ? this.state.value : null;
+    return {
+      ...(p?.threads.length ? { s: ["send comments to the agent", () => this.sendThreads(selection(), p)] } : {}),
+      ...(p ? { o: ["GitHub", () => openUrl(p.url)] } : {}),
+    };
+  }
 
   sendThreads(sel, pr) {
     const text = pr.threads.map((x) => `- ${x.path}${x.line ? `:${x.line}` : ""} (${x.author ?? "reviewer"}): ${firstParagraph(x.body)}`).join("\n");
@@ -180,9 +312,9 @@ export class PrPanel extends Loading {
     const sel = selection();
     const s = this.state;
     const refresh = headButton(t, "pr-refresh", "↻", (_e, cx) => this.reload(cx));
-    if (!sel?.task) return frame(t, "pr", { title: "Pull request" }, note(t, "Select a task or one of its sessions."));
-    if (s.status === "loading" || s.status === "idle") return frame(t, "pr", { title: "Pull request", subtitle: sel.task, actions: [refresh] }, note(t, "Loading the pull request…"));
-    if (s.status === "error") return frame(t, "pr", { title: "Pull request", subtitle: sel.task, actions: [refresh] }, note(t, s.message), [
+    if (!sel?.task) return this.frame(t, { title: "Pull request" }, [item(note(t, "Select a task or one of its sessions."))]);
+    if (s.status === "loading" || s.status === "idle") return this.frame(t, { title: "Pull request", subtitle: sel.task, actions: [refresh] }, [item(note(t, "Loading the pull request…"))]);
+    if (s.status === "error") return this.frame(t, { title: "Pull request", subtitle: sel.task, actions: [refresh] }, [item(note(t, s.message))], [
       div().flex_1(),
       button(t, "pr-create", "Push and open a draft PR", () => {
         sr(["task", "pr", sel.project, sel.task, "--create"], 300000).then((r) =>
@@ -197,8 +329,8 @@ export class PrPanel extends Loading {
     const review = { APPROVED: ["✓ approved", t.ansi2], CHANGES_REQUESTED: ["✗ changes requested", t.ansi1] }[p.review] ?? (p.review ? ["◷ review required", t.ansi3] : null);
     const threads = p.threads.length;
     const head = { title: "Pull request", badge: `#${p.number}`, subtitle: sel.task, actions: [headButton(t, "pr-open", "GitHub ↗", () => openUrl(p.url)), refresh] };
-    const body = v_flex()
-      .child(v_flex().p(8).gap(8)
+    const items = [
+      item(v_flex().p(8).gap(8)
         .child(h_flex().gap(8).flex_wrap().items_center()
           .child(pill(p.state, stateColor, t.background))
           .when(Boolean(review), (el) => el.child(div().text_size(12).text_color(review[1]).child(review[0])))
@@ -211,23 +343,24 @@ export class PrPanel extends Loading {
           .child(div().text_color(t.ansi2).child(`✓ ${count("pass")} passed`))
           .when(count("fail") > 0, (el) => el.child(div().text_color(t.ansi1).child(`✗ ${count("fail")} failed`)))
           .when(count("pending") > 0, (el) => el.child(div().text_color(t.ansi3).child(`◷ ${count("pending")} pending`)))
-          .when(count("skipped") > 0, (el) => el.child(div().text_color(t.dim).child(`⤼ ${count("skipped")} skipped`)))))
-      .when(attention.length > 0, (el) => el.child(heading(t, "Checks"))
-        .children(attention.map((c, i) => h_flex().id(`pr-check-${i}`).h(28).px(8).gap(8).items_center().rounded(7).text_size(12)
-          .when(Boolean(c.url), (el) => el.cursor_pointer().hover((st) => st.bg(t.hover)).on_click(() => openUrl(c.url)))
-          .child(div().w(14).text_color(c.state === "fail" ? t.ansi1 : t.ansi3).child(c.state === "fail" ? "✗" : "◷"))
-          .child(div().flex_1().min_w(0).truncate().child(c.name ?? "check")))))
-      .child(heading(t, threads ? `Unresolved review comments · ${threads}` : "No unresolved review comments"))
-      .children(p.threads.map((x, i) => card(`pr-thread-${i}`).hover((st) => st.bg(t.hover))
+          .when(count("skipped") > 0, (el) => el.child(div().text_color(t.dim).child(`⤼ ${count("skipped")} skipped`))))),
+      ...(attention.length ? [item(heading(t, "Checks"))] : []),
+      ...attention.map((c, i) => item(h_flex().id(`pr-check-${i}`).h(28).px(8).gap(8).items_center().rounded(7).text_size(12)
+        .when(Boolean(c.url), (el) => el.cursor_pointer().hover((st) => st.bg(t.hover)).on_click(() => openUrl(c.url)))
+        .child(div().w(14).text_color(c.state === "fail" ? t.ansi1 : t.ansi3).child(c.state === "fail" ? "✗" : "◷"))
+        .child(div().flex_1().min_w(0).truncate().child(c.name ?? "check")), c.url ? () => openUrl(c.url) : null)),
+      item(heading(t, threads ? `Unresolved review comments · ${threads}` : "No unresolved review comments")),
+      ...p.threads.map((x, i) => item(card(`pr-thread-${i}`).hover((st) => st.bg(t.hover))
         .child(h_flex().gap(6).text_size(12)
           .child(linkStyle(t, `pr-thread-link-${i}`, `${x.path.split("/").pop()}${x.line ? `:${x.line}` : ""}`, x.url))
           .child(div().text_color(t.dim).child(x.author ?? "reviewer")))
-        .child(TextView.markdown(`pr-thread-body-${i}`, firstParagraph(x.body)))));
+        .child(TextView.markdown(`pr-thread-body-${i}`, firstParagraph(x.body))), x.url ? () => openUrl(x.url) : null)),
+    ];
     const footer = threads > 0 ? [
       div().flex_1().min_w(0).truncate().text_size(12).text_color(t.dim).child("Into its prompt, not sent yet"),
       button(t, "pr-send", `Send ${threads} to the agent`, () => this.sendThreads(sel, p)),
     ] : null;
-    return frame(t, "pr", head, body, footer);
+    return this.frame(t, head, items, footer);
   }
 }
 
@@ -244,19 +377,24 @@ export class TicketPanel extends Loading {
   key(sel) { return sel?.ref && sel.linear ? `${sel.ref}` : null; }
   fetch(sel) { return sr(["session", "ticket", sel.ref], 60000); }
 
+  keys() {
+    const k = this.state.status === "ready" ? this.state.value : null;
+    return k ? { o: ["Linear", () => openUrl(k.url)] } : {};
+  }
+
   render() {
     const t = theme();
     const sel = selection();
     const s = this.state;
-    if (!sel?.task) return frame(t, "ticket", { title: "Ticket" }, note(t, "Select a task or one of its sessions."));
-    if (!sel.linear) return frame(t, "ticket", { title: "Ticket", subtitle: sel.task }, note(t, "No Linear ticket is linked to this task. Its main session links one when its name, branch or prompt names it; or: showrunner task set-linear."));
+    if (!sel?.task) return this.frame(t, { title: "Ticket" }, [item(note(t, "Select a task or one of its sessions."))]);
+    if (!sel.linear) return this.frame(t, { title: "Ticket", subtitle: sel.task }, [item(note(t, "No Linear ticket is linked to this task. Its main session links one when its name, branch or prompt names it; or: showrunner task set-linear."))]);
     const refresh = headButton(t, "tk-refresh", "↻", (_e, cx) => this.reload(cx));
-    if (s.status !== "ready") return frame(t, "ticket", { title: "Ticket", badge: sel.linear, subtitle: sel.task, actions: [refresh] }, note(t, s.status === "error" ? s.message : "Loading the ticket…"));
+    if (s.status !== "ready") return this.frame(t, { title: "Ticket", badge: sel.linear, subtitle: sel.task, actions: [refresh] }, [item(note(t, s.status === "error" ? s.message : "Loading the ticket…"))]);
     const k = s.value;
     const comments = k.comments?.nodes ?? [];
     const head = { title: "Ticket", badge: k.identifier, subtitle: sel.task, actions: [headButton(t, "tk-open", "Linear ↗", () => openUrl(k.url)), refresh] };
-    const body = v_flex()
-      .child(v_flex().p(8).gap(8)
+    const items = [
+      item(v_flex().p(8).gap(8)
         .child(h_flex().gap(8).flex_wrap().items_center()
           .child(pill(`${TICKET_GLYPH[k.state?.type] ?? "◇"} ${k.state?.name ?? ""}`, k.state?.color ?? t.accent, /^#[0-9a-f]{6}$/i.test(k.state?.color ?? "") ? textOn(k.state.color) : "#ffffff"))
           .children((k.labels?.nodes ?? []).map((l) => h_flex().gap(4).items_center().text_size(12)
@@ -265,13 +403,14 @@ export class TicketPanel extends Loading {
         .child(h_flex().gap(12).flex_wrap().text_size(12).text_color(t.muted)
           .child(div().child(k.assignee ? `👤 ${k.assignee.displayName}` : "👤 unassigned"))
           .when(k.priorityLabel && k.priorityLabel !== "No priority", (el) => el.child(div().child(`⚑ ${k.priorityLabel}`)))
-          .when(Boolean(k.creator), (el) => el.child(div().child(`✎ ${k.creator.displayName}`)))))
-      .child(div().px(8).pb(8).child(TextView.markdown("tk-description", k.description?.trim() || "_No description._")))
-      .when(comments.length > 0, (el) => el.child(heading(t, `Comments · ${comments.length}`))
-        .children(comments.map((c, i) => card(`tk-comment-${i}`)
-          .child(div().text_size(12).text_color(t.dim).child(`${c.user?.displayName ?? "someone"} · ${c.createdAt.slice(0, 10)}`))
-          .child(TextView.markdown(`tk-comment-body-${i}`, c.body)))));
-    return frame(t, "ticket", head, body);
+          .when(Boolean(k.creator), (el) => el.child(div().child(`✎ ${k.creator.displayName}`))))),
+      item(div().px(8).pb(8).child(TextView.markdown("tk-description", k.description?.trim() || "_No description._"))),
+      ...(comments.length ? [item(heading(t, `Comments · ${comments.length}`))] : []),
+      ...comments.map((c, i) => item(card(`tk-comment-${i}`)
+        .child(div().text_size(12).text_color(t.dim).child(`${c.user?.displayName ?? "someone"} · ${c.createdAt.slice(0, 10)}`))
+        .child(TextView.markdown(`tk-comment-body-${i}`, c.body)))),
+    ];
+    return this.frame(t, head, items);
   }
 }
 
@@ -287,8 +426,8 @@ export class IdeasPanel extends Loading {
     this.input = InputState.new({ placeholder: "An idea for later…" });
     this.input.on("change", (_e, cx) => { this.draft = this.input.value(); cx.notify(); });
     this.input.on("submit", (_e, cx) => this.add(cx));
-    this.input.on("focus", (_e, cx) => { this.typing = true; cx.notify(); });
-    this.input.on("blur", (_e, cx) => { this.typing = false; cx.notify(); });
+    this.input.on("focus", (_e, cx) => { this.adding = true; cx.notify(); });
+    this.input.on("blur", (_e, cx) => { this.adding = false; cx.notify(); });
     this.editing = null;
     this.edit = InputState.new({});
     this.edit.on("submit", (_e, cx) => {
@@ -296,12 +435,39 @@ export class IdeasPanel extends Loading {
       const id = this.editing;
       this.editing = null;
       if (text && id) this.change(cx, ["edit", id, text]);
+      this.handle.focus();
       cx.notify();
     });
   }
 
   key(sel) { return sel?.ref ?? null; }
   fetch(sel) { return sr(["ideas", "list", "--json", "--for", sel.ref]); }
+
+  get pickLabel() {
+    const idea = this.state.status === "ready" ? this.state.value[this.pos] : null;
+    return idea && !idea.sent && !idea.started ? "send" : null;
+  }
+  typing() { return this.adding || Boolean(this.editing); }
+  escape() { this.editing = null; }
+
+  keys() {
+    const list = this.state.status === "ready" ? this.state.value : [];
+    const idea = list[this.pos];
+    const open = idea && !idea.sent && !idea.started;
+    return {
+      e: [open ? "edit" : null, (cx) => open && this.startEdit(cx, idea)],
+      d: [idea ? "delete" : null, (cx) => idea && this.change(cx, ["remove", idea.id])],
+      a: ["add", () => this.input.focus()],
+      w: [list.filter((x) => !x.sent && !x.started).length > 1 ? "work through all" : null, (cx) => this.workThrough(cx)],
+    };
+  }
+
+  startEdit(cx, idea) {
+    this.editing = idea.id;
+    this.edit.set_value(idea.text);
+    this.edit.focus();
+    cx.notify();
+  }
 
   add(cx) {
     const text = this.input.value().trim();
@@ -346,7 +512,7 @@ export class IdeasPanel extends Loading {
   render() {
     const t = theme();
     const sel = selection();
-    if (!sel?.ref) return frame(t, "ideas", { title: "Ideas" }, note(t, "Select a task or session: its ideas show here."));
+    if (!sel?.ref) return this.frame(t, { title: "Ideas" }, [item(note(t, "Select a task or session: its ideas show here."))]);
     const list = this.state.status === "ready" ? this.state.value : [];
     const waiting = list.filter((x) => !x.sent && !x.started);
     const where = sel.task ?? `${sel.crumbs?.[0] ?? ""} adhoc`;
@@ -358,34 +524,34 @@ export class IdeasPanel extends Loading {
       subtitle: where,
       actions: waiting.length > 1 ? [headButton(t, "ideas-work", `Work through all ${waiting.length} ↗`, (_e, cx) => this.workThrough(cx))] : [],
     };
-    const body = v_flex()
-      .when(this.state.status === "loading" && !list.length, (el) => el.child(note(t, "Loading ideas…")))
-      .when(this.state.status === "error", (el) => el.child(note(t, this.state.message)))
-      .when(this.state.status === "ready" && !list.length, (el) => el.child(note(t, "Jot down ideas here while the sessions work. Send one on its own, or let the session work through them all.")))
-      .children(list.map((idea, i) => {
+    const empty = this.state.status === "error" ? this.state.message
+      : list.length ? null
+      : this.state.status === "ready" ? "Jot down ideas here while the sessions work. Send one on its own, or let the session work through them all."
+      : "Loading ideas…";
+    const items = empty ? [item(note(t, empty))] : list.map((idea, i) => {
         const mark = idea.started ? ["●", t.ansi3, "the session is on it"] : idea.sent ? ["↗", t.accent, "sent, waiting for the session"] : ["○", t.dim, null];
         const canEdit = !idea.sent && !idea.started;
         if (this.editing === idea.id)
-          return h_flex().px(8).py(4).gap(8).items_center()
+          return item(h_flex().px(8).py(4).gap(8).items_center()
             .child(div().w(14).text_color(t.accent).child("✎"))
             .child(div().flex_1().min_w(0).h(32).px(10).flex().items_center().rounded(8).border_1().border_color(t.accent)
               .child(Input.new(this.edit).h_full().text_size(12).text_color(t.foreground)))
-            .child(small(`idea-cancel-${idea.id}`, "Cancel", (_e, cx) => { this.editing = null; cx.notify(); }));
-        return h_flex().id(`idea-${idea.id}`).min_h(28).px(8).py(5).gap(8).items_start().rounded(7).hover((s) => s.bg(t.hover))
+            .child(small(`idea-cancel-${idea.id}`, "Cancel", (_e, cx) => { this.editing = null; cx.notify(); })), () => {});
+        return item(h_flex().id(`idea-${idea.id}`).min_h(28).px(8).py(5).gap(8).items_start().rounded(7).hover((s) => s.bg(t.hover))
           .child(div().w(14).text_color(mark[1]).child(mark[0]))
           .child(v_flex().flex_1().min_w(0)
             .child(h_flex().gap(5).items_start().child(div().text_color(t.dim).child(`${i + 1}.`)).child(div().flex_1().min_w(0).child(idea.text)))
             .when(Boolean(mark[2]), (el) => el.child(div().text_size(11).text_color(mark[1]).child(mark[2]))))
-          .when(canEdit, (el) => el.child(small(`idea-edit-${idea.id}`, "✎", (_e, cx) => { this.editing = idea.id; this.edit.set_value(idea.text); this.edit.focus(); cx.notify(); })))
+          .when(canEdit, (el) => el.child(small(`idea-edit-${idea.id}`, "✎", (_e, cx) => this.startEdit(cx, idea))))
           .when(canEdit, (el) => el.child(small(`idea-send-${idea.id}`, "send ↗", (_e, cx) => this.send(cx, idea))))
-          .child(small(`idea-remove-${idea.id}`, "×", (_e, cx) => this.change(cx, ["remove", idea.id])));
-      }));
+          .child(small(`idea-remove-${idea.id}`, "×", (_e, cx) => this.change(cx, ["remove", idea.id]))), (cx) => canEdit && this.send(cx, idea));
+      });
     const footer = [
-      div().id("idea-new").flex_1().min_w(0).h(32).px(10).flex().items_center().rounded(8).border_1().border_color(this.typing ? t.accent : t.border)
+      div().id("idea-new").flex_1().min_w(0).h(32).px(10).flex().items_center().rounded(8).border_1().border_color(this.adding ? t.accent : t.border)
         .cursor_text().on_mouse_down("left", (_e, cx) => cx.stop_propagation())
         .child(Input.new(this.input).h_full().text_size(12).text_color(t.foreground)),
       button(t, "idea-add", "Add", (_e, cx) => this.add(cx), Boolean(this.draft.trim())),
     ];
-    return frame(t, "ideas", head, body, footer);
+    return this.frame(t, head, items, footer);
   }
 }
