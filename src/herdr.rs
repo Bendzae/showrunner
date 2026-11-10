@@ -50,12 +50,14 @@ const FILES: &[(&str, &str)] = files![
 ];
 
 /// The keys, in the layout's own section: `Ctrl-/` jumps between the tree and
-/// the terminal, `Ctrl-'` picks the right panel, `Ctrl-;` opens the Coordinator.
+/// the terminal, `Ctrl-'` picks the right panel, `Ctrl-;` opens the Coordinator,
+/// `Cmd-K` switches sessions.
 const KEY_SECTION: &str = "layout:showrunner";
-const KEYS: [(&str, &str); 3] = [
+const KEYS: [(&str, &str); 4] = [
     ("ctrl-/", "showrunner.toggle"),
     ("ctrl-'", "showrunner.panels"),
     ("ctrl-;", "showrunner.coordinator"),
+    ("cmd-k", "showrunner.switcher"),
 ];
 
 pub fn default_home() -> PathBuf {
@@ -142,8 +144,9 @@ pub fn install(home: &Path, bin: Option<&str>, keys: bool) -> Result<Installed> 
             fs::write(&path, serde_json::to_string_pretty(&map)? + "\n")?;
             notes.push(
                 "keys.json: in the Showrunner layout ctrl-/ jumps between the tree and the \
-                 terminal, ctrl-' picks the right panel, ctrl-; opens the coordinator (Herdr no \
-                 longer updates an edited keys.json's defaults: add new ones by hand)"
+                 terminal, ctrl-' picks the right panel, ctrl-; opens the coordinator, cmd-k \
+                 switches sessions (Herdr no longer updates an edited keys.json's defaults: add \
+                 new ones by hand)"
                     .to_string(),
             );
         }

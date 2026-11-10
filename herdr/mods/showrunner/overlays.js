@@ -4,9 +4,9 @@
 import { div, svg, image } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, TextareaState, Textarea } from "gpui-base";
 import { props, closeOverlay, theme, settings, pickFolder, home, run } from "herdr";
-import { menuItems, enqueue } from "./lib.js";
+import { menuItems, enqueue, show } from "./lib.js";
 import { FORMS, PICKERS, agentChoices, loadKnownAgents, toBranch } from "./actions.js";
-import { icon, keycap } from "./ui.js";
+import { icon, keycap, statusGlyph } from "./ui.js";
 import { showPanel } from "./panels.js";
 
 // Closing gives the keyboard back to the tree, then has it run `jobs` (which
@@ -321,6 +321,89 @@ export class Picker {
             .when(x.value === current && !x.create, (el) => el.child(icon("check", 13, t.accent)));
         })));
   }
+}
+
+// The session switcher (⌘K): the tree's running sessions in its order, fuzzy
+// filtered; Enter shows one with the keyboard in its terminal.
+export class Switcher {
+  init(cx) {
+    this.query = "";
+    this.at = 0;
+    this.input = InputState.new({ placeholder: "Jump to a session" });
+    this.input.on("change", (_e, cx) => { this.query = this.input.value(); this.at = 0; cx.notify(); });
+    this.input.on("submit", (_e, cx) => { this.pick(this.matches()[this.at]); cx.notify(); });
+    this.input.focus();
+    cx.timer.after(300, () => this.input.focus());
+  }
+
+  matches() {
+    const q = this.query.trim();
+    return (props().entries ?? []).map((x, i) => [fuzzy(q, x.label), i, x]).filter(([s]) => s !== null)
+      .sort((a, b) => a[0] - b[0] || a[1] - b[1]).map(([, , x]) => x);
+  }
+
+  pick(x) {
+    if (!x) return;
+    show(x.space, x.tab, x.address, true);
+    closeOverlay(props().overlay);
+  }
+
+  // Back to where the keyboard was: the tree, or a pane.
+  cancel() {
+    const back = props().back;
+    if (back === "tree") return close();
+    if (back) run("pane.focus", { pane: back });
+    closeOverlay(props().overlay);
+  }
+
+  render() {
+    const t = theme();
+    const list = this.matches();
+    this.at = Math.min(this.at, Math.max(0, list.length - 1));
+    const ROW = 32, MAX = 320;
+    const fit = Math.floor(MAX / ROW);
+    const start = Math.max(0, Math.min(this.at - Math.floor(fit / 2), list.length - fit));
+    const step = (by) => { this.at = Math.max(0, Math.min(list.length - 1, this.at + by)); };
+    const sep = () => div().flex_none().text_color(t.dim).child("–");
+    return v_flex().id("sr-switcher").w_full().min_h(0).p(18).gap(10).bg(t.popover).text_size(13)
+      .on_key_down((e, cx) => {
+        const ctrl = e.modifiers?.control;
+        if (e.key === "escape") this.cancel();
+        else if (e.key === "down" || (ctrl && e.key === "n")) step(1);
+        else if (e.key === "up" || (ctrl && e.key === "p")) step(-1);
+        else return;
+        cx.stop_propagation();
+        cx.notify();
+      })
+      .child(title(t, "Sessions", "↑↓ · Enter · Esc"))
+      .child(h_flex().h(36).flex_none().px(10).gap(8).items_center().rounded(9).border_1().border_color(t.accent).bg(t.background)
+        .child(icon("search", 15, t.dim))
+        .child(Input.new(this.input).flex_1().h_full().text_size(12.8).text_color(t.foreground)))
+      .child(v_flex().h(MAX).min_h(0)
+        .when(!list.length, (el) => el.child(div().p(8).text_color(t.dim).child(this.query ? "Nothing matches" : "No other running sessions")))
+        .children(list.slice(start, start + fit).map((x, i) => {
+          const index = start + i;
+          const [project, task, session] = x.parts;
+          const label = h_flex().flex_1().min_w(0).gap(6).items_center()
+            .child(div().flex_shrink(0).max_w(150).truncate().text_color(t.muted).child(project))
+            .when(Boolean(task), (el) => el.child(sep()).child(div().flex_shrink(1).min_w(0).truncate().text_color(t.foreground).child(task)))
+            .when(Boolean(session), (el) => el.child(sep()).child(div().flex_shrink(0).max_w(140).truncate().text_color(t.muted).child(session)));
+          const note = x.status === "blocked" ? ["needs you", t.blocked] : x.status === "done" ? ["done", t.done] : x.at ? [ago(x.at), t.dim] : null;
+          return h_flex().id(`sr-sw-${index}`).h(ROW).flex_none().px(10).gap(9).rounded(7).items_center()
+            .when(index === this.at, (el) => el.bg(t.selected))
+            .hover((s) => s.bg(t.hover))
+            .on_click(() => this.pick(x))
+            .child(statusGlyph(t, x.status))
+            .child(label)
+            .when(Boolean(note), (el) => el.child(div().flex_none().text_size(11).text_color(note[1]).child(note[0])));
+        })));
+  }
+}
+
+// How long ago, shortly: "now", "5m", "3h", "2d".
+function ago(ms) {
+  const s = (Date.now() - ms) / 1000;
+  return s < 60 ? "now" : s < 3600 ? `${Math.floor(s / 60)}m` : s < 86400 ? `${Math.floor(s / 3600)}h` : `${Math.floor(s / 86400)}d`;
 }
 
 // Case-insensitive subsequence match, as the TUI's picker: lower is better.

@@ -47,6 +47,8 @@ export class Tree {
     this.filtering = false;
     this.filter = "";
     this.sel = localStorage.getItem("selected");
+    // When each tab was last left: the session switcher's "last used".
+    this.visited = JSON.parse(localStorage.getItem("visited") ?? "{}");
     this.scroll = 0;
     this.listHeight = 600;
     this.renamed = new Set();
@@ -95,6 +97,7 @@ export class Tree {
     else if (c === "jobs") this.runJobs(cx);
     else if (c === "panels") this.panelMenu();
     else if (c === "coordinator") this.openCoordinator();
+    else if (c === "switcher") this.openSwitcher();
     // `showrunner.select:<row key>`, e.g. `s:cm__app__fix__main` or `t:app/Fix login`.
     else if (c.startsWith("select:")) { this.expandTo(c.slice(7)); this.select(c.slice(7)); this.handle.focus(); }
   }
@@ -117,6 +120,31 @@ export class Tree {
     if (live) return show(c.space, c.cm_name, live.address, true);
     act("Starting the coordinator", ["coordinator"],
       { success: "Coordinator started", after: { reveal: { space: c.space, tab: c.cm_name, focus: true } } });
+  }
+
+  // The session switcher (⌘K): every running session but the one on screen,
+  // those that need you first, then the ones done since you looked, then the
+  // most recently used.
+  openSwitcher() {
+    const live = liveSessions(this.guessed);
+    const current = spaces().find((s) => s.active)?.tabs?.find((t) => t.active)?.id;
+    const entries = [];
+    const add = (parts, space, cm) => {
+      const l = live[cm];
+      if (!l || cm === current) return;
+      const at = this.visited[cm] ?? (this.stats.sessions[cm]?.last_active ?? 0) * 1000;
+      entries.push({ parts, label: parts.join(" - "), space, tab: cm, address: l.address, status: l.status, at });
+    };
+    const c = this.data?.coordinator;
+    if (c) add(["Coordinator"], c.space, c.cm_name);
+    for (const p of this.data?.projects ?? []) {
+      for (const s of p.adhoc_sessions ?? []) add([p.name, "adhoc", s.name], p.space, s.cm_name);
+      for (const t of p.tasks ?? []) for (const s of t.sessions ?? []) add([p.name, t.name, s.name], t.space, s.cm_name);
+    }
+    const rank = (s) => ({ blocked: 0, done: 1 })[s] ?? 2;
+    entries.sort((a, b) => rank(a.status) - rank(b.status) || b.at - a.at);
+    const back = this.handle.is_focused() ? "tree" : focused()?.pane ?? null;
+    openOverlay({ mod: "showrunner", kind: "dialog", width: 600, height: 430, props: { view: "switcher", entries, back } });
   }
 
   // Back to the terminal on screen.
@@ -418,6 +446,10 @@ export class Tree {
     const space = spaces().find((s) => s.active);
     const tab = space?.tabs?.find((t) => t.active)?.id ?? null;
     if (tab === this.lastTab) return;
+    if (this.lastTab) {
+      this.visited[this.lastTab] = Date.now();
+      localStorage.setItem("visited", JSON.stringify(this.visited));
+    }
     const first = this.lastTab === undefined;
     this.lastTab = tab;
     // On start, the selection remembered from last time stays.

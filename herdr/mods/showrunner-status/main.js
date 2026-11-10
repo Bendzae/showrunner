@@ -46,6 +46,7 @@ export default class ShowrunnerStatus extends View {
         .child(hint("/", "filter"))
         .child(hint("⌃/", "tree ⇄ terminal"))
         .child(hint("⌃'", "panels"))
-        .child(hint("⌃;", "coordinator"))));
+        .child(hint("⌃;", "coordinator"))
+        .child(hint("⌘K", "sessions"))));
   }
 }
