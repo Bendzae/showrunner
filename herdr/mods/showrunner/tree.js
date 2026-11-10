@@ -757,7 +757,6 @@ export class Tree {
           .child(chevron(r.folded))
           .child(icon("layers", 12, t.dim))
           .child(div().flex_shrink(1).min_w(0).truncate().text_size(12).text_color(t.muted).child(r.label))
-          .when(r.folded, (el) => el.child(div().flex_none().text_size(11).text_color(t.dim).child(String(r.count))))
           .when(Boolean(hidden?.hot), (el) => el.child(fire))
           .child(div().flex_1())
           .when(Boolean(activityBadge(t, hidden)), (el) => el.child(activityBadge(t, hidden)));
@@ -797,7 +796,6 @@ export class Tree {
           .child(r.count ? chevron(r.folded) : div().size(12).flex_none())
           .child(icon("house", 12, t.accent))
           .child(div().text_size(12).text_color(r.count ? t.muted : t.dim).child("adhoc"))
-          .when(r.folded && r.count > 0, (el) => el.child(div().text_size(11).text_color(t.dim).child(String(r.count))))
           .when(Boolean(hidden?.hot), (el) => el.child(fire))
           .child(div().flex_1())
           .when(Boolean(activityBadge(t, hidden)), (el) => el.child(activityBadge(t, hidden)));
