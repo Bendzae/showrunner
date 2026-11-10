@@ -729,6 +729,10 @@ export class Tree {
     // to the rows under it.
     const hidden = r.folded ? r.activity : null;
     const fire = div().flex_none().text_size(11).child("🔥");
+    // How many tasks (sessions) a folded group (adhoc) holds, boxed so it
+    // doesn't read as a count of what's beside it.
+    const countBox = (n, noun) => div().id(`sr-count-${r.key}`).flex_none().px(4).rounded(4).border_1().border_color(t.border)
+      .text_size(10).text_color(t.dim).tooltip(`${n} ${noun}${n === 1 ? "" : "s"}`).child(String(n));
     const runMark = (name) => {
       const live = name && runs[name];
       if (!live) return null;
@@ -759,7 +763,8 @@ export class Tree {
           .child(div().flex_shrink(1).min_w(0).truncate().text_size(12).text_color(t.muted).child(r.label))
           .when(Boolean(hidden?.hot), (el) => el.child(fire))
           .child(div().flex_1())
-          .when(Boolean(activityBadge(t, hidden)), (el) => el.child(activityBadge(t, hidden)));
+          .when(Boolean(activityBadge(t, hidden)), (el) => el.child(activityBadge(t, hidden)))
+          .when(r.folded, (el) => el.child(countBox(r.count, "task")));
       case "task": {
         const { task } = r.item;
         const needs = r.folded && r.status === "blocked";
@@ -798,7 +803,8 @@ export class Tree {
           .child(div().text_size(12).text_color(r.count ? t.muted : t.dim).child("adhoc"))
           .when(Boolean(hidden?.hot), (el) => el.child(fire))
           .child(div().flex_1())
-          .when(Boolean(activityBadge(t, hidden)), (el) => el.child(activityBadge(t, hidden)));
+          .when(Boolean(activityBadge(t, hidden)), (el) => el.child(activityBadge(t, hidden)))
+          .when(r.folded && r.count > 0, (el) => el.child(countBox(r.count, "session")));
       case "session":
       case "adhoc":
       case "stopped": {
