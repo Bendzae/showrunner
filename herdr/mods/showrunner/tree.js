@@ -7,8 +7,8 @@ import { v_flex, h_flex, InputState, Input } from "gpui-base";
 import { spaces, focused, run, theme, settings, shared, setShared, nextCommand, readTextFile, window, layout, themes, openOverlay } from "herdr";
 import { sr, clean, loadConfig, liveSessions, liveRuns, guessedStatus, worst, menuItems, show, runAct } from "./lib.js";
 import { perform, openMenu, form } from "./actions.js";
-import { togglePanel, panelEntries } from "./panels.js";
-import { icon, programIcon, statusGlyph, prBadge, diffBadge, avatar, avatarColor, linearId, prSummary } from "./ui.js";
+import { togglePanel, showPanel, panelEntries } from "./panels.js";
+import { icon, programIcon, statusGlyph, prColor, diffBadge, avatar, avatarColor, linearId, prSummary } from "./ui.js";
 
 const H = { project: 34, group: 26, task: 28, session: 26, stopped: 26, "adhoc-group": 26, adhoc: 26, "other-head": 32, space: 28, hint: 30 };
 const HOT_SECONDS = 2 * 3600;
@@ -701,7 +701,7 @@ export class Tree {
 
   row(r, t, { selected, treeFocused, activeTab, runs }) {
     const indent = 6 + r.depth * 12;
-    const base = h_flex().id(`sr-${r.key}`).px(6).pl(indent).gap(7).items_center().rounded(7)
+    const base = h_flex().id(`sr-${r.key}`).px(6).pl(indent).gap(4).items_center().rounded(7)
       .border_1().border_color(selected && treeFocused ? t.accent : "#00000000")
       .when(selected && treeFocused, (el) => el.bg(t.selected))
       .when(!(selected && treeFocused), (el) => el.hover((s) => s.bg(t.hover)))
@@ -712,7 +712,7 @@ export class Tree {
         cx.notify();
       })
       .on_mouse_down("right", (_e, cx) => { this.select(r.key); this.menu(r, "pointer"); cx.notify(); });
-    const chevron = (folded) => div().id(`sr-fold-${r.key}`).size(14).flex_none().flex().items_center().justify_center().text_color(t.dim)
+    const chevron = (folded) => div().id(`sr-fold-${r.key}`).size(12).flex_none().flex().items_center().justify_center().text_color(t.dim)
       .on_click((_e, cx) => { cx.stop_propagation(); this.toggle(r.key); cx.notify(); })
       .child(icon(folded ? "chevron-right" : "chevron-down", 11));
     const runMark = (name) => {
@@ -729,7 +729,7 @@ export class Tree {
         return base.mt(4).pl(4)
           .child(chevron(r.folded))
           .child(avatar(project.name))
-          .child(div().flex_shrink(0).max_w(170).truncate().font_semibold().text_color(t.foreground).child(project.name))
+          .child(div().id(`sr-name-${r.key}`).flex_shrink(0).max_w(170).truncate().font_semibold().text_color(t.foreground).tooltip(project.name).child(project.name))
           .child(div().flex_1())
           .when(r.folded && r.needs > 0, (el) => el.child(h_flex().h(16).px(5).rounded(4).bg(t.blocked).items_center()
             .text_size(10.5).font_bold().text_color(t.background).child(`${r.needs} !`)))
@@ -748,24 +748,36 @@ export class Tree {
         const { task } = r.item;
         const needs = r.status === "blocked";
         const ticket = linearId(task.linear);
+        // The task's PR or ticket in the right panel; again hides it.
+        const panelIcon = (view, name, color, tip) => div().id(`sr-${view}-${r.key}`).size(18).flex_none().flex().items_center().justify_center()
+          .rounded(5).hover((s) => s.bg(t.hover)).tooltip(tip)
+          .on_click((_e, cx) => {
+            cx.stop_propagation();
+            const same = this.sel === r.key;
+            this.select(r.key);
+            same ? togglePanel(view) : showPanel(view);
+            cx.notify();
+          })
+          .child(icon(name, 13, color));
         return base
           .child(chevron(r.folded))
           .child(statusGlyph(t, r.status))
-          .child(div().flex_shrink(1).min_w(0).truncate()
+          .child(div().id(`sr-name-${r.key}`).flex_shrink(1).min_w(0).truncate()
             .text_color(needs ? t.blocked : task.archived ? t.muted : t.foreground)
             .when(this.activeSpace(r.item.space), (el) => el.font_semibold())
+            .tooltip(task.name)
             .child(task.name))
           .when(r.hot, (el) => el.child(div().flex_none().text_size(11).child("🔥")))
           .when(task.stack?.size > 1, (el) => el.child(div().flex_none().text_size(10.5).text_color(t.dim).child(`${task.stack.position}/${task.stack.size}`)))
           .child(div().flex_1())
           .when(Boolean(runMark(r.item.run)), (el) => el.child(runMark(r.item.run)))
-          .when(Boolean(ticket), (el) => el.child(div().flex_none().text_size(10.5).text_color(t.dim).child(ticket)))
-          .when(Boolean(task.pr), (el) => el.child(prBadge(t, task.pr)))
+          .when(Boolean(ticket), (el) => el.child(panelIcon("ticket", "ticket", t.dim, ticket)))
+          .when(Boolean(task.pr), (el) => el.child(panelIcon("pr", "git-pull-request", prColor(t, task.pr), prSummary(task.pr))))
           .when(Boolean(diffBadge(t, r.diff)), (el) => el.child(diffBadge(t, r.diff)));
       }
       case "adhoc-group":
         return base
-          .child(r.count ? chevron(r.folded) : div().size(14).flex_none())
+          .child(r.count ? chevron(r.folded) : div().size(12).flex_none())
           .child(icon("house", 12, t.accent))
           .child(div().flex_1().text_size(12).text_color(r.count ? t.muted : t.dim).child("adhoc"))
           .when(r.folded && Boolean(r.status) && r.status !== "idle", (el) => el.child(statusGlyph(t, r.status)))

@@ -37,22 +37,18 @@ export function statusGlyph(t, status, size = 12) {
   }
 }
 
-const REVIEW = { approved: ["✓", "ansi2"], changes_requested: ["✗", "ansi1"], requested: ["◌", "muted"], not_requested: ["·", "dim"] };
-const CI = { passing: ["●", "ansi2"], failing: ["●", "ansi1"], pending: ["◍", "ansi3"] };
-const STATE = { open: "ansi2", draft: "muted", merged: "ansi5", closed: "ansi1" };
-
 export const prNumber = (url) => url?.split("/").pop() ?? "";
 
-// `#123 ✓ ●`: number in the state's color, then review and CI (open PRs only).
-export function prBadge(t, pr) {
-  if (!pr) return null;
-  const final = pr.state === "merged" || pr.state === "closed";
-  const review = REVIEW[pr.review];
-  const ci = pr.checks && CI[pr.checks];
-  return h_flex().flex_none().gap(3).items_center().text_size(11.5)
-    .child(div().text_color(t[STATE[pr.state]] ?? t.muted).child(`#${prNumber(pr.url)}${pr.state === "draft" ? " draft" : final ? ` ${pr.state}` : ""}`))
-    .when(!final && Boolean(review), (el) => el.child(div().text_color(t[review[1]] ?? t.dim).child(review[0])))
-    .when(!final && Boolean(ci), (el) => el.child(div().text_color(t[ci[1]]).child(ci[0])));
+// One color for a PR, what matters most first: it's done, CI failed or
+// changes were asked for, CI runs, it's approved, it waits for review.
+export function prColor(t, pr) {
+  if (pr.state === "merged") return t.ansi5;
+  if (pr.state === "closed") return t.dim;
+  if (pr.state === "draft") return t.muted;
+  if (pr.checks === "failing" || pr.review === "changes_requested") return t.ansi1;
+  if (pr.checks === "pending") return t.ansi3;
+  if (pr.review === "approved") return t.ansi2;
+  return t.accent;
 }
 
 export function prSummary(pr) {
@@ -65,11 +61,17 @@ export function prSummary(pr) {
   return parts.join(" · ");
 }
 
+// 1234 → 1.2k, 12345 → 12k.
+export function short(n) {
+  if (n < 1000) return String(n);
+  return n < 10000 ? `${(n / 1000).toFixed(1).replace(/\.0$/, "")}k` : `${Math.round(n / 1000)}k`;
+}
+
 export function diffBadge(t, diff) {
   if (!diff || (!diff.added && !diff.removed)) return null;
-  return h_flex().flex_none().gap(3).text_size(11.5)
-    .child(div().text_color(diff.added ? t.ansi2 : t.dim).child(`+${diff.added}`))
-    .child(div().text_color(diff.removed ? t.ansi1 : t.dim).child(`−${diff.removed}`));
+  return h_flex().flex_none().gap(2).text_size(11)
+    .child(div().text_color(diff.added ? t.ansi2 : t.dim).child(`+${short(diff.added)}`))
+    .child(div().text_color(diff.removed ? t.ansi1 : t.dim).child(`−${short(diff.removed)}`));
 }
 
 // One strong color per hue, light and dark alike (as Herdr's space avatars).
