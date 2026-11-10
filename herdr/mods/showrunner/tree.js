@@ -90,7 +90,7 @@ export class Tree {
     else if (c.startsWith("select:")) { this.select(c.slice(7)); this.handle.focus(); }
   }
 
-  // Which right panel to show, from anywhere (⌃.); the keyboard goes back
+  // Which right panel to show, from anywhere (⌃'); the keyboard goes back
   // where it was.
   panelMenu() {
     const entries = panelEntries();
