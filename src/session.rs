@@ -481,9 +481,9 @@ pub fn create_task_branch(project_path: &str, branch_name: &str, base: Option<&s
     Ok(())
 }
 
-/// Keep a task's base in git config where `gh` keeps it
-/// (`branch.<branch>.gh-merge-base`), so `gh pr create` and Herdr's reviewer
-/// compare against it. `None` removes it.
+/// Keep a branch's base (a task's base, a session branch's task branch) in git
+/// config where `gh` keeps it (`branch.<branch>.gh-merge-base`), so
+/// `gh pr create` and Herdr's reviewer compare against it. `None` removes it.
 pub fn record_base_branch(project_path: &str, branch: &str, base: Option<&str>) {
     let key = format!("branch.{branch}.gh-merge-base");
     let mut args = vec!["-C", project_path, "config"];
@@ -588,6 +588,9 @@ pub fn create_session_with(
         if !status.status.success() {
             let stderr = String::from_utf8_lossy(&status.stderr);
             bail!("Failed to create worktree: {stderr}");
+        }
+        if !is_main_session(session_name) {
+            record_base_branch(project_path, &session_branch, Some(task_branch));
         }
 
         prepare_worktree(
@@ -3623,6 +3626,26 @@ Some transcript output.\n\
             ],
         );
         repo
+    }
+
+    #[test]
+    fn base_branch_is_recorded_and_removed_in_git_config() {
+        let repo = scratch_repo("base");
+        let project = repo.to_string_lossy().to_string();
+        let key = "branch.task-x.gh-merge-base";
+
+        record_base_branch(&project, "task-x", Some("task"));
+        assert_eq!(git(&repo, &["config", key]), "task");
+
+        record_base_branch(&project, "task-x", None);
+        assert!(
+            !Command::new("git")
+                .args(["-C", &project, "config", key])
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::remove_dir_all(repo.parent().unwrap()).unwrap();
     }
 
     #[test]
