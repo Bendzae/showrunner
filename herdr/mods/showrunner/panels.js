@@ -115,16 +115,22 @@ const zoom = () => settings().zoom ?? 1;
 // A body that scrolls itself, so the keyboard can scroll it and keep a
 // selected item in view (gpui scrolls only virtual lists from code).
 class Scroller {
-  constructor(id) {
+  // `sticky`: kept at its end as what's in it grows, while it's scrolled there.
+  constructor(id, sticky = false) {
     this.id = id;
     this.y = 0;
     this.view = 0;
     this.heights = [];
+    this.sticky = sticky;
+    this.stuck = sticky;
   }
 
   content() { return this.heights.reduce((a, b) => a + (b ?? 0), 12); }
   max() { return Math.max(0, this.content() - this.view); }
   by(dy) { this.y = Math.max(0, Math.min(this.y + dy, this.max())); }
+  // After the person scrolled: a sticky list follows its end again once back there.
+  track() { this.stuck = this.sticky && this.y >= this.max() - 4; }
+  reset() { this.y = 0; this.stuck = this.sticky; }
 
   reveal(i) {
     const top = 6 + this.heights.slice(0, i).reduce((a, b) => a + (b ?? 0), 0), h = this.heights[i] ?? 0;
@@ -135,11 +141,12 @@ class Scroller {
 
   render(t, items) {
     this.heights.length = items.length;
+    if (this.stuck) this.y = this.max();
     this.by(0);
     const thumb = this.max() > 0 ? Math.max(24, this.view * this.view / this.content()) : 0;
     return div().id(this.id).flex_1().min_h(0).relative().overflow_hidden()
       .on_size_change((size, cx) => { this.view = size.height / zoom(); cx.notify(); })
-      .on_scroll_wheel((e, cx) => { this.by(-e.delta.y); cx.notify(); })
+      .on_scroll_wheel((e, cx) => { this.by(-e.delta.y); this.track(); cx.notify(); })
       .child(v_flex().absolute().left(0).right(0).top(-this.y).p(6).children(items))
       .when(thumb > 0, (el) => el.child(div().absolute().right(2).w(4).rounded(2).bg(t.border)
         .top((this.view - thumb) * this.y / this.max()).h(thumb)));
@@ -163,12 +170,12 @@ const item = (el, pick) => ({ el, pick });
 // `pane.go` (Ctrl-B h/l) moves onto it: j/k move (or scroll), Enter picks,
 // h or Esc goes back.
 class Loading {
-  init(cx, view, every) {
+  init(cx, view, every, sticky = false) {
     this.view = view;
     this.state = { status: "idle" };
     this.loaded = null;
     this.handle = cx.focus_handle();
-    this.scroller = new Scroller(`${view}-body`);
+    this.scroller = new Scroller(`${view}-body`, sticky);
     this.pos = 0;
     cx.timer.every(1000, (cx) => {
       const sel = selection();
@@ -195,7 +202,7 @@ class Loading {
     this.loaded = key;
     this.loadedAt = Date.now();
     if (!key) { this.state = { status: "idle" }; return cx.notify(); }
-    if (this.state.status !== "ready" || this.state.key !== key) { this.state = { status: "loading" }; this.pos = 0; this.scroller.y = 0; }
+    if (this.state.status !== "ready" || this.state.key !== key) { this.state = { status: "loading" }; this.pos = 0; this.scroller.reset(); }
     cx.notify();
     cx.spawn(async (cx) => {
       const r = await this.fetch(sel);
@@ -261,6 +268,7 @@ class Loading {
         }
       }
     }
+    this.scroller.track();
     cx.stop_propagation();
     cx.notify();
   }
@@ -574,8 +582,10 @@ export class IdeasPanel extends Loading {
 // (`showrunner session activity`), as the activity Claude mod shows it: the
 // main session and its subagents (nested under whoever started them), each
 // with its task list, its shell commands (the last lines they wrote) and the
-// call under way; the turn's time, progress and context fill on top. Enter or
-// a click folds an agent or a command; c clears what has finished.
+// call under way; the turn's time, progress and context fill on top. The
+// newest work is at the end, which the list keeps in view: the main session and
+// its subagents in the order they last did something, finished subagents
+// folded. Enter or a click folds an agent or a command; c clears what has finished.
 const ENDED = new Set(["completed", "failed", "killed"]);
 
 function duration(ms) {
@@ -588,9 +598,15 @@ function duration(ms) {
 
 const since = (start, end) => (start ? duration((end ? Date.parse(end) : Date.now()) - Date.parse(start)) : "");
 
+// When a loop last did something (timestamps sort as text).
+const lastActive = (l) => [l.started_at, l.ended_at, l.turn_started_at, l.current_at,
+  ...l.shells.flatMap((s) => [s.started_at, s.ended_at]), ...l.tasks.flatMap((x) => [x.started_at, x.ended_at])]
+  .filter(Boolean).sort().at(-1) ?? "";
+
 export class ActivityPanel extends Loading {
   init(cx) {
-    super.init(cx, "activity", 1500);
+    // The newest work is at the end: the list keeps to it.
+    super.init(cx, "activity", 1500, true);
     // Agents and commands opened or shut against how they'd be by default.
     this.flipped = new Set();
     // Per conversation: what ended before this was cleared away.
@@ -690,8 +706,8 @@ export class ActivityPanel extends Loading {
 
     const loopItems = (l, depth) => {
       const id = `loop:${l.id}`;
-      const open = this.isOpen(id, true);
       const isMain = l.id === "main";
+      const open = this.isOpen(id, isMain || !ENDED.has(l.status));
       const clock = isMain ? (l.status === "running" ? `turn ${since(l.turn_started_at)}` : "idle") : since(l.started_at, l.ended_at);
       const label = isMain ? l.label : `${l.label}${l.type ? ` · ${l.type}` : ""}`;
       const indent = 6 + depth * 14;
@@ -749,8 +765,8 @@ export class ActivityPanel extends Loading {
         .child(div().flex_none().text_size(11.5).font_semibold().child(`${pct}%`))
         .child(right(`${done}/${total}`))));
     }
-    loopItems(main, 0);
-    for (const agent of agents.filter((a) => a.parent === "main")) loopItems(agent, 0);
+    const sections = [main, ...agents.filter((a) => a.parent === "main")].sort((a, b) => lastActive(a).localeCompare(lastActive(b)));
+    for (const section of sections) loopItems(section, 0);
     if (!main.tasks.length && !main.shells.length && !main.current && !agents.length) {
       items.push(item(note(t, "Nothing yet: tasks, commands and subagents show here as the session works.")));
     }
