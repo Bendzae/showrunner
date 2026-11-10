@@ -208,7 +208,7 @@ export function menuItems(item) {
         { key: "B", label: "Set base branch", action: "set-base" },
         { key: "P", label: "Push", action: "push" },
         { key: "b", label: "Checkout", action: "checkout-task" },
-        { key: "o", label: task.pr ? "Show PR" : "Open PR", action: "open-pr" },
+        { key: "o", label: "Open PR", action: "open-pr" },
         { key: "g", label: "Set group", action: "set-group" },
         ...(task.linear ? [{ key: "l", label: "Show Linear ticket", action: "open-linear" }] : []),
         ...remote(item.main),
