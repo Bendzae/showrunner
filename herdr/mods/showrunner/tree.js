@@ -41,7 +41,8 @@ export class Tree {
     this.error = null;
     this.stats = { projects: {}, tasks: {}, sessions: {} };
     this.guessed = {};
-    this.collapsed = new Set(JSON.parse(localStorage.getItem("collapsed") ?? "[]"));
+    // Folded unless opened: projects, groups, tasks and adhoc start closed.
+    this.expanded = new Set(JSON.parse(localStorage.getItem("expanded") ?? "[]"));
     this.archived = false;
     this.filtering = false;
     this.filter = "";
@@ -93,7 +94,7 @@ export class Tree {
     else if (c === "jobs") this.runJobs(cx);
     else if (c === "panels") this.panelMenu();
     // `showrunner.select:<row key>`, e.g. `s:cm__app__fix__main` or `t:app/Fix login`.
-    else if (c.startsWith("select:")) { this.select(c.slice(7)); this.handle.focus(); }
+    else if (c.startsWith("select:")) { this.expandTo(c.slice(7)); this.select(c.slice(7)); this.handle.focus(); }
   }
 
   // Which right panel to show, from anywhere (⌃'); the keyboard goes back
@@ -188,16 +189,19 @@ export class Tree {
     });
   }
 
-  saveCollapsed() {
-    localStorage.setItem("collapsed", JSON.stringify([...this.collapsed]));
-  }
-
   toggle(key) {
-    this.collapsed.has(key) ? this.collapsed.delete(key) : this.collapsed.add(key);
-    this.saveCollapsed();
+    this.expanded.has(key) ? this.expanded.delete(key) : this.expanded.add(key);
+    localStorage.setItem("expanded", JSON.stringify([...this.expanded]));
   }
 
-  // Every row, in order: what the TUI's list shows, filtered and folded.
+  // Open the rows above a row, so it shows.
+  expandTo(key) {
+    const row = this.allRows?.find((r) => r.key === key);
+    for (const parent of row?.parents ?? []) if (!this.expanded.has(parent)) this.toggle(parent);
+  }
+
+  // Every row, in order, as the TUI lists them; `allRows` keeps the ones
+  // folded away, the result leaves them out.
   build(live) {
     const rows = [];
     this.names = {};
@@ -205,6 +209,8 @@ export class Tree {
     this.tabOrder = [];
     const f = this.filter.trim().toLowerCase();
     const has = (...xs) => !f || xs.some((x) => (x ?? "").toLowerCase().includes(f));
+    // A filter opens everything, so its matches show.
+    const open = (key) => Boolean(f) || this.expanded.has(key);
     const sessionInfo = (s, stopped) => ({
       cm_name: s.cm_name, name: s.name, agent: s.agent, worktree: s.worktree ?? null,
       run: s.run ?? null, live: !stopped && Boolean(live[s.cm_name]), address: live[s.cm_name]?.address ?? null,
@@ -219,6 +225,33 @@ export class Tree {
       const projectRows = [];
       let needs = 0, sessionsTotal = 0;
       let lastGroup = null;
+      // Adhoc sessions, the project's own space: always first, also when empty.
+      if (!this.archived) {
+        const running = (p.adhoc_sessions ?? []).filter((s) => live[s.cm_name]);
+        const stopped = [...(p.adhoc_stopped ?? []), ...(p.adhoc_sessions ?? []).filter((s) => !live[s.cm_name])];
+        const hits = [...running.map((s) => [s, false]), ...stopped.map((s) => [s, true])].filter(([s]) => projectHit || has(s.name, "adhoc"));
+        this.names[p.space] = p.name;
+        this.names[p.run] = "▶ run";
+        if (hits.length) this.spaceOrder.push(p.space);
+        if (hits.length || !f) {
+          const akey = `a:${p.name}`;
+          const status = worst(running.map((s) => live[s.cm_name].status));
+          needs += running.filter((s) => live[s.cm_name].status === "blocked").length;
+          sessionsTotal += running.length;
+          projectRows.push({ key: akey, kind: "adhoc-group", depth: 1, parents: [pkey], status, folded: !open(akey), count: hits.length,
+            item: { kind: "adhoc-group", project: P, space: p.space } });
+          for (const [s, isStopped] of hits) {
+            this.names[s.cm_name] = s.name;
+            this.tabOrder.push(s.cm_name);
+            projectRows.push({
+              key: `s:${s.cm_name}`, kind: isStopped ? "stopped" : "adhoc", depth: 2, parents: [pkey, akey],
+              item: { kind: isStopped ? "stopped" : "adhoc", project: P, session: sessionInfo(s, isStopped), space: p.space, run: s.run },
+              status: isStopped ? "stopped" : live[s.cm_name]?.status, program: live[s.cm_name]?.program,
+              diff: this.stats.sessions[s.cm_name]?.diff,
+            });
+          }
+        }
+      }
       for (const t of tasks) {
         const T = { name: t.name, branch: t.branch, base_branch: t.base_branch, linear: t.linear, group: t.group, archived: t.archived, pr: this.stats.tasks[`${p.name}/${t.name}`]?.pr ?? null, stack: t.stack };
         const space = t.space;
@@ -238,20 +271,18 @@ export class Tree {
         if (t.group && t.group !== lastGroup) {
           const gkey = `g:${p.name}/${t.group}`;
           const groupTasks = tasks.filter((x) => x.group === t.group);
-          projectRows.push({ key: gkey, kind: "group", depth: 1, label: t.group, count: groupTasks.length,
-            item: { kind: "group", project: P, group: t.group, space: p.space }, folded: this.collapsed.has(gkey) });
+          projectRows.push({ key: gkey, kind: "group", depth: 1, parents: [pkey], label: t.group, count: groupTasks.length,
+            item: { kind: "group", project: P, group: t.group, space: p.space }, folded: !open(gkey) });
         }
         lastGroup = t.group ?? null;
         const inGroup = Boolean(t.group);
-        if (inGroup && this.collapsed.has(`g:${p.name}/${t.group}`)) continue;
+        const above = inGroup ? [pkey, `g:${p.name}/${t.group}`] : [pkey];
         const tkey = `t:${p.name}/${t.name}`;
         const mainInfo = main ? sessionInfo(main, false) : null;
         const taskItem = { kind: "task", project: P, task: T, space, run: t.run, main: mainInfo, counts: { sessions: running.length } };
         const hot = running.some((s) => (this.stats.sessions[s.cm_name]?.last_active ?? 0) > Date.now() / 1000 - HOT_SECONDS);
-        const folded = this.collapsed.has(tkey);
-        projectRows.push({ key: tkey, kind: "task", depth: inGroup ? 2 : 1, item: taskItem, status, hot, folded,
+        projectRows.push({ key: tkey, kind: "task", depth: inGroup ? 2 : 1, parents: above, item: taskItem, status, hot, folded: !open(tkey),
           blocked: statuses.filter((s) => s === "blocked").length, diff: this.stats.tasks[`${p.name}/${t.name}`]?.diff });
-        if (folded) continue;
         const ordered = [...running.map((s) => [s, false]), ...stopped.map((s) => [s, true])]
           .filter(([s]) => sessionHits.includes(s))
           .sort(([a], [b]) => (a.name !== "main") - (b.name !== "main") || a.name.localeCompare(b.name, undefined, { numeric: true }));
@@ -260,7 +291,7 @@ export class Tree {
           this.tabOrder.push(s.cm_name);
           const S = sessionInfo(s, isStopped);
           projectRows.push({
-            key: `s:${s.cm_name}`, kind: isStopped ? "stopped" : "session", depth: (inGroup ? 2 : 1) + 1,
+            key: `s:${s.cm_name}`, kind: isStopped ? "stopped" : "session", depth: (inGroup ? 2 : 1) + 1, parents: [...above, tkey],
             item: { kind: isStopped ? "stopped" : "session", project: P, task: T, session: S, space, run: s.run, main: mainInfo },
             status: isStopped ? "stopped" : live[s.cm_name]?.status, program: live[s.cm_name]?.program,
             diff: this.stats.sessions[s.cm_name]?.diff, branch: this.stats.sessions[s.cm_name]?.branch,
@@ -269,39 +300,10 @@ export class Tree {
         }
         this.names[t.run] = "▶ run";
       }
-      // Adhoc sessions: the project's own space.
-      if (!this.archived) {
-        const running = (p.adhoc_sessions ?? []).filter((s) => live[s.cm_name]);
-        const stopped = [...(p.adhoc_stopped ?? []), ...(p.adhoc_sessions ?? []).filter((s) => !live[s.cm_name])];
-        const hits = [...running.map((s) => [s, false]), ...stopped.map((s) => [s, true])].filter(([s]) => projectHit || has(s.name, "adhoc"));
-        this.names[p.space] = p.name;
-        this.names[p.run] = "▶ run";
-        if (hits.length) {
-          this.spaceOrder.push(p.space);
-          const akey = `a:${p.name}`;
-          const status = worst(running.map((s) => live[s.cm_name].status));
-          needs += running.filter((s) => live[s.cm_name].status === "blocked").length;
-          sessionsTotal += running.length;
-          projectRows.push({ key: akey, kind: "adhoc-group", depth: 1, status, folded: this.collapsed.has(akey), count: hits.length,
-            item: { kind: "adhoc-group", project: P, space: p.space } });
-          if (!this.collapsed.has(akey))
-            for (const [s, isStopped] of hits) {
-              this.names[s.cm_name] = s.name;
-              this.tabOrder.push(s.cm_name);
-              projectRows.push({
-                key: `s:${s.cm_name}`, kind: isStopped ? "stopped" : "adhoc", depth: 2,
-                item: { kind: isStopped ? "stopped" : "adhoc", project: P, session: sessionInfo(s, isStopped), space: p.space, run: s.run },
-                status: isStopped ? "stopped" : live[s.cm_name]?.status, program: live[s.cm_name]?.program,
-                diff: this.stats.sessions[s.cm_name]?.diff,
-              });
-            }
-        }
-      }
       if (!projectHit && !projectRows.length) continue;
-      const folded = this.collapsed.has(pkey) && !f;
-      rows.push({ key: pkey, kind: "project", depth: 0, folded, needs, branch: this.stats.projects[p.name]?.branch,
+      rows.push({ key: pkey, kind: "project", depth: 0, folded: !open(pkey), needs, branch: this.stats.projects[p.name]?.branch,
         item: { kind: "project", project: P, space: p.space, run: p.run, counts: { tasks: (p.tasks ?? []).length, sessions: sessionsTotal } } });
-      if (!folded) rows.push(...projectRows);
+      rows.push(...projectRows);
     }
     // Herdr spaces that aren't showrunner's (a plain terminal, another agent).
     const others = spaces().filter((s) => !s.id.startsWith("cm__") && !s.machine && has(s.name));
@@ -309,7 +311,8 @@ export class Tree {
       rows.push({ key: "o:head", kind: "other-head" });
       for (const s of others) rows.push({ key: `o:${s.id}`, kind: "space", depth: 0, space: s, status: s.status, item: { kind: "space", space: s.id } });
     }
-    return rows;
+    this.allRows = rows;
+    return rows.filter((r) => !(r.parents ?? []).some((k) => !open(k)));
   }
 
   // Herdr names the spaces and tabs showrunner's labels made after their
@@ -356,7 +359,7 @@ export class Tree {
   }
 
   // A tab asked for (a session or run just started) appears: show it.
-  revealPending(rows) {
+  revealPending() {
     const want = shared("showrunner.reveal");
     if (!want) return;
     if (Date.now() > want.until) return setShared("showrunner.reveal", null);
@@ -370,7 +373,10 @@ export class Tree {
     show(want.space, want.tab, address, want.focus);
     // Showing a tab moves the keyboard to it; like the TUI, stay in the list.
     if (!want.focus && keep) this.handle.focus();
-    if (rows.some((r) => r.key === `s:${want.tab}`)) this.select(`s:${want.tab}`);
+    if (!this.allRows?.some((r) => r.key === `s:${want.tab}`)) return false;
+    this.expandTo(`s:${want.tab}`);
+    this.select(`s:${want.tab}`);
+    return true;
   }
 
   // While the keyboard is elsewhere, the selection follows the shown tab.
@@ -383,9 +389,12 @@ export class Tree {
     // On start, the selection remembered from last time stays.
     if (first && rows.some((r) => r.key === this.sel)) return;
     if (treeFocused || !tab) return;
-    const key = rows.some((r) => r.key === `s:${tab}`)
-      ? `s:${tab}`
-      : rows.find((r) => r.kind === "task" && r.item.space === space?.id)?.key ?? rows.find((r) => r.key === `o:${space?.id}`)?.key;
+    // The tab's row, or the closest row above it that isn't folded away.
+    const all = this.allRows ?? rows;
+    const target = all.find((r) => r.key === `s:${tab}`)
+      ?? all.find((r) => (r.kind === "task" || r.kind === "adhoc-group") && r.item.space === space?.id)
+      ?? all.find((r) => r.key === `o:${space?.id}`);
+    const key = [target?.key, ...[...(target?.parents ?? [])].reverse()].find((k) => rows.some((r) => r.key === k));
     if (key) this.sel = key;
   }
 
@@ -406,9 +415,11 @@ export class Tree {
   activate(row) {
     const { item } = row;
     switch (row.kind) {
+      case "adhoc-group":
+        if (!row.count) return perform("new-adhoc", item);
+        return this.toggle(row.key);
       case "project":
       case "group":
-      case "adhoc-group":
         return this.toggle(row.key);
       case "task":
         if (item.main) return show(item.space, item.main.cm_name, item.main.address, true);
@@ -517,21 +528,21 @@ export class Tree {
     const t = theme();
     const live = liveSessions(this.guessed);
     const runs = liveRuns();
-    const rows = this.data ? this.build(live) : [];
-    this.lastRows = rows;
+    let rows = this.data ? this.build(live) : [];
     const treeFocused = this.handle.is_focused();
     this.trackTurns(live, cx);
     if (this.data) {
-      this.revealPending(rows);
+      if (this.revealPending()) rows = this.build(live);
       this.follow(rows, treeFocused);
       this.syncNames();
       this.syncOrder();
     }
+    this.lastRows = rows;
     if (!rows.some((r) => r.key === this.sel)) this.sel = rows.find((r) => r.item)?.key ?? null;
     const selected = rows.find((r) => r.key === this.sel);
     this.publish(selected, live);
     const activeTab = spaces().find((s) => s.active)?.tabs?.find((x) => x.active)?.id;
-    if ((find(layout(), "sidebar")?.size?.px ?? Infinity) < 160) return this.rail(t, rows);
+    if ((find(layout(), "sidebar")?.size?.px ?? Infinity) < 160) return this.rail(t, this.allRows);
 
     // Rows at fixed heights; the strip scrolls only as far as keeps the selection in view.
     this.tops = {};
@@ -656,7 +667,7 @@ export class Tree {
   // The folded sidebar: a cell per task (and adhoc space), its project's color
   // and initial, its most urgent status in the corner. Click shows it.
   rail(t, rows) {
-    const cells = rows.filter((r) => r.kind === "task" || r.kind === "adhoc-group");
+    const cells = rows.filter((r) => r.kind === "task" || (r.kind === "adhoc-group" && r.count > 0));
     return v_flex().id("showrunner-rail").size_full().min_h(0).bg(t.chrome).pt(8).gap(4).items_center().overflow_y_scrollbar()
       .children(cells.map((r) => {
         const on = this.activeSpace(r.item.space);
@@ -689,7 +700,7 @@ export class Tree {
   }
 
   row(r, t, { selected, treeFocused, activeTab, runs }) {
-    const indent = 6 + r.depth * 16;
+    const indent = 6 + r.depth * 12;
     const base = h_flex().id(`sr-${r.key}`).px(6).pl(indent).gap(7).items_center().rounded(7)
       .border_1().border_color(selected && treeFocused ? t.accent : "#00000000")
       .when(selected && treeFocused, (el) => el.bg(t.selected))
@@ -754,10 +765,11 @@ export class Tree {
       }
       case "adhoc-group":
         return base
-          .child(chevron(r.folded))
-          .child(r.folded ? statusGlyph(t, r.status) : icon("house", 12, t.accent))
-          .child(div().flex_1().text_size(12).text_color(t.muted).child("adhoc"))
-          .when(r.folded, (el) => el.child(div().text_size(11).text_color(t.dim).child(String(r.count))));
+          .child(r.count ? chevron(r.folded) : div().size(14).flex_none())
+          .child(icon("house", 12, t.accent))
+          .child(div().flex_1().text_size(12).text_color(r.count ? t.muted : t.dim).child("adhoc"))
+          .when(r.folded && Boolean(r.status) && r.status !== "idle", (el) => el.child(statusGlyph(t, r.status)))
+          .when(r.folded && r.count > 0, (el) => el.child(div().text_size(11).text_color(t.dim).child(String(r.count))));
       case "session":
       case "adhoc":
       case "stopped": {
