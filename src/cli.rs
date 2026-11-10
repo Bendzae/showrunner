@@ -420,9 +420,11 @@ fn cmd_list(args: &[String]) -> Result<()> {
             Vec::new()
         };
 
+    // Projects on a host (`ec2:/…`) are listed by that host, under `hosts`.
     let projects: Vec<&crate::config::Project> = cfg
         .projects
         .iter()
+        .filter(|p| remote::host_of_path(&p.path).is_none())
         .filter(|p| project_filter.is_none_or(|f| &p.name == f))
         .collect();
     if let Some(filter) = project_filter.filter(|_| projects.is_empty()) {

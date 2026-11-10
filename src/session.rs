@@ -326,13 +326,25 @@ fn launch(spec: Launch) -> Result<()> {
     labels.extend(spec.task_branch.map(|b| (LABEL_TASK_BRANCH, b)));
     labels.extend(spec.worktree_path.map(|p| (LABEL_WORKTREE_PATH, p)));
     labels.extend(spec.claude_session_id.map(|id| (LABEL_CLAUDE_SESSION, id)));
+    let unset: String = NESTING_ENV.iter().map(|var| format!("-u {var} ")).collect();
     hc::run(
         spec.work_dir,
-        Some(&format!("exec {}", spec.command)),
+        Some(&format!("exec env {unset}{}", spec.command)),
         &labels,
     )?;
     Ok(())
 }
+
+/// What terminals inherit when the hc core was started from inside Claude Code
+/// or tmux (the core hands its own environment to every terminal). Claude takes
+/// an inherited `CLAUDE_CODE_CHILD_SESSION` as a nested session and stops
+/// saving its transcript.
+const NESTING_ENV: [&str; 4] = [
+    "CLAUDECODE",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "TMUX",
+    "TMUX_PANE",
+];
 
 pub fn branch_exists(project_path: &str, branch: &str) -> bool {
     Command::new("git")
