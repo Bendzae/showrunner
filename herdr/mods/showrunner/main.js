@@ -1,12 +1,14 @@
-// Showrunner in Herdr: the sidebar tree (default), and the popups it opens
-// (props.view: "menu", "form", "picker", "confirm").
+// Showrunner in Herdr: the sidebar tree (default), the popups it opens
+// (props.view: "menu", "form", "picker", "confirm"), the right panel's
+// views ("pr", "ticket", "ideas") and their buttons in the top bar ("bar").
 
 import { View } from "gpui-kit";
 import { props } from "herdr";
 import { Tree } from "./tree.js";
 import { Menu, Form, Picker, Confirm } from "./overlays.js";
+import { PrPanel, TicketPanel, IdeasPanel, PanelBar } from "./panels.js";
 
-const VIEWS = { tree: Tree, menu: Menu, form: Form, picker: Picker, confirm: Confirm };
+const VIEWS = { tree: Tree, menu: Menu, form: Form, picker: Picker, confirm: Confirm, pr: PrPanel, ticket: TicketPanel, ideas: IdeasPanel, bar: PanelBar };
 
 export default class Showrunner extends View {
   init(_props, cx) {

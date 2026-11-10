@@ -66,15 +66,36 @@
       "resizable": false,
       "children": [
         {
-          "id": "tabs",
-          "type": "block",
+          "id": "topbar",
+          "type": "row",
           "size": {
             "px": 42
           },
-          "window_drag": true,
-          "content": {
-            "mod": "tabs"
-          }
+          "resizable": false,
+          "children": [
+            {
+              "id": "tabs",
+              "type": "block",
+              "window_drag": true,
+              "content": {
+                "mod": "tabs"
+              }
+            },
+            {
+              "id": "panel-tabs",
+              "type": "block",
+              "size": {
+                "px": 196
+              },
+              "window_drag": true,
+              "content": {
+                "mod": "showrunner",
+                "props": {
+                  "view": "bar"
+                }
+              }
+            }
+          ]
         },
         {
           "id": "work-body",
@@ -116,7 +137,7 @@
               "type": "column",
               "hidden": true,
               "size": {
-                "px": 368
+                "px": 420
               },
               "min": 280,
               "max": 900,
@@ -138,6 +159,36 @@
                       "type": "block",
                       "content": {
                         "mod": "changes"
+                      }
+                    },
+                    {
+                      "id": "ideas",
+                      "type": "block",
+                      "content": {
+                        "mod": "showrunner",
+                        "props": {
+                          "view": "ideas"
+                        }
+                      }
+                    },
+                    {
+                      "id": "pr",
+                      "type": "block",
+                      "content": {
+                        "mod": "showrunner",
+                        "props": {
+                          "view": "pr"
+                        }
+                      }
+                    },
+                    {
+                      "id": "ticket",
+                      "type": "block",
+                      "content": {
+                        "mod": "showrunner",
+                        "props": {
+                          "view": "ticket"
+                        }
                       }
                     }
                   ]

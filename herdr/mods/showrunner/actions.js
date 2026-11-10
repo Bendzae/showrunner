@@ -2,7 +2,8 @@
 // showrunner command, or move Herdr (show a tab, open a terminal beside one).
 
 import { exec, run, openOverlay, notify, knownAgents, panes } from "herdr";
-import { act, sr, clean, show, copy, openUrl, liveRuns, loadConfig, RUN_MENU, taskRef } from "./lib.js";
+import { act, sr, clean, show, copy, liveRuns, loadConfig, RUN_MENU, taskRef } from "./lib.js";
+import { showPanel } from "./panels.js";
 
 const MOD = "showrunner";
 
@@ -91,11 +92,11 @@ export async function perform(action, item, at) {
     case "checkout-task":
       return act("Checking out", ["task", "checkout", project.name, task.name]);
     case "open-pr":
-      if (task.pr?.url) return openUrl(task.pr.url);
+      if (task.pr?.url) return showPanel("pr");
       return confirm("No PR found", `Create a draft PR for ${task.branch}? Its branch is pushed first.`,
         ["task", "pr", project.name, task.name, "--create"], "Create PR");
     case "open-linear":
-      return openUrl(task.linear);
+      return showPanel("ticket");
     case "archive":
       return act("Archiving task", ["task", "archive", project.name, task.name]);
     case "unarchive":

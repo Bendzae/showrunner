@@ -68,6 +68,8 @@ What the TUI's menus do:
   showrunner run <project | project/task | session> [--command <cmd>] [--kill]
   showrunner review <project/task | session> [--tool hunk|difit]
                                                 review here, then send the comments
+  showrunner ideas list|add|start|done|edit|remove|sent [...] [--for <session>] [--json]
+                                                the task's idea queue (default: this session's)
   showrunner herdr install [--home <dir>] [--bin <path>] [--no-keys]
                                                 the Herdr app's Showrunner layout
 
@@ -117,6 +119,7 @@ pub fn dispatch(args: &[String]) -> Option<Result<()>> {
         Some("run") => Some(cli_actions::cmd_run(rest)),
         Some("review") => Some(cli_actions::cmd_review(rest)),
         Some("herdr") => Some(cli_actions::cmd_herdr(rest)),
+        Some("ideas") => Some(cli_actions::cmd_ideas(rest)),
         Some("--help" | "-h" | "help") => {
             print!("{HELP}");
             Some(Ok(()))
@@ -273,7 +276,7 @@ pub(crate) fn session_ref(s: &LiveSession) -> String {
 
 /// The session this process runs in, when invoked from inside one of its
 /// terminals.
-fn current_session_name() -> Option<String> {
+pub(crate) fn current_session_name() -> Option<String> {
     session::session_of_terminal(&std::env::var("HC_TERMINAL_ID").ok()?)
 }
 
@@ -977,7 +980,7 @@ fn handoff_prompt(export: &ops::SessionExport, from: &str, note: Option<&str>) -
 
 /// Resolve a session ref to the name of a *recorded* session, live or
 /// not — a session whose agent died can still be moved.
-fn resolve_recorded_session(reference: &str) -> Result<String> {
+pub(crate) fn resolve_recorded_session(reference: &str) -> Result<String> {
     let reference = reference.trim().trim_matches('/');
     let cm_name = if reference.starts_with("cm__") {
         reference.to_string()
@@ -1045,7 +1048,20 @@ fn cmd_session_pr(args: &[String]) -> Result<()> {
 /// Record the Claude conversation a session runs, so recreation resumes it
 /// (the showrunner Claude mod calls this when it changes, e.g. on `/clear`).
 fn cmd_session_set_conversation(args: &[String]) -> Result<()> {
-    let (positional, _) = parse_args(args, &[], &[])?;
+    let (positional, flags) = parse_args(args, &[], &["hook"])?;
+    // As a Claude hook (SessionStart): the conversation id comes on stdin, the
+    // session is the one it runs in. Never fails: a hook error shows in Claude.
+    if flags.contains_key("hook") {
+        let mut input = String::new();
+        let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut input);
+        let id = serde_json::from_str::<Value>(&input)
+            .ok()
+            .and_then(|v| v["session_id"].as_str().map(str::to_string));
+        if let (Some(cm_name), Some(id)) = (current_session_name(), id) {
+            config::set_session_record_claude_session_id(&cm_name, &id);
+        }
+        return Ok(());
+    }
     let [reference, id] = positional.as_slice() else {
         bail!("usage: session set-conversation <session> <id>");
     };

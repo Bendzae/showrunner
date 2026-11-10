@@ -24,6 +24,7 @@ const FILES: &[(&str, &str)] = files![
     "mods/showrunner/tree.js",
     "mods/showrunner/overlays.js",
     "mods/showrunner/ui.js",
+    "mods/showrunner/panels.js",
     "mods/showrunner/icons/archive.svg",
     "mods/showrunner/icons/check.svg",
     "mods/showrunner/icons/chevron-down.svg",
@@ -38,15 +39,20 @@ const FILES: &[(&str, &str)] = files![
     "mods/showrunner/icons/plus.svg",
     "mods/showrunner/icons/search.svg",
     "mods/showrunner/icons/spinner.svg",
+    "mods/showrunner/icons/lightbulb.svg",
+    "mods/showrunner/icons/git-pull-request.svg",
+    "mods/showrunner/icons/ticket.svg",
     "mods/showrunner-status/mod.json",
     "mods/showrunner-status/main.js",
 ];
 
-/// The key, in the layout's own section: `Ctrl-/` jumps between the tree and
-/// the terminal.
+/// The keys, in the layout's own section: `Ctrl-/` jumps between the tree and
+/// the terminal, `Ctrl-.` picks the right panel.
 const KEY_SECTION: &str = "layout:showrunner";
-const KEY: &str = "ctrl-/";
-const KEY_ACTION: &str = "showrunner.toggle";
+const KEYS: [(&str, &str); 2] = [
+    ("ctrl-/", "showrunner.toggle"),
+    ("ctrl-.", "showrunner.panels"),
+];
 
 pub fn default_home() -> PathBuf {
     std::env::var_os("HERDR_APP_HOME")
@@ -114,15 +120,17 @@ pub fn install(home: &Path, bin: Option<&str>, keys: bool) -> Result<Installed> 
             .as_object_mut()
             .context("keys.json section")?;
         let before = section.clone();
-        // A key an earlier install bound to the toggle goes: one key does it.
-        section.retain(|key, action| key == KEY || action.as_str() != Some(KEY_ACTION));
-        section.insert(KEY.to_string(), json!(KEY_ACTION));
+        for (key, action) in KEYS {
+            // A key an earlier install bound to the action goes: one key does it.
+            section.retain(|k, a| k == key || a.as_str() != Some(action));
+            section.insert(key.to_string(), json!(action));
+        }
         if *section != before {
             fs::write(&path, serde_json::to_string_pretty(&map)? + "\n")?;
             notes.push(
-                "keys.json: ctrl-/ jumps between the tree and the terminal in the Showrunner \
-                 layout (Herdr no longer updates an edited keys.json's defaults: add new ones \
-                 by hand)"
+                "keys.json: in the Showrunner layout ctrl-/ jumps between the tree and the \
+                 terminal, ctrl-. picks the right panel (Herdr no longer updates an edited \
+                 keys.json's defaults: add new ones by hand)"
                     .to_string(),
             );
         }
@@ -161,8 +169,10 @@ mod tests {
         let keys: Value =
             serde_json::from_str(&fs::read_to_string(home.join("keys.json")).unwrap()).unwrap();
         assert_eq!(keys["global"]["cmd-t"], "tab.new");
-        assert_eq!(keys[KEY_SECTION][KEY], KEY_ACTION);
-        assert_eq!(keys[KEY_SECTION].as_object().unwrap().len(), 1);
+        for (key, action) in KEYS {
+            assert_eq!(keys[KEY_SECTION][key], action);
+        }
+        assert_eq!(keys[KEY_SECTION].as_object().unwrap().len(), KEYS.len());
         let local: Value = serde_json::from_str(
             &fs::read_to_string(home.join("mods/showrunner/local.json")).unwrap(),
         )

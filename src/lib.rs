@@ -6,6 +6,7 @@ pub mod config;
 mod entry;
 mod hc;
 mod herdr;
+mod ideas;
 mod migrate;
 pub mod notify;
 pub mod ops;

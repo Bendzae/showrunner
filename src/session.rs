@@ -587,6 +587,7 @@ pub fn create_session_with(
     };
 
     let system_prompt = build_base_system_prompt(
+        &cm_name,
         project_name,
         task_branch,
         session_branch.as_deref(),
@@ -736,6 +737,7 @@ pub fn create_adhoc_session(
     agent: AgentKind,
 ) -> Result<String> {
     let cm_name = build_session_name(project_name, ADHOC_MARKER, session_name);
+    install_agent_skills(agent, project_path);
 
     let claude_session_id = new_claude_session_id(agent);
     let agent_cmd = build_agent_command(
@@ -769,6 +771,7 @@ pub fn recreate_adhoc_session(
 ) -> Result<String> {
     let agent = record.agent_kind();
     ensure_agent_installed(agent)?;
+    install_agent_skills(agent, &record.project_path);
     let resume = can_resume(agent, &record.project_path, record);
     let rc_name = record
         .remote_control
@@ -1064,6 +1067,7 @@ pub fn recreate_session(cm_name: &str, record: &crate::config::SessionRecord) ->
         .then(|| record_branch(record));
 
     let system_prompt = build_base_system_prompt(
+        cm_name,
         &record.project_name,
         &record.task_branch,
         session_branch.as_deref(),
@@ -1380,12 +1384,10 @@ fn build_agent_command(
             if let Some(name) = remote_control_name {
                 cmd.push_str(&format!(" --remote-control {}", shell_escape(name)));
             }
-            if system_prompt.is_some() {
-                cmd.push_str(&format!(
-                    " --plugin-dir {}",
-                    shell_escape(&showrunner_plugin_path(work_dir))
-                ));
-            }
+            cmd.push_str(&format!(
+                " --plugin-dir {}",
+                shell_escape(&showrunner_plugin_path(work_dir))
+            ));
             if let Some(sp) = system_prompt {
                 cmd.push_str(&format!(" --append-system-prompt {}", shell_escape(sp)));
             }
@@ -1587,6 +1589,7 @@ fn copy_patterns_to_worktree(project_path: &str, worktree_path: &str, patterns: 
 /// the session's own branch, or `None` for the main session (which works on the
 /// task branch) and for sessions running without a worktree.
 fn build_base_system_prompt(
+    cm_name: &str,
     project_name: &str,
     task_branch: &str,
     worktree_branch: Option<&str>,
@@ -1628,6 +1631,17 @@ fn build_base_system_prompt(
     if worktree_branch.is_some() {
         prompt.push_str("\n- NEVER push the worktree branch unless explicitly told to do so");
     }
+    let (space, tab) = herdr_ids(cm_name);
+    prompt.push_str(&format!(
+        "\n- The person may queue ideas for this task in the Herdr app's Ideas panel: see\n  \
+         the `idea-queue` skill when they mention their ideas or the queue\n\
+         - You run in a herdr-core terminal shown in the Herdr app. Start long-running\n  \
+         commands the person may want to watch (dev servers, watchers, long test runs)\n  \
+         in a terminal beside you instead of in the background:\n  \
+         `hc run --bg --label herdr.space={space} --label herdr.tab={tab} -- <command>`\n  \
+         (it prints the terminal's address, e.g. t7); read its output with\n  \
+         `hc read <address>`, stop it with `hc kill <address>`"
+    ));
     prompt
 }
 
@@ -1681,6 +1695,8 @@ fn build_initial_prompt(
 const PLUGIN_MANIFEST: &str = include_str!("../showrunner-plugin/.claude-plugin/plugin.json");
 const PLUGIN_SKILL_COMMIT_PUSH_TASK: &str =
     include_str!("../showrunner-plugin/skills/commit-push-task/SKILL.md");
+const PLUGIN_SKILL_IDEA_QUEUE: &str =
+    include_str!("../showrunner-plugin/skills/idea-queue/SKILL.md");
 const PLUGIN_SKILL_MANAGE_SESSIONS: &str =
     include_str!("../showrunner-plugin/skills/manage-sessions/SKILL.md");
 
@@ -1713,6 +1729,7 @@ fn install_agents_dir_skills(work_dir: &str) {
     for (name, content) in [
         ("commit-push-task", PLUGIN_SKILL_COMMIT_PUSH_TASK),
         ("manage-sessions", PLUGIN_SKILL_MANAGE_SESSIONS),
+        ("idea-queue", PLUGIN_SKILL_IDEA_QUEUE),
     ] {
         let dir = skills_dir.join(name);
         let _ = fs::create_dir_all(&dir);
@@ -1759,11 +1776,21 @@ fn install_showrunner_plugin(work_dir: &str) {
     let _ = fs::create_dir_all(plugin_dir.join(".claude-plugin"));
     let _ = fs::create_dir_all(plugin_dir.join("skills").join("commit-push-task"));
     let _ = fs::create_dir_all(plugin_dir.join("skills").join("manage-sessions"));
+    let _ = fs::create_dir_all(plugin_dir.join("skills").join("idea-queue"));
+    let _ = fs::write(
+        plugin_dir
+            .join("skills")
+            .join("idea-queue")
+            .join("SKILL.md"),
+        PLUGIN_SKILL_IDEA_QUEUE,
+    );
 
     let _ = fs::write(
         plugin_dir.join(".claude-plugin").join("plugin.json"),
         PLUGIN_MANIFEST,
     );
+    let _ = fs::create_dir_all(plugin_dir.join("hooks"));
+    let _ = fs::write(plugin_dir.join("hooks").join("hooks.json"), plugin_hooks());
     let _ = fs::write(
         plugin_dir
             .join("skills")
@@ -1781,6 +1808,23 @@ fn install_showrunner_plugin(work_dir: &str) {
 
     // Git-ignore the locally installed plugin via .git/info/exclude.
     add_git_excludes(work_dir, &[".claude/plugins/showrunner/"]);
+}
+
+/// The plugin's Claude hooks: when a conversation starts (a new session,
+/// `/clear`, `/resume`) the session record follows it, so a recreated session
+/// resumes the conversation it last had. The binary creating the session runs
+/// it, not whichever `showrunner` the PATH has.
+fn plugin_hooks() -> String {
+    let exe = std::env::current_exe()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "showrunner".to_string());
+    let command = format!("{} session set-conversation --hook", shell_escape(&exe));
+    serde_json::to_string_pretty(&serde_json::json!({
+        "hooks": {
+            "SessionStart": [{ "hooks": [{ "type": "command", "command": command }] }]
+        }
+    }))
+    .unwrap_or_default()
 }
 
 /// Add entries to the repo's `.git/info/exclude`, skipping any already
@@ -3386,18 +3430,23 @@ Some transcript output.\n\
             None,
             Some("id1"),
         );
+        // Every Claude session loads the plugin (its conversation hook).
+        let plugin = " --plugin-dir '/w/.claude/plugins/showrunner'";
         assert_eq!(
             new,
-            "claude --dangerously-skip-permissions --session-id id1"
+            format!("claude --dangerously-skip-permissions --session-id id1{plugin}")
         );
         let resumed =
             build_agent_command(AgentKind::Claude, "/w", None, None, true, None, Some("id1"));
         assert_eq!(
             resumed,
-            "claude --dangerously-skip-permissions --resume id1"
+            format!("claude --dangerously-skip-permissions --resume id1{plugin}")
         );
         let legacy = build_agent_command(AgentKind::Claude, "/w", None, None, true, None, None);
-        assert_eq!(legacy, "claude --dangerously-skip-permissions --continue");
+        assert_eq!(
+            legacy,
+            format!("claude --dangerously-skip-permissions --continue{plugin}")
+        );
     }
 
     #[test]
@@ -3413,7 +3462,8 @@ Some transcript output.\n\
         );
         assert_eq!(
             cmd,
-            "claude --dangerously-skip-permissions --continue --remote-control 'mac · app / fix'"
+            "claude --dangerously-skip-permissions --continue --remote-control 'mac · app / fix' \
+             --plugin-dir '/w/.claude/plugins/showrunner'"
         );
     }
 

@@ -6,8 +6,11 @@ use std::io::{BufRead, Write};
 
 use anyhow::{Result, bail};
 
-use crate::cli::{parse_args, resolve_session, session_ref};
+use crate::cli::{
+    current_session_name, parse_args, resolve_recorded_session, resolve_session, session_ref,
+};
 use crate::config::{self, Config, Project, Task};
+use crate::ideas::{self, Change};
 use crate::ops;
 use crate::review;
 use crate::session::{self, LiveSession};
@@ -447,6 +450,86 @@ fn resolve_item(cfg: &Config, reference: &str) -> Result<Item> {
             Ok(Item::Session(project, live))
         }
     }
+}
+
+/// The idea queue of a session's task (see `ideas.rs`): this session's, or
+/// `--for <session>`'s.
+pub fn cmd_ideas(args: &[String]) -> Result<()> {
+    let usage = "usage: ideas list [--json] | add <idea>... | start|done|remove|sent <id> | \
+                 edit <id> <text>   [--for <session>]";
+    let Some(sub) = args.first().map(String::as_str) else {
+        bail!("{usage}");
+    };
+    let (positional, flags) = parse_args(&args[1..], &["for"], &["json"])?;
+    let cm_name = match flags.get("for") {
+        Some(reference) => resolve_recorded_session(reference)?,
+        None => current_session_name().ok_or_else(|| {
+            anyhow::anyhow!("not inside a showrunner session; pass --for <session>")
+        })?,
+    };
+    let record = config::load_sessions()
+        .remove(&cm_name)
+        .ok_or_else(|| anyhow::anyhow!("no session record for {cm_name}"))?;
+    let path = ideas::queue_path(&record);
+    let mut queue = ideas::load(&path);
+    let one_id = || match positional.as_slice() {
+        [id] => Ok(id.clone()),
+        _ => Err(anyhow::anyhow!("{usage}")),
+    };
+    match sub {
+        "list" => {
+            if flags.contains_key("json") {
+                println!("{}", serde_json::to_string(&queue)?);
+            } else {
+                println!("{}", ideas::describe(&queue));
+            }
+            return Ok(());
+        }
+        "add" => {
+            let added: Vec<ideas::Idea> = positional
+                .iter()
+                .filter(|text| !text.trim().is_empty())
+                .map(|text| ideas::new_idea(text))
+                .collect();
+            if added.is_empty() {
+                bail!("give at least one idea");
+            }
+            let shown: Vec<String> = added
+                .iter()
+                .map(|i| format!("[id {}] {}", i.id, i.text))
+                .collect();
+            queue.extend(added);
+            ideas::save(&path, &queue)?;
+            println!("Added {}. {} in the queue.", shown.join("; "), queue.len());
+        }
+        "start" => {
+            ideas::change(&mut queue, &one_id()?, Change::Start)?;
+            ideas::save(&path, &queue)?;
+            println!("Marked as started.");
+        }
+        "done" | "remove" => {
+            ideas::change(&mut queue, &one_id()?, Change::Remove)?;
+            ideas::save(&path, &queue)?;
+            println!("Done; {} left in the queue.", queue.len());
+        }
+        "sent" => {
+            ideas::change(&mut queue, &one_id()?, Change::Sent)?;
+            ideas::save(&path, &queue)?;
+        }
+        "edit" => {
+            let [id, text @ ..] = positional.as_slice() else {
+                bail!("{usage}");
+            };
+            let text = text.join(" ");
+            if text.trim().is_empty() {
+                bail!("an idea needs some text");
+            }
+            ideas::change(&mut queue, id, Change::Edit(text))?;
+            ideas::save(&path, &queue)?;
+        }
+        _ => bail!("{usage}"),
+    }
+    Ok(())
 }
 
 /// Install the Herdr mods and layout (see `herdr.rs`).

@@ -4,9 +4,10 @@
 
 import { div, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input } from "gpui-base";
-import { spaces, focused, run, theme, settings, shared, setShared, nextCommand, readTextFile, window, layout, themes } from "herdr";
+import { spaces, focused, run, theme, settings, shared, setShared, nextCommand, readTextFile, window, layout, themes, openOverlay } from "herdr";
 import { sr, clean, loadConfig, liveSessions, liveRuns, guessedStatus, worst, menuItems, show, runAct } from "./lib.js";
 import { perform, openMenu, form } from "./actions.js";
+import { togglePanel, panelEntries } from "./panels.js";
 import { icon, programIcon, statusGlyph, prBadge, diffBadge, avatar, avatarColor, linearId, prSummary } from "./ui.js";
 
 const H = { project: 34, group: 26, task: 28, session: 26, stopped: 26, "adhoc-group": 26, adhoc: 26, "other-head": 32, space: 28, hint: 30 };
@@ -54,6 +55,10 @@ export class Tree {
     this.input.on("submit", (_e, cx) => { this.handle.focus(); cx.notify(); });
     // Operations a previous run was waiting on are gone with it.
     setShared("showrunner.busy", []);
+    // Herdr's tab bar remembers the right panel per space for the views listed here.
+    const panels = shared("workspace.panels") ?? ["files", "changes"];
+    const missing = ["ideas", "pr", "ticket"].filter((v) => !panels.includes(v));
+    if (missing.length) setShared("workspace.panels", [...panels, ...missing]);
 
     cx.spawn(async (cx) => {
       for (;;) {
@@ -80,8 +85,17 @@ export class Tree {
     else if (c === "toggle") this.handle.is_focused() ? this.leave() : this.handle.focus();
     else if (c === "refresh") this.refresh(cx);
     else if (c === "jobs") this.runJobs(cx);
+    else if (c === "panels") this.panelMenu();
     // `showrunner.select:<row key>`, e.g. `s:cm__app__fix__main` or `t:app/Fix login`.
     else if (c.startsWith("select:")) { this.select(c.slice(7)); this.handle.focus(); }
+  }
+
+  // Which right panel to show, from anywhere (⌃.); the keyboard goes back
+  // where it was.
+  panelMenu() {
+    const entries = panelEntries();
+    const back = this.handle.is_focused() ? "tree" : focused()?.pane ?? null;
+    openOverlay({ mod: "showrunner", kind: "dialog", width: 280, height: 48 + entries.length * 30, props: { view: "menu", title: "Right panel", entries, back } });
   }
 
   // Back to the terminal on screen.
@@ -476,6 +490,7 @@ export class Tree {
       case "K": if (row) this.reorder(row, true); break;
       case "J": if (row) this.reorder(row, false); break;
       case "t": this.cycleTheme(); break;
+      case "i": togglePanel("ideas"); break;
       case "q": case "escape":
         if (this.filtering) { this.closeFilter(); break; }
         this.leave();
@@ -617,6 +632,11 @@ export class Tree {
         status: item.session ? live[item.session.cm_name]?.status ?? (item.kind === "stopped" ? "stopped" : null) : null,
         agent: item.session?.agent ?? null,
         inTmux: item.session?.in_tmux ?? false,
+        // What the right panel's views follow: a session (a task's main one).
+        ref: item.session?.cm_name ?? (item.task ? item.main?.cm_name ?? `${item.space}__main` : null),
+        space: item.space ?? null,
+        project: item.project?.name ?? null,
+        task: item.task?.name ?? null,
         archived: this.archived,
       };
     }

@@ -3,10 +3,11 @@
 
 import { div, svg, image } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, TextareaState, Textarea } from "gpui-base";
-import { props, closeOverlay, theme, settings, pickFolder, home } from "herdr";
+import { props, closeOverlay, theme, settings, pickFolder, home, run } from "herdr";
 import { menuItems, enqueue } from "./lib.js";
 import { FORMS, PICKERS, agentChoices, loadKnownAgents, toBranch } from "./actions.js";
 import { icon, keycap } from "./ui.js";
+import { showPanel } from "./panels.js";
 
 // Closing gives the keyboard back to the tree, then has it run `jobs` (which
 // may move the keyboard on). Queued first: a closed popup changes nothing.
@@ -45,21 +46,35 @@ export class Menu {
 
   choose(entry) {
     if (!entry) return;
+    if (entry.action.startsWith("panel:")) {
+      const view = entry.action.slice(6);
+      if (view) showPanel(view);
+      else run("layout.hide", { id: "panel" });
+      return this.close();
+    }
     close({ kind: "perform", action: entry.action, item: props().item });
+  }
+
+  // Back to where the keyboard was when the menu opened: the tree, or a pane.
+  close() {
+    const back = props().back;
+    if (back === undefined || back === "tree") return close();
+    if (back) run("pane.focus", { pane: back });
+    closeOverlay(props().overlay);
   }
 
   render() {
     const t = theme();
     const list = this.entries();
-    const item = props().item;
-    const heading = item.session?.name ? `${item.task?.name ?? "adhoc"} · ${item.session.name}` : item.task?.name ?? item.group ?? item.project?.name;
+    const item = props().item ?? {};
+    const heading = props().title ?? (item.session?.name ? `${item.task?.name ?? "adhoc"} · ${item.session.name}` : item.task?.name ?? item.group ?? item.project?.name);
     return v_flex().id("sr-menu").track_focus(this.handle).w_full().min_h(0).p(5).bg(t.popover).text_size(12.8)
       .on_key_down((e, cx) => {
         const k = e.key.length === 1 ? e.key_char ?? e.key : e.key;
         if (e.key === "down" || (k === "j" && !list.some((x) => x.key === "j"))) this.at = (this.at + 1) % list.length;
         else if (e.key === "up" || (k === "k" && !list.some((x) => x.key === "k"))) this.at = (this.at + list.length - 1) % list.length;
         else if (e.key === "enter") this.choose(list[this.at]);
-        else if (e.key === "escape" || k === "q") close();
+        else if (e.key === "escape" || k === "q") this.close();
         else {
           const hit = list.find((x) => x.key === k);
           if (!hit) return;
@@ -78,7 +93,9 @@ export class Menu {
             .hover((s) => s.bg(t.hover))
             .on_click(() => this.choose(x))
             .child(keycap(t, x.key, i === this.at))
-            .child(div().flex_1().truncate().child(x.label)))));
+            .when(Boolean(x.icon), (el) => el.child(svg(x.icon).size(14).flex_none().text_color(t.muted)))
+            .child(div().flex_1().truncate().child(x.label))
+            .when(Boolean(x.on), (el) => el.child(icon("check", 13, t.accent))))));
   }
 }
 
