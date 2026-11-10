@@ -1,13 +1,16 @@
 pub mod agent;
 pub mod app;
 pub mod cli;
+mod cli_actions;
 pub mod config;
 mod entry;
 mod hc;
+mod herdr;
 mod migrate;
 pub mod notify;
 pub mod ops;
 pub mod remote;
+mod review;
 pub mod server;
 pub mod session;
 pub mod theme;

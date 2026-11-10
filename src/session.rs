@@ -36,6 +36,21 @@ fn herdr_ids(cm_name: &str) -> (&str, &str) {
     (space, cm_name)
 }
 
+/// The Herdr space a task's sessions show in.
+pub fn task_space(project: &str, task: &str) -> String {
+    format!(
+        "cm{sep}{}{sep}{}",
+        sanitize(project),
+        sanitize(task),
+        sep = SESSION_SEP
+    )
+}
+
+/// The Herdr space for a project's adhoc sessions and its own run command.
+pub fn project_space(project: &str) -> String {
+    task_space(project, ADHOC_MARKER)
+}
+
 /// Sentinel placed in the task slot of a session name to mark an adhoc session.
 /// Adhoc sessions belong to a project but no task; they run in the project dir.
 pub const ADHOC_MARKER: &str = "adhoc";
@@ -291,6 +306,9 @@ fn launch(spec: Launch) -> Result<()> {
     // A finished terminal of the same session (its agent exited), or a
     // recovered shell, would otherwise linger next to the new one.
     for old in hc::list_all(&[(LABEL_SESSION, spec.cm_name)])? {
+        if old.is_live() && runs_agent(&old) {
+            bail!("session {} is already running", spec.cm_name);
+        }
         if !old.is_live() {
             hc::remove(&old.address);
         } else if !runs_agent(&old) {
@@ -1205,11 +1223,25 @@ fn is_shell_command(cmd: &str) -> bool {
 /// return its name. A prior run terminal of the same name is replaced so "Run"
 /// always starts fresh. The shell stays alive after the command exits so its
 /// output (and any error) remains visible on attach.
-pub fn run_command_session(label: &str, work_dir: &str, command: &str) -> Result<String> {
+/// It shows in Herdr as a tab of `space`.
+pub fn run_command_session(
+    label: &str,
+    work_dir: &str,
+    command: &str,
+    space: &str,
+) -> Result<String> {
     let name = run_session_name(label);
     kill_session_only(&name)?;
     let shell_cmd = format!("{command}; exec \"${{SHELL:-/bin/sh}}\"");
-    hc::run(work_dir, Some(&shell_cmd), &[(LABEL_RUN, &name)])?;
+    hc::run(
+        work_dir,
+        Some(&shell_cmd),
+        &[
+            (LABEL_RUN, &name),
+            (LABEL_HERDR_SPACE, space),
+            (LABEL_HERDR_TAB, &name),
+        ],
+    )?;
     Ok(name)
 }
 
@@ -2647,11 +2679,42 @@ fn ci_rollup(runs: &[serde_json::Value]) -> CiStatus {
     }
 }
 
+/// The next free session number of a task, past the live sessions and the
+/// recorded ones that aren't running (a resumed one keeps its number).
 pub fn next_session_number(project_name: &str, task_name: &str, sessions: &[LiveSession]) -> u32 {
+    let records = crate::config::load_sessions();
+    next_number_among(
+        project_name,
+        task_name,
+        sessions
+            .iter()
+            .map(|s| {
+                (
+                    s.project_name.as_str(),
+                    s.task_name.as_str(),
+                    s.session_name.as_str(),
+                )
+            })
+            .chain(records.values().map(|r| {
+                (
+                    r.project_name.as_str(),
+                    r.task_name.as_str(),
+                    r.session_name.as_str(),
+                )
+            })),
+    )
+}
+
+/// Session names in ids are sanitized: compare the task the same way.
+fn next_number_among<'a>(
+    project_name: &str,
+    task_name: &str,
+    sessions: impl Iterator<Item = (&'a str, &'a str, &'a str)>,
+) -> u32 {
+    let (project, task) = (sanitize(project_name), sanitize(task_name));
     let max = sessions
-        .iter()
-        .filter(|s| s.project_name == project_name && s.task_name == task_name)
-        .filter_map(|s| s.session_name.parse::<u32>().ok())
+        .filter(|(p, t, _)| sanitize(p) == project && sanitize(t) == task)
+        .filter_map(|(_, _, name)| name.parse::<u32>().ok())
         .max()
         .unwrap_or(0);
     max + 1
@@ -3006,6 +3069,24 @@ mod tests {
         assert!(!is_adhoc_marker("ad-hoc"));
         assert!(!is_adhoc_marker("adhocs"));
         assert!(!is_adhoc_marker("explore"));
+    }
+
+    #[test]
+    fn next_session_number_matches_tasks_by_their_sanitized_names() {
+        let sessions = [
+            ("webapp", "Add-dark-mode", "main"),
+            ("webapp", "Add-dark-mode", "1"),
+            ("webapp", "Add dark mode", "3"),
+            ("webapp", "Other-task", "7"),
+        ];
+        assert_eq!(
+            next_number_among("webapp", "Add dark mode", sessions.into_iter()),
+            4
+        );
+        assert_eq!(
+            next_number_among("webapp", "New task", sessions.into_iter()),
+            1
+        );
     }
 
     #[test]

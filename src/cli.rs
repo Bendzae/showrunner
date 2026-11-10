@@ -11,6 +11,7 @@ use anyhow::{Result, bail};
 use serde_json::{Value, json};
 
 use crate::agent::AgentKind;
+use crate::cli_actions;
 use crate::config::{self, Config};
 use crate::ops;
 use crate::remote;
@@ -50,6 +51,25 @@ Managing tasks and sessions (usable from inside a session):
                                                     unresolved review threads, live
   showrunner session set-conversation <session> <id>
                                                 record the Claude conversation it resumes
+
+What the TUI's menus do:
+  showrunner project add <path> [--name <n>] | delete <project> --yes
+  showrunner project move <project> up|down | set-run <project> [<command>]
+  showrunner project branches <project> | checkout <project> <branch> | fetch <project>
+  showrunner task archive|unarchive|update|push|checkout <project> <task>
+  showrunner task move <project> <task> up|down
+  showrunner task pr <project> <task> [--create]   open its PR (--create: push, draft one)
+  showrunner task from-ticket <project> <ticket> [--agent <id>]
+  showrunner group rename <project> <group> <new> | ungroup <project> <group>
+  showrunner group move <project> <group> up|down [--archived]
+  showrunner session adhoc <project> <name> [--agent <id>]
+  showrunner session merge <session> [--message <m>] | update <session>
+  showrunner session resume <session>           start a recorded session that isn't running
+  showrunner run <project | project/task | session> [--command <cmd>] [--kill]
+  showrunner review <project/task | session> [--tool hunk|difit]
+                                                review here, then send the comments
+  showrunner herdr install [--home <dir>] [--bin <path>] [--no-keys]
+                                                the Herdr app's Showrunner layout
 
 Housekeeping:
   showrunner restore                            recreate saved sessions that
@@ -92,6 +112,11 @@ pub fn dispatch(args: &[String]) -> Option<Result<()>> {
         Some("attach") => Some(cmd_attach(rest)),
         Some("restore") => Some(cmd_restore(rest)),
         Some("migrate") => Some(cmd_migrate(rest)),
+        Some("project") => Some(cli_actions::cmd_project(rest)),
+        Some("group") => Some(cli_actions::cmd_group(rest)),
+        Some("run") => Some(cli_actions::cmd_run(rest)),
+        Some("review") => Some(cli_actions::cmd_review(rest)),
+        Some("herdr") => Some(cli_actions::cmd_herdr(rest)),
         Some("--help" | "-h" | "help") => {
             print!("{HELP}");
             Some(Ok(()))
@@ -188,7 +213,7 @@ fn cmd_link(args: &[String]) -> Result<()> {
 
 /// Split args into positionals and flags. Value flags accept `--flag value` or
 /// `--flag=value`; bool flags are stored as "true" when present.
-fn parse_args(
+pub(crate) fn parse_args(
     args: &[String],
     value_flags: &[&str],
     bool_flags: &[&str],
@@ -242,7 +267,7 @@ fn cmd_serve(args: &[String]) -> Result<()> {
 }
 
 /// Canonical `<project>/<task>/<session>` ref for a session.
-fn session_ref(s: &LiveSession) -> String {
+pub(crate) fn session_ref(s: &LiveSession) -> String {
     format!("{}/{}/{}", s.project_name, s.task_name, s.session_name)
 }
 
@@ -254,7 +279,7 @@ fn current_session_name() -> Option<String> {
 
 /// Resolve a session ref to a live session. Accepts a raw `cm__…` name,
 /// `<project>/<task>/<session>`, or `<project>/<task>` (its main session).
-fn resolve_session(reference: &str, sessions: &[LiveSession]) -> Result<LiveSession> {
+pub(crate) fn resolve_session(reference: &str, sessions: &[LiveSession]) -> Result<LiveSession> {
     let reference = reference.trim().trim_matches('/');
     if reference.is_empty() {
         bail!("a session ref is required");
@@ -351,7 +376,11 @@ fn sample_statuses(sessions: &[LiveSession]) -> HashMap<String, SessionStatus> {
 }
 
 fn cmd_list(args: &[String]) -> Result<()> {
-    let (positional, flags) = parse_args(args, &["project", "ref-prefix"], &["json", "stats"])?;
+    let (positional, flags) = parse_args(
+        args,
+        &["project", "ref-prefix"],
+        &["json", "stats", "no-status", "local"],
+    )?;
     if let Some(extra) = positional.first() {
         bail!("unexpected argument '{extra}' (usage: list [--json] [--project <name>])");
     }
@@ -361,7 +390,13 @@ fn cmd_list(args: &[String]) -> Result<()> {
 
     let cfg = Config::load()?;
     let sessions = session::list_sessions().unwrap_or_default();
-    let statuses = sample_statuses(&sessions);
+    // `--no-status` is for callers that see statuses themselves (Herdr): it
+    // skips sampling the screens, which takes a moment.
+    let statuses = if flags.contains_key("no-status") {
+        HashMap::new()
+    } else {
+        sample_statuses(&sessions)
+    };
     let current = current_session_name();
     let project_filter = flags.get("project");
     // Set when a remote lists on behalf of the caller, so printed refs are
@@ -370,7 +405,7 @@ fn cmd_list(args: &[String]) -> Result<()> {
     let session_ref = |s: &LiveSession| format!("{ref_prefix}{}", session_ref(s));
     // `--project` names a local project, so a filtered list stays local.
     let host_listings: Vec<(remote::Host, Result<String>)> =
-        if ref_prefix.is_empty() && project_filter.is_none() {
+        if ref_prefix.is_empty() && project_filter.is_none() && !flags.contains_key("local") {
             remote::hosts(&cfg)
                 .into_iter()
                 .map(|host| {
@@ -391,6 +426,7 @@ fn cmd_list(args: &[String]) -> Result<()> {
         bail!("project '{filter}' not found");
     }
 
+    let records = config::load_sessions();
     let session_value = |s: &LiveSession| {
         let mut v = json!({
             "ref": session_ref(s),
@@ -399,6 +435,9 @@ fn cmd_list(args: &[String]) -> Result<()> {
             "status": statuses.get(&s.name).map(|st| st.as_str()),
             "agent": session::session_agent(&s.name).id(),
             "current": current.as_deref() == Some(s.name.as_str()),
+            "run": session::run_session_name(&s.name),
+            "worktree": s.worktree_path(),
+            "remote_control": records.get(&s.name).is_some_and(|r| r.remote_control),
         });
         if stats {
             v["diff"] = session::get_diff_stats(&s.name)
@@ -411,6 +450,31 @@ fn cmd_list(args: &[String]) -> Result<()> {
     };
 
     if flags.contains_key("json") {
+        // Recorded sessions that aren't running (closed, or not restored yet),
+        // so a frontend can offer to resume them. Those still in tmux move
+        // with `migrate` instead.
+        let in_tmux: std::collections::HashSet<String> =
+            crate::migrate::tmux_sessions().into_iter().collect();
+        let stopped = |project: &str, task: &str| -> Vec<Value> {
+            let mut out: Vec<Value> = records
+                .iter()
+                .filter(|(name, r)| {
+                    !r.archived
+                        && r.belongs_to(project, task)
+                        && !sessions.iter().any(|s| &s.name == *name)
+                })
+                .map(|(name, r)| {
+                    json!({
+                        "cm_name": name,
+                        "name": r.session_name,
+                        "agent": r.agent,
+                        "in_tmux": in_tmux.contains(name.as_str()),
+                    })
+                })
+                .collect();
+            out.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+            out
+        };
         let projects: Vec<Value> = projects
             .iter()
             .map(|p| {
@@ -426,6 +490,9 @@ fn cmd_list(args: &[String]) -> Result<()> {
                             "archived": t.archived,
                             "group": t.group,
                             "linear": t.linear,
+                            "run": session::run_session_name(&format!("{}-{}", p.name, t.name)),
+                            "space": session::task_space(&p.name, &t.name),
+                            "stopped": stopped(&p.name, &t.name),
                             "stack": stacks.get(&t.branch).map(|(pos, total)| {
                                 json!({ "position": pos, "size": total })
                             }),
@@ -454,6 +521,10 @@ fn cmd_list(args: &[String]) -> Result<()> {
                 let mut v = json!({
                     "name": p.name,
                     "path": p.path,
+                    "run": session::run_session_name(&p.name),
+                    "run_command": p.run_command,
+                    "space": session::project_space(&p.name),
+                    "adhoc_stopped": stopped(&p.name, session::ADHOC_MARKER),
                     "tasks": tasks,
                     "adhoc_sessions": session::adhoc_sessions_for_project(&p.name, &sessions)
                         .iter()
@@ -466,7 +537,7 @@ fn cmd_list(args: &[String]) -> Result<()> {
                 v
             })
             .collect();
-        let mut out = json!({ "projects": projects });
+        let mut out = json!({ "projects": projects, "default_agent": cfg.default_agent });
         let hosts: Vec<Value> = host_listings
             .into_iter()
             .map(|(host, listing)| {
@@ -583,6 +654,7 @@ fn cmd_task(args: &[String]) -> Result<()> {
         Some("set-group") => cmd_task_set_group(&args[1..]),
         Some("set-linear") => cmd_task_set_linear(&args[1..]),
         Some("delete") => cmd_task_delete(&args[1..]),
+        Some(other) if let Some(result) = cli_actions::task_action(other, &args[1..]) => result,
         Some(other) => {
             bail!(
                 "unknown task command '{other}' (expected create, set-base, set-group, \
@@ -771,6 +843,7 @@ fn cmd_session(args: &[String]) -> Result<()> {
         Some("ticket") => cmd_session_ticket(&args[1..]),
         Some("pr") => cmd_session_pr(&args[1..]),
         Some("set-conversation") => cmd_session_set_conversation(&args[1..]),
+        Some(other) if let Some(result) = cli_actions::session_action(other, &args[1..]) => result,
         Some(other) => bail!(
             "unknown session command '{other}' (expected create, kill, move, remote-control, \
              info, ticket, pr or set-conversation)"

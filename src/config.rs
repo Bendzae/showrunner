@@ -765,8 +765,12 @@ pub struct Config {
     pub startup_skills: Vec<String>,
 }
 
-/// Root directory for all showrunner data: ~/.showrunner
+/// Root directory for all showrunner data: `~/.showrunner`, or
+/// `$SHOWRUNNER_HOME` (a separate setup, e.g. for testing).
 pub fn base_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("SHOWRUNNER_HOME") {
+        return PathBuf::from(dir);
+    }
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("~"))
         .join(".showrunner")
@@ -785,6 +789,9 @@ fn legacy_base_dir() -> PathBuf {
 /// back-pointers of the worktrees living inside it. A no-op when there is
 /// nothing to migrate or the new dir already exists.
 pub fn migrate_legacy_base_dir() {
+    if std::env::var_os("SHOWRUNNER_HOME").is_some() {
+        return;
+    }
     let old = legacy_base_dir();
     let new = base_dir();
     if new.exists() || !old.exists() || fs::rename(&old, &new).is_err() {
@@ -894,6 +901,14 @@ pub struct SessionRecord {
 }
 
 impl SessionRecord {
+    /// Whether the record is one of this task's sessions. Records keep names
+    /// as they were given, so compare them sanitized, as session names are.
+    pub fn belongs_to(&self, project: &str, task: &str) -> bool {
+        use crate::session::sanitize;
+        sanitize(&self.project_name) == sanitize(project)
+            && sanitize(&self.task_name) == sanitize(task)
+    }
+
     pub fn agent_kind(&self) -> crate::agent::AgentKind {
         crate::agent::AgentKind::from_id(&self.agent).unwrap_or_default()
     }
@@ -1535,6 +1550,25 @@ mod tests {
         cfg.add_project("App".into(), "/tmp/app".into());
         cfg.add_project("App2".into(), "/tmp/app".into());
         assert_eq!(cfg.projects.len(), 1);
+    }
+
+    #[test]
+    fn session_records_belong_to_their_task_by_sanitized_names() {
+        let record = SessionRecord {
+            project_name: "web app".into(),
+            project_path: "/tmp/web".into(),
+            task_name: "Fix login flow".into(),
+            task_branch: "fix-login-flow".into(),
+            session_name: "main".into(),
+            use_worktree: true,
+            archived: false,
+            agent: "claude".into(),
+            remote_control: false,
+            claude_session_id: None,
+        };
+        assert!(record.belongs_to("web app", "Fix login flow"));
+        assert!(record.belongs_to("web-app", "Fix-login-flow"));
+        assert!(!record.belongs_to("web app", "Fix login"));
     }
 
     #[test]

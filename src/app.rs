@@ -1,16 +1,15 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Write as _;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
 
 use anyhow::Result;
 
 use crate::agent::AgentKind;
 use crate::config::{self, Config, KeyBindings, Project, ReviewTool, Task};
 use crate::remote::{self, HostPoller, HostSnapshot, Link, Target};
+use crate::review;
 use crate::session::{self, DiffStats, LiveSession, PrInfo, SessionStatus};
 use crate::worker::{TaskInfo, Worker};
 
@@ -199,6 +198,8 @@ pub struct RunContext {
     pub project_name: String,
     pub cwd: String,
     pub label: String,
+    /// The Herdr space the run terminal shows in.
+    pub space: String,
 }
 
 /// Label identifying the run session for a list item (the basis of its run
@@ -215,130 +216,6 @@ pub fn run_label(item: &ListItem) -> Option<String> {
         }
         ListItem::AdhocGroup { .. } | ListItem::TaskGroup { .. } => None,
     }
-}
-
-/// True when a `difit` executable is found on `PATH`.
-fn difit_on_path() -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path).any(|dir| dir.join("difit").is_file())
-}
-
-/// Build the command used to launch difit. Prefers a `difit` binary on `PATH`;
-/// otherwise falls back to `npx -y difit` so review works without a global
-/// install (npx fetches the package on first use).
-fn difit_command(args: &[String]) -> std::process::Command {
-    let mut cmd = if difit_on_path() {
-        std::process::Command::new("difit")
-    } else {
-        let mut c = std::process::Command::new("npx");
-        c.args(["-y", "difit"]);
-        c
-    };
-    cmd.args(args);
-    cmd
-}
-
-/// True when a `hunk` executable is found on `PATH`.
-fn hunk_on_path() -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path).any(|dir| dir.join("hunk").is_file())
-}
-
-/// Build the command used to launch hunk. Prefers a `hunk` binary on `PATH`;
-/// otherwise falls back to `npx -y hunkdiff` (hunk's npm package name) so review
-/// works without a global install (npx fetches the package on first use).
-pub fn hunk_command(args: &[String]) -> std::process::Command {
-    let mut cmd = if hunk_on_path() {
-        std::process::Command::new("hunk")
-    } else {
-        let mut c = std::process::Command::new("npx");
-        c.args(["-y", "hunkdiff"]);
-        c
-    };
-    cmd.args(args);
-    cmd
-}
-
-/// A single inline review note from hunk's live session (`hunk session comment
-/// list --json`). Only the fields needed to forward the note are deserialized.
-#[derive(Clone, serde::Deserialize)]
-struct HunkComment {
-    #[serde(rename = "filePath")]
-    file_path: Option<String>,
-    body: Option<String>,
-    /// `[start, end]` line range on the new side; absent for pure deletions.
-    #[serde(rename = "newRange")]
-    new_range: Option<Vec<i64>>,
-    /// `[start, end]` line range on the old side.
-    #[serde(rename = "oldRange")]
-    old_range: Option<Vec<i64>>,
-}
-
-/// Query hunk's live session for the human's review comments (`--type user`).
-/// Returns `None` on any failure (daemon down, session not yet registered, parse
-/// error) so the poller simply keeps its previous snapshot.
-fn query_hunk_user_comments(cwd: &str) -> Option<Vec<HunkComment>> {
-    let args: Vec<String> = [
-        "session", "comment", "list", "--repo", cwd, "--type", "user", "--json",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect();
-    // Null stdin so this background query can't contend for terminal input with
-    // the foreground hunk TUI; `output()` already keeps stdout/stderr off-screen.
-    let out = hunk_command(&args)
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    #[derive(serde::Deserialize)]
-    struct List {
-        comments: Vec<HunkComment>,
-    }
-    serde_json::from_slice::<List>(&out.stdout)
-        .ok()
-        .map(|l| l.comments)
-}
-
-/// Format hunk review comments into a raw comment block (`- file:line — body`
-/// bullets). Wrapped by [`review_prompt`] before it's forwarded to the agent,
-/// the same way difit's extracted comment block is.
-fn format_hunk_comments(comments: &[HunkComment]) -> String {
-    comments
-        .iter()
-        .map(|c| {
-            let file = c.file_path.as_deref().unwrap_or("(unknown file)");
-            let line = c
-                .new_range
-                .as_ref()
-                .or(c.old_range.as_ref())
-                .and_then(|r| r.first())
-                .copied();
-            let body = c.body.as_deref().unwrap_or("").trim();
-            match line {
-                Some(l) => format!("- {file}:{l} — {body}"),
-                None => format!("- {file} — {body}"),
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// Extract the review-comment block difit prints to stdout on exit. Returns
-/// `None` when the session left no comments (difit prints nothing).
-pub fn extract_difit_comments(stdout: &str) -> Option<String> {
-    const MARKER: &str = "Comments from review session:";
-    let idx = stdout.find(MARKER)?;
-    // Back up to the start of the marker's line so the header is included.
-    let line_start = stdout[..idx].rfind('\n').map(|n| n + 1).unwrap_or(0);
-    Some(stdout[line_start..].trim_end().to_string())
 }
 
 /// A pending foreground hunk review: working dir, hunk CLI args, and the
@@ -472,15 +349,6 @@ pub struct PendingReview {
     pub comments: String,
     /// Candidate sessions as `(session name, display name)`.
     pub candidates: Vec<(String, String)>,
-}
-
-/// The prompt forwarded to an agent session carrying review comments (difit or
-/// hunk); `comments` is the tool's raw comment block.
-fn review_prompt(comments: &str) -> String {
-    format!(
-        "The following code review comments were left during review. \
-         Please address them:\n\n{comments}"
-    )
 }
 
 /// Modification time of config.toml, if it exists.
@@ -1042,7 +910,7 @@ impl App {
     /// outcome in the status bar.
     fn forward_review_comments(&mut self, comments: &str, cm_name: &str, display: &str) {
         self.status_message = Some(
-            match session::send_text(cm_name, &review_prompt(comments), true) {
+            match session::send_text(cm_name, &review::prompt(comments), true) {
                 Ok(()) => format!("Forwarded review comments to {display}"),
                 Err(e) => format!("Failed to forward comments: {e}"),
             },
@@ -2166,109 +2034,58 @@ impl App {
     /// which suspends the TUI and runs it on the real terminal. Both forward any
     /// review comments to the agent session on exit.
     pub fn start_review(&mut self) {
-        // (cwd, difit args, hunk args, candidate sessions, description). Each
-        // candidate is `(session name, display name)`; comments forward to it.
-        let (cwd, difit_args, hunk_args, candidates, description) =
-            match self.selected_item().cloned() {
-                Some(ListItem::Task {
-                    project_name,
-                    project_path,
-                    task,
-                }) => {
-                    let base = task
-                        .base_branch
-                        .clone()
-                        .unwrap_or_else(|| "main".to_string());
-                    let base_ref = session::resolve_base_ref(&project_path, &base);
-                    // All of the task's sessions are candidates: a lone one is
-                    // forwarded to directly, several trigger the picker popup.
-                    let candidates =
-                        session::sessions_for_task(&project_name, &task.name, &self.sessions)
-                            .into_iter()
-                            .map(|s| (s.name, s.session_name))
-                            .collect();
-                    // difit: `difit <target> <base> --merge-base` resolves the base
-                    // to merge-base(branch, base) so we see only the branch's changes
-                    // — the GitHub PR diff, excluding main's commits since the fork
-                    // point. hunk: the three-dot range `<base>...<branch>` is git's
-                    // equivalent merge-base diff, passed straight through to git.
-                    (
-                        project_path,
-                        vec![
-                            task.branch.clone(),
-                            base_ref.clone(),
-                            "--merge-base".to_string(),
-                        ],
-                        vec!["diff".to_string(), format!("{base_ref}...{}", task.branch)],
-                        candidates,
-                        format!("{} vs {base}", task.branch),
-                    )
-                }
-                Some(ListItem::Session {
-                    project_path,
-                    session,
-                    ..
-                }) => {
-                    let cwd = session
-                        .worktree_path()
-                        .map(|p| p.to_string_lossy().to_string())
-                        .unwrap_or(project_path);
-                    // hunk's `diff` shows uncommitted working-tree changes and
-                    // includes untracked files by default.
-                    (
-                        cwd,
-                        vec![".".to_string(), "--include-untracked".to_string()],
-                        vec!["diff".to_string()],
-                        vec![(session.name.clone(), session.session_name.clone())],
-                        format!("uncommitted changes in {}", session.session_name),
-                    )
-                }
-                _ => {
-                    self.status_message = Some("Select a task or session to review".into());
-                    return;
-                }
-            };
+        let target = match self.selected_item().cloned() {
+            Some(ListItem::Task {
+                project_name,
+                project_path,
+                task,
+            }) => review::for_task(&project_name, &project_path, &task, &self.sessions),
+            Some(ListItem::Session {
+                project_path,
+                session,
+                ..
+            }) => review::for_session(&project_path, &session),
+            _ => {
+                self.status_message = Some("Select a task or session to review".into());
+                return;
+            }
+        };
+        let description = target.description;
 
         if let ReviewTool::Hunk = self.config.review_tool {
             // hunk needs the controlling terminal; hand it to the main loop,
             // along with the candidate sessions its comments forward to.
             self.status_message = Some(format!("Reviewing {description} in hunk…"));
-            self.should_review_hunk = Some((cwd, hunk_args, candidates));
+            self.should_review_hunk = Some((target.cwd, target.hunk_args, target.candidates));
             return;
         }
 
+        let (cwd, difit_args, candidates) = (target.cwd, target.difit_args, target.candidates);
         let review_tx = self.review_sender.clone();
         self.start_op(&format!("Reviewing {description} in difit…"), move || {
-            // `.output()` captures difit's stdout/stderr (keeping them off the
-            // TUI) and blocks this background thread until the browser closes.
-            let message = match difit_command(&difit_args).current_dir(&cwd).output() {
-                Err(e) => format!("difit failed to launch (need difit or npx on PATH): {e}"),
-                Ok(out) => {
-                    let stdout = String::from_utf8_lossy(&out.stdout);
-                    match extract_difit_comments(&stdout) {
-                        Some(comments) => match candidates.len() {
-                            0 => "Review finished; no session to forward comments to".into(),
-                            // Exactly one candidate: forward straight away.
-                            1 => {
-                                let (cm_name, display) = &candidates[0];
-                                match session::send_text(cm_name, &review_prompt(&comments), true) {
-                                    Ok(()) => format!("Forwarded review comments to {display}"),
-                                    Err(e) => format!("Failed to forward comments: {e}"),
-                                }
-                            }
-                            // Several candidates: hand off to the main thread so
-                            // the user can pick the target via a popup.
-                            _ => {
-                                let _ = review_tx.send(PendingReview {
-                                    comments,
-                                    candidates,
-                                });
-                                "Review closed; select a session to forward comments to".into()
-                            }
-                        },
-                        None => "Review closed with no comments".into(),
+            let message = match review::run_difit(&cwd, &difit_args) {
+                Err(e) => format!("{e:#}"),
+                Ok(None) => "Review closed with no comments".into(),
+                Ok(Some(comments)) => match candidates.len() {
+                    0 => "Review finished; no session to forward comments to".into(),
+                    // Exactly one candidate: forward straight away.
+                    1 => {
+                        let (cm_name, display) = &candidates[0];
+                        match session::send_text(cm_name, &review::prompt(&comments), true) {
+                            Ok(()) => format!("Forwarded review comments to {display}"),
+                            Err(e) => format!("Failed to forward comments: {e}"),
+                        }
                     }
-                }
+                    // Several candidates: hand off to the main thread so
+                    // the user can pick the target via a popup.
+                    _ => {
+                        let _ = review_tx.send(PendingReview {
+                            comments,
+                            candidates,
+                        });
+                        "Review closed; select a session to forward comments to".into()
+                    }
+                },
             };
             OpResult {
                 message,
@@ -2295,53 +2112,15 @@ impl App {
         args: Vec<String>,
         candidates: Vec<(String, String)>,
     ) {
-        let stop = Arc::new(AtomicBool::new(false));
-        let latest: Arc<Mutex<Vec<HunkComment>>> = Arc::new(Mutex::new(Vec::new()));
-
-        let poller = {
-            let stop = stop.clone();
-            let latest = latest.clone();
-            let cwd = cwd.clone();
-            thread::spawn(move || {
-                while !stop.load(Ordering::Relaxed) {
-                    if let Some(comments) = query_hunk_user_comments(&cwd) {
-                        *latest.lock().unwrap() = comments;
-                    }
-                    // Sleep in short slices so we stop promptly when hunk exits.
-                    for _ in 0..3 {
-                        if stop.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        thread::sleep(Duration::from_millis(100));
-                    }
-                }
-            })
-        };
-
-        let status = hunk_command(&args).current_dir(&cwd).status();
-        stop.store(true, Ordering::Relaxed);
-        let _ = poller.join();
-
-        match status {
-            Err(e) => {
-                self.status_message = Some(format!(
-                    "hunk failed to launch (need hunk or npx on PATH): {e}"
-                ));
-            }
-            Ok(_) => {
-                let comments = latest.lock().unwrap().clone();
-                if comments.is_empty() {
-                    self.status_message = Some("Review closed with no comments".into());
-                } else {
-                    // Route through the shared picker: forwarded directly for a
-                    // lone candidate, popup for several (shown when the TUI
-                    // resumes), status message for none.
-                    self.open_review_session_picker(PendingReview {
-                        comments: format_hunk_comments(&comments),
-                        candidates,
-                    });
-                }
-            }
+        match review::run_hunk(&cwd, &args) {
+            Err(e) => self.status_message = Some(format!("{e:#}")),
+            Ok(None) => self.status_message = Some("Review closed with no comments".into()),
+            // Forwarded directly for a lone candidate, a popup for several
+            // (shown when the TUI resumes), a status message for none.
+            Ok(Some(comments)) => self.open_review_session_picker(PendingReview {
+                comments,
+                candidates,
+            }),
         }
     }
 
@@ -2354,8 +2133,11 @@ impl App {
             self.status_message = Some("Select a project, task, or session to run".into());
             return None;
         };
-        let (project_name, cwd) = match item {
-            ListItem::Project { project } => (project.name, project.path),
+        let (project_name, cwd, space) = match item {
+            ListItem::Project { project } => {
+                let space = session::project_space(&project.name);
+                (project.name, project.path, space)
+            }
             ListItem::Task {
                 project_name,
                 project_path,
@@ -2368,7 +2150,8 @@ impl App {
                     .and_then(|s| s.worktree_path())
                     .map(|p| p.to_string_lossy().to_string())
                     .unwrap_or(project_path);
-                (project_name, cwd)
+                let space = session::task_space(&project_name, &task.name);
+                (project_name, cwd, space)
             }
             ListItem::Session {
                 project_name,
@@ -2386,7 +2169,8 @@ impl App {
                     .worktree_path()
                     .map(|p| p.to_string_lossy().to_string())
                     .unwrap_or(project_path);
-                (project_name, cwd)
+                let space = session::task_space(&session.project_name, &session.task_name);
+                (project_name, cwd, space)
             }
             // run_label already returned None for any other variant.
             ListItem::AdhocGroup { .. } | ListItem::TaskGroup { .. } => return None,
@@ -2395,6 +2179,7 @@ impl App {
             project_name,
             cwd,
             label,
+            space,
         })
     }
 
@@ -2532,7 +2317,7 @@ impl App {
 
     /// Launch `command` in a dedicated run terminal for `ctx` and attach.
     fn launch_run(&mut self, ctx: RunContext, command: String) {
-        match session::run_command_session(&ctx.label, &ctx.cwd, &command) {
+        match session::run_command_session(&ctx.label, &ctx.cwd, &command, &ctx.space) {
             Ok(cm_name) => {
                 self.status_message = Some(format!("Running: {command}"));
                 self.should_attach = Some(cm_name);
@@ -4312,7 +4097,7 @@ fn fuzzy_score(query: &str, candidate: &str) -> Option<i64> {
 /// Open `url` (or a file path) in the platform's default handler. Uses `open`
 /// on macOS and `xdg-open` on Linux/other Unixes. Errors are swallowed by
 /// callers, matching the previous best-effort behavior.
-fn open_url(url: &str) {
+pub(crate) fn open_url(url: &str) {
     let opener = if cfg!(target_os = "macos") {
         "open"
     } else {
@@ -4386,62 +4171,5 @@ mod tests {
         let prefix = fuzzy_score("feat", "feature/x").unwrap();
         let scattered = fuzzy_score("feat", "x-fix-east").unwrap();
         assert!(prefix < scattered, "{prefix} should beat {scattered}");
-    }
-
-    #[test]
-    fn extract_difit_comments_returns_none_without_marker() {
-        assert_eq!(extract_difit_comments("server started\nbye"), None);
-    }
-
-    #[test]
-    fn extract_difit_comments_captures_from_marker() {
-        let out = "noise\nComments from review session:\n- fix this\n";
-        let got = extract_difit_comments(out).unwrap();
-        assert!(got.starts_with("Comments from review session:"));
-        assert!(got.contains("- fix this"));
-    }
-
-    // Parse the exact shape `hunk session comment list --json` emits, then format
-    // it into the comment block. Guards both the serde field renames and the
-    // file:line rendering (incl. the oldRange-only / missing-line fallbacks).
-    fn parse_hunk_comments(json: &str) -> Vec<HunkComment> {
-        #[derive(serde::Deserialize)]
-        struct List {
-            comments: Vec<HunkComment>,
-        }
-        serde_json::from_str::<List>(json).unwrap().comments
-    }
-
-    #[test]
-    fn format_hunk_comments_renders_file_line_and_body() {
-        let json = r#"{"comments":[
-            {"noteId":"u:1","source":"user","filePath":"src/f.txt","hunkIndex":0,
-             "newRange":[2,2],"body":"Please rename this variable","editable":true},
-            {"noteId":"u:2","source":"user","filePath":"src/g.txt",
-             "oldRange":[10,12],"body":"Removed too much","editable":true}
-        ]}"#;
-        let comments = parse_hunk_comments(json);
-        let out = format_hunk_comments(&comments);
-        assert!(out.contains("- src/f.txt:2 — Please rename this variable"));
-        // Falls back to oldRange when newRange is absent.
-        assert!(out.contains("- src/g.txt:10 — Removed too much"));
-        // Wrapped by the shared review prompt when forwarded.
-        assert!(review_prompt(&out).contains("Please address them"));
-    }
-
-    #[test]
-    fn format_hunk_comments_tolerates_missing_fields() {
-        // A note with neither range nor file still renders without panicking.
-        let comments = parse_hunk_comments(r#"{"comments":[{"body":"general note"}]}"#);
-        let out = format_hunk_comments(&comments);
-        assert!(out.contains("(unknown file) — general note"));
-    }
-
-    #[test]
-    fn review_prompt_embeds_the_comments() {
-        let prompt = review_prompt("- rename foo\n- drop bar");
-        assert!(prompt.contains("- rename foo"));
-        assert!(prompt.contains("- drop bar"));
-        assert!(prompt.contains("Please address them"));
     }
 }

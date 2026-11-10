@@ -140,7 +140,7 @@ fn cwd_scoped_sessions_by_dir(records: &HashMap<String, SessionRecord>) -> HashM
     counts
 }
 
-fn tmux_sessions() -> Vec<String> {
+pub(crate) fn tmux_sessions() -> Vec<String> {
     tmux(&["list-sessions", "-F", "#{session_name}"])
         .map(|out| {
             out.lines()

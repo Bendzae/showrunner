@@ -407,9 +407,19 @@ pub fn restore_sessions(cfg: &Config) -> RestoreReport {
     }
     let live: Vec<session::LiveSession> = session::list_sessions().unwrap_or_default();
     let live_names: HashSet<&str> = live.iter().map(|s| s.name.as_str()).collect();
+    // Recreating a session still running in tmux would run its agent twice on
+    // one conversation: those move with `migrate`.
+    let in_tmux: HashSet<String> = crate::migrate::tmux_sessions().into_iter().collect();
 
     for (cm_name, record) in &saved {
         if record.archived || live_names.contains(cm_name.as_str()) {
+            continue;
+        }
+        if in_tmux.contains(cm_name) {
+            report.failures.push(format!(
+                "{}/{}/{}: still running in tmux (move it with `showrunner migrate`)",
+                record.project_name, record.task_name, record.session_name
+            ));
             continue;
         }
         let reference = format!(
@@ -451,6 +461,29 @@ pub fn restore_sessions(cfg: &Config) -> RestoreReport {
         }
     }
     report
+}
+
+/// Start a recorded session that isn't running, resuming its conversation.
+pub fn resume_session(cfg: &Config, cm_name: &str) -> Result<()> {
+    let record = session_record(cm_name)?;
+    if session::list_sessions()?.iter().any(|s| s.name == cm_name) {
+        bail!("{cm_name} is already running");
+    }
+    if crate::migrate::tmux_sessions().iter().any(|s| s == cm_name) {
+        bail!("it still runs in tmux: move it with `showrunner migrate`");
+    }
+    if record.archived {
+        bail!("its task is archived: unarchive the task instead");
+    }
+    if session::is_adhoc_marker(&record.task_name) {
+        session::recreate_adhoc_session(cm_name, &record)?;
+        return Ok(());
+    }
+    let project = cfg.projects.iter().find(|p| p.path == record.project_path);
+    if !recreate_task_session(project, cm_name, &record)? {
+        bail!("its branch is gone, so the session was dropped");
+    }
+    Ok(())
 }
 
 /// Recreate a task session from its record. A missing worktree (the task was
@@ -794,4 +827,295 @@ pub fn pr_details(project_path: &str, branch: &str) -> Result<serde_json::Value>
         "checks": checks,
         "threads": threads,
     }))
+}
+
+/// Register a git repository as a project; returns its name (`name`, else the
+/// folder's).
+pub fn add_project(path: &str, name: Option<&str>) -> Result<String> {
+    let path = std::path::PathBuf::from(crate::app::expand_tilde(path.trim()));
+    if !path.is_dir() {
+        bail!("{} is not a directory", path.display());
+    }
+    let path = path.canonicalize().unwrap_or(path);
+    if !path.join(".git").is_dir() {
+        bail!("{} is not a git repository", path.display());
+    }
+    let path_str = path.to_string_lossy().to_string();
+    let name = name
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map(str::to_string)
+        .or_else(|| path.file_name().map(|n| n.to_string_lossy().to_string()))
+        .unwrap_or_else(|| "unknown".into());
+    if Config::load()?.has_project_at(&path_str) {
+        bail!("{path_str} is already a project");
+    }
+    let added = name.clone();
+    Config::modify(move |c| c.add_project(added, path_str))?;
+    Ok(name)
+}
+
+/// Delete a project: every task's sessions, worktrees and branches, its
+/// folders under the data dir, and the config entry. The repository itself
+/// stays.
+pub fn delete_project(project: &Project) -> Result<()> {
+    let sessions = session::list_sessions().unwrap_or_default();
+    for task in &project.tasks {
+        session::delete_task(
+            &project.name,
+            &project.path,
+            &task.name,
+            &task.branch,
+            &sessions,
+        );
+    }
+    for adhoc in session::adhoc_sessions_for_project(&project.name, &sessions) {
+        let _ = session::kill_session(&adhoc.name);
+    }
+    session::cleanup_project_dirs(&project.name);
+    config::remove_project_session_records(&project.name);
+    let path = project.path.clone();
+    Config::modify(move |c| c.remove_project(&path))?;
+    Ok(())
+}
+
+/// Archive a task: its sessions stop and their worktrees go (branches stay),
+/// and the records are kept so unarchiving brings them back. Returns how many
+/// sessions were running.
+pub fn archive_task(project: &Project, task_name: &str) -> Result<usize> {
+    find_task(project, task_name)?;
+    let (project_name, task) = (project.name.clone(), task_name.to_string());
+    Config::modify(move |c| {
+        c.set_task_archived(&project_name, &task, true);
+    })?;
+    config::set_task_session_records_archived(&project.name, task_name, true);
+
+    let sessions = session::list_sessions().unwrap_or_default();
+    let live = session::sessions_for_task(&project.name, task_name, &sessions);
+    for s in &live {
+        let _ = session::kill_session_only(&s.name);
+    }
+    for record in config::load_sessions().values() {
+        if record.belongs_to(&project.name, task_name) {
+            session::remove_record_worktree(record);
+        }
+    }
+    Ok(live.len())
+}
+
+/// Bring an archived task back with its sessions, each resuming its
+/// conversation in a recreated worktree. Returns the sessions restored and
+/// `session: error` for those that couldn't be.
+pub fn unarchive_task(project: &Project, task_name: &str) -> Result<(usize, Vec<String>)> {
+    find_task(project, task_name)?;
+    let (project_name, task) = (project.name.clone(), task_name.to_string());
+    Config::modify(move |c| {
+        c.set_task_archived(&project_name, &task, false);
+    })?;
+    config::set_task_session_records_archived(&project.name, task_name, false);
+
+    let mut restored = 0;
+    let mut failed = Vec::new();
+    for (cm_name, record) in &config::load_sessions() {
+        if !record.belongs_to(&project.name, task_name) {
+            continue;
+        }
+        match recreate_task_session(Some(project), cm_name, record) {
+            Ok(true) => restored += 1,
+            Ok(false) => {}
+            Err(e) => failed.push(format!("{}: {e}", record.session_name)),
+        }
+    }
+    Ok((restored, failed))
+}
+
+pub fn find_task<'a>(project: &'a Project, task_name: &str) -> Result<&'a config::Task> {
+    project
+        .tasks
+        .iter()
+        .find(|t| t.name == task_name)
+        .ok_or_else(|| {
+            anyhow::anyhow!("task '{task_name}' not found in project '{}'", project.name)
+        })
+}
+
+/// Start an adhoc session: the agent in the project directory, on whatever
+/// branch is checked out there.
+pub fn create_adhoc_session(
+    cfg: &Config,
+    project: &Project,
+    name: &str,
+    agent: AgentKind,
+) -> Result<String> {
+    let name = name.trim();
+    if name.is_empty() {
+        bail!("an adhoc session needs a name");
+    }
+    let cm_name = session::build_session_name(&project.name, session::ADHOC_MARKER, name);
+    if session::list_sessions()?.iter().any(|s| s.name == cm_name) {
+        bail!("adhoc session '{name}' already exists");
+    }
+    let cm_name = session::create_adhoc_session(
+        &project.name,
+        &project.path,
+        name,
+        &cfg.startup_skills,
+        agent,
+    )?;
+    config::add_session_record(
+        &cm_name,
+        SessionRecord {
+            project_name: project.name.clone(),
+            project_path: project.path.clone(),
+            task_name: session::ADHOC_MARKER.to_string(),
+            task_branch: String::new(),
+            session_name: name.to_string(),
+            use_worktree: false,
+            archived: false,
+            agent: agent.id().to_string(),
+            remote_control: false,
+            claude_session_id: session::claude_session_id(&cm_name),
+        },
+    );
+    Ok(cm_name)
+}
+
+/// A live session's record, which knows its task and worktree.
+fn session_record(cm_name: &str) -> Result<SessionRecord> {
+    config::load_sessions()
+        .remove(cm_name)
+        .ok_or_else(|| anyhow::anyhow!("no session record for {cm_name}"))
+}
+
+fn session_worktree(record: &SessionRecord) -> Result<String> {
+    if !record.use_worktree {
+        bail!("the session has no worktree");
+    }
+    Ok(session::worktree_dir(
+        &record.project_name,
+        &record.task_name,
+        &record.session_name,
+    )
+    .to_string_lossy()
+    .to_string())
+}
+
+/// Merge a session's branch into its task branch, first committing what its
+/// worktree holds (with `message`, else a numbered default).
+pub fn merge_session(cm_name: &str, message: Option<&str>) -> Result<String> {
+    if is_main_session_name(cm_name) {
+        bail!("the main session is on the task branch already: nothing to merge");
+    }
+    let record = session_record(cm_name)?;
+    let worktree = session_worktree(&record)?;
+    if session::worktree_is_dirty(&worktree) {
+        let message = message
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| session::next_commit_message(&worktree, &record.session_name));
+        session::commit_all(&worktree, &message)?;
+    }
+    session::merge_session_to_task(
+        &record.project_path,
+        &record.task_branch,
+        &record.session_name,
+        &worktree,
+    )
+}
+
+/// Rebase a session's branch onto its task branch.
+pub fn update_session(cm_name: &str) -> Result<String> {
+    if is_main_session_name(cm_name) {
+        bail!("the main session is the task branch: update the task instead");
+    }
+    let record = session_record(cm_name)?;
+    let worktree = session_worktree(&record)?;
+    session::rebase_session_on_task(&record.project_path, &record.task_branch, &worktree)
+}
+
+/// The task's PR in the browser; with none yet, push the branch and open a
+/// draft one (against the task's base when it has one). Returns its URL.
+pub fn open_or_create_pr(project: &Project, task: &config::Task) -> Result<String> {
+    if let Some(pr) = session::get_pr_info(&project.path, &task.branch) {
+        crate::app::open_url(&pr.url);
+        return Ok(pr.url);
+    }
+    session::push_branch(&project.path, &task.branch).context("pushing the branch")?;
+    let mut args = vec![
+        "pr",
+        "create",
+        "--draft",
+        "--title",
+        &task.name,
+        "--body",
+        "",
+        "--head",
+        &task.branch,
+    ];
+    let base = task.base_branch.as_deref().filter(|b| !b.trim().is_empty());
+    if let Some(base) = base {
+        args.extend(["--base", base]);
+    }
+    let out = std::process::Command::new("gh")
+        .args(&args)
+        .current_dir(&project.path)
+        .output()
+        .context("running gh")?;
+    if !out.status.success() {
+        bail!(
+            "creating the PR failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    crate::app::open_url(&url);
+    Ok(url)
+}
+
+/// What a "Run" acts on: a project (its folder), a task (its first session's
+/// worktree) or a session (its worktree).
+pub struct RunTarget {
+    /// The run terminal's label; see [`session::run_session_name`].
+    pub label: String,
+    pub cwd: String,
+    /// The Herdr space the run terminal shows in.
+    pub space: String,
+    pub project: String,
+}
+
+pub fn run_target_project(project: &Project) -> RunTarget {
+    RunTarget {
+        label: project.name.clone(),
+        cwd: project.path.clone(),
+        space: session::project_space(&project.name),
+        project: project.name.clone(),
+    }
+}
+
+pub fn run_target_task(project: &Project, task: &config::Task) -> RunTarget {
+    let sessions = session::list_sessions().unwrap_or_default();
+    let cwd = session::sessions_for_task(&project.name, &task.name, &sessions)
+        .first()
+        .and_then(|s| s.worktree_path())
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| project.path.clone());
+    RunTarget {
+        label: format!("{}-{}", project.name, task.name),
+        cwd,
+        space: session::task_space(&project.name, &task.name),
+        project: project.name.clone(),
+    }
+}
+
+pub fn run_target_session(project: &Project, live: &session::LiveSession) -> RunTarget {
+    RunTarget {
+        label: live.name.clone(),
+        cwd: live
+            .worktree_path()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| project.path.clone()),
+        space: session::task_space(&live.project_name, &live.task_name),
+        project: project.name.clone(),
+    }
 }

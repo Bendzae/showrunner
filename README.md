@@ -344,6 +344,26 @@ All showrunner features work with every harness — what differs is the mechanis
 | Status detection | reported by Claude (OSC 7501) | screen heuristics | screen heuristics |
 | Initial prompt, startup skills, `ask`/`send`/`output` | ✓ | ✓ | ✓ |
 
+## In the Herdr app
+
+Sessions run in herdr-core terminals labeled for [Herdr](https://herdr.dev): each task is a Herdr space and each session a tab of it, named after them, with Herdr's live agent status, sounds and notifications. Showrunner also brings a Herdr layout that puts its project/task/session list in the sidebar:
+
+```sh
+showrunner herdr install        # writes the mods and the layout into ~/.config/herdr-app
+```
+
+Then switch layouts with `Cmd-Shift-L` (or from Settings) to **showrunner**. The sidebar lists projects, task groups, tasks and sessions like the TUI, with the same badges (status, ` ! ` needs you, 🔥, stack position, Linear id, PR/CI, diff) and the same keys: `j/k` move, `Enter` shows a session and puts the keyboard in its terminal (on a task: its main session), `Space` folds, `a` opens the item's menu with the TUI's keys (`n`, `N`, `S`, `r`, `m`, `u`, `x`, `t`, `B`, `P`, `b`, `o`, `g`, `A`, `d`, …), `p` adds a project, `/` filters, `Z` shows archived tasks, `K/J` move items, `t` cycles Herdr's themes. `Ctrl-\` jumps between the list and the terminal, as detaching from the TUI did. A click shows a session, a double click opens it, a right click opens its menu. The status bar shows the selection's branch → base, PR, Linear ticket and diff.
+
+What works differently there:
+
+- Forms instead of prompts: a new task asks name, branch, first prompt and agent in one dialog; base branch, group and checkout use fuzzy pickers; adding a project offers the system's folder picker.
+- `t` (terminal) opens a shell beside the session in its tab; `x` (run) runs the project's command in a `▶ run` tab of the space; `r` (review) runs the review tool in a pane beside the session and sends the comments to it when it closes.
+- A session whose tab was closed stays in the list as *stopped*; `Enter` starts it again, resuming its conversation.
+- Creating a task or session shows its tab; the keyboard stays in the list.
+- Remote hosts (`[remote]`) aren't shown there, only this machine's projects.
+
+`showrunner herdr install` adds `Ctrl-\` to `keys.json` (skip with `--no-keys`); Herdr stops updating the defaults of a `keys.json` once it's edited. Run it again after updating showrunner.
+
 ## Mobile web UI (`serve`)
 
 `showrunner serve` starts an HTTP server with a phone-friendly web UI for managing sessions remotely — view session statuses, read live output, send messages and keys (permission prompts included), review diffs, and create projects, tasks, sessions and adhoc sessions, delete tasks, or kill sessions.
@@ -378,8 +398,11 @@ showrunner send <session> <text> [--no-submit]
 showrunner output <session> [--lines <n>]
 showrunner attach <session>                      # take over its terminal (Ctrl-\ detaches)
 showrunner restore                               # recreate saved sessions that are no longer running (after a reboot)
+showrunner herdr install                         # the Herdr app's Showrunner layout (see "In the Herdr app")
 showrunner migrate                               # move idle sessions from tmux (older versions) into hc
 ```
+
+Everything the TUI's menus do has a command too (`project`, `group`, `task archive|update|push|pr|…`, `session adhoc|merge|update|resume`, `run`, `review`): `showrunner --help` lists them.
 
 Sessions are addressed by the refs `list` prints — `<project>/<task>/<session>` (e.g. `myapp/fix-auth/2`), `<project>/<task>` for that task's main session, or a raw `cm__…` name. `list` marks the session you're calling from as `(this session)`, and reports the same statuses as the TUI (`running`, `waiting_input`, `waiting_permission`, `finished`); for agents that don't report their status it samples each screen twice, so it takes a moment.
 
