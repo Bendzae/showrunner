@@ -14,14 +14,15 @@ export async function loadConfig() {
     const text = await readTextFile(`${appHome()}/mods/showrunner/local.json`);
     if (text) local = JSON.parse(text);
   } catch {}
-  config = { bin: local.bin ?? "showrunner", home: local.home ?? `${home()}/.showrunner` };
+  config = { bin: local.bin ?? "showrunner", home: local.home ?? `${home()}/.showrunner`, ownHome: local.home ?? null };
   return config;
 }
 
 export async function sr(args, timeout = 120000) {
-  const { bin } = await loadConfig();
+  const { bin, ownHome } = await loadConfig();
   try {
-    return await exec(bin, args, { timeout });
+    // Herdr's exec takes no environment: the data folder goes through env.
+    return ownHome ? await exec("env", [`SHOWRUNNER_HOME=${ownHome}`, bin, ...args], { timeout }) : await exec(bin, args, { timeout });
   } catch (e) {
     return { code: 127, stdout: "", stderr: String(e?.message ?? e) };
   }

@@ -1,3 +1,6 @@
 /target
 .claude/
 .spr.yml
+# written by `herdr-app check`
+herdr/mods/*/gpui-kit.d.ts
+herdr/mods/*/jsconfig.json

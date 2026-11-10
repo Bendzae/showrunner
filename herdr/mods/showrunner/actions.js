@@ -170,12 +170,13 @@ function remove(item) {
 // Review in a pane beside the agent, zoomed: the tool runs there and sends the
 // comments to the agent when it closes.
 async function review(item) {
-  const { bin } = await loadConfig();
+  const { bin, ownHome } = await loadConfig();
   const tab = anchorTab(item);
   if (!tab) return notify({ title: "No session to review beside", level: "warning", timeout: 4000 });
   const address = item.session?.address ?? item.main?.address;
   show(item.space, tab, address, true);
-  run("pane.split", { direction: "right", argv: [bin, "review", itemRef(item)] });
+  const argv = [bin, "review", itemRef(item)];
+  run("pane.split", { direction: "right", argv: ownHome ? ["env", `SHOWRUNNER_HOME=${ownHome}`, ...argv] : argv });
   run("pane.zoom", {});
 }
 
