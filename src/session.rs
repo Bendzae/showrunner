@@ -828,6 +828,153 @@ pub fn recreate_adhoc_session(
     Ok(cm_name.to_string())
 }
 
+/// The Coordinator: one Claude session above every project, for an overview
+/// of and work across all projects, tasks and sessions on this machine. Its
+/// name has no `<project>/<task>/<session>` parts, so no project lists it.
+pub const COORDINATOR: &str = "cm__coordinator__main";
+
+pub fn coordinator_space() -> &'static str {
+    herdr_ids(COORDINATOR).0
+}
+
+/// Start the Coordinator in its own folder unless it runs, resuming its last
+/// conversation there. Returns whether it was started.
+pub fn ensure_coordinator() -> Result<bool> {
+    if session_terminal(COORDINATOR).is_some() {
+        return Ok(false);
+    }
+    let agent = AgentKind::Claude;
+    ensure_agent_installed(agent)?;
+    let dir = crate::config::base_dir().join("coordinator");
+    fs::create_dir_all(&dir)?;
+    let work_dir = dir.to_string_lossy().to_string();
+    let trusted = claude_trusts(&dir);
+    install_agent_skills(agent, &work_dir);
+    install_herdr_skills(&dir);
+    let command = build_agent_command(
+        agent,
+        &work_dir,
+        Some(&coordinator_prompt()),
+        None,
+        has_resumable_session(agent, &work_dir),
+        None,
+        None,
+    );
+    launch(Launch {
+        cm_name: COORDINATOR,
+        work_dir: &work_dir,
+        command: &command,
+        agent,
+        project_path: &work_dir,
+        task_branch: None,
+        worktree_path: None,
+        claude_session_id: None,
+    })?;
+    if !trusted {
+        accept_trust_prompt(COORDINATOR);
+    }
+    Ok(true)
+}
+
+/// Whether Claude trusts `dir` (or a folder above it), so it starts without asking.
+fn claude_trusts(dir: &Path) -> bool {
+    let Some(text) = dirs::home_dir().and_then(|h| fs::read_to_string(h.join(".claude.json")).ok())
+    else {
+        return false;
+    };
+    let Ok(config) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return false;
+    };
+    dir.ancestors()
+        .any(|d| config["projects"][d.to_string_lossy().as_ref()]["hasTrustDialogAccepted"] == true)
+}
+
+/// Claude asks once whether to trust a new folder: answer yes for a folder
+/// showrunner made. Claude remembers the answer.
+fn accept_trust_prompt(cm_name: &str) {
+    for _ in 0..60 {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        let Some(address) = session_terminal(cm_name).map(|t| t.address) else {
+            continue;
+        };
+        let Ok(screen) = hc::read(&address, 0) else {
+            continue;
+        };
+        if !screen.contains("trust this folder") {
+            continue;
+        }
+        let on_yes = screen
+            .lines()
+            .any(|l| l.contains('❯') && l.contains("Yes, I trust"));
+        let _ = hc::keys(&address, &[if on_yes { "enter" } else { "down" }]);
+        if on_yes {
+            return;
+        }
+    }
+}
+
+fn coordinator_prompt() -> String {
+    let (space, tab) = herdr_ids(COORDINATOR);
+    format!(
+        "You are the Coordinator, started by Showrunner, a multi-agent task management tool.\n\
+         You are the person's one long-lived agent above every project on this machine: you\n\
+         belong to no project or task, and run in your own folder, not in a repository.\n\
+         \n\
+         - Keep the overview across projects, tasks and sessions: what is working, what\n  \
+         waits for the person, what is done, where PRs and tickets stand. `showrunner list`\n  \
+         shows it (`--json` for details)\n\
+         - Start, steer and coordinate work: create tasks and sessions with self-contained\n  \
+         prompts, ask other sessions' agents what they know (`showrunner ask`), brief them\n  \
+         (`showrunner send`), read their screens (`showrunner output`). See the\n  \
+         `manage-sessions` skill\n\
+         - Delegate implementation to task sessions, which work in their own worktrees. Don't\n  \
+         change project repositories yourself; read their code when it helps you plan,\n  \
+         coordinate or answer\n\
+         - Check with the person before you create, archive, delete, move or merge tasks or\n  \
+         sessions, or redirect an agent's work, unless they asked for exactly that\n\
+         - Sessions run in herdr-core terminals shown in the Herdr app: a space per task, a\n  \
+         tab per session. The `hc` skill covers reading, messaging and waiting on terminals\n  \
+         and agents; the `herdr-app` skill covers what the person's window shows (change it\n  \
+         only when asked)\n\
+         - Start long-running commands the person may want to watch in a terminal beside you\n  \
+         instead of in the background:\n  \
+         `hc run --bg --label herdr.space={space} --label herdr.tab={tab} -- <command>`\n  \
+         (it prints the terminal's address, e.g. t7); read its output with\n  \
+         `hc read <address>`, stop it with `hc kill <address>`"
+    )
+}
+
+/// `hc` and `herdr-app` describe themselves for agents (`--skill`): their
+/// manuals become the Coordinator's skills, current as of its start.
+fn install_herdr_skills(dir: &Path) {
+    for (program, description) in [
+        (
+            "hc",
+            "herdr-core's CLI: start, read, message and wait on the terminals and agents every showrunner session runs in",
+        ),
+        (
+            "herdr-app",
+            "Change what the person sees in the Herdr app window: spaces, tabs, panes, layouts",
+        ),
+    ] {
+        let Ok(out) = Command::new(program).arg("--skill").output() else {
+            continue;
+        };
+        if !out.status.success() {
+            continue;
+        }
+        let skill = dir.join(".claude/skills").join(program);
+        let _ = fs::create_dir_all(&skill);
+        let _ = fs::write(
+            skill.join("SKILL.md"),
+            format!(
+                "---\nname: {program}\ndescription: {description}\n---\n\n{}",
+                String::from_utf8_lossy(&out.stdout)
+            ),
+        );
+    }
+}
+
 fn record_worktree_dir(record: &crate::config::SessionRecord) -> PathBuf {
     worktree_dir(
         &record.project_name,

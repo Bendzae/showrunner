@@ -404,6 +404,11 @@ pub struct RestoreReport {
 pub fn restore_sessions(cfg: &Config) -> RestoreReport {
     let mut report = RestoreReport::default();
     session::label_for_herdr();
+    match session::ensure_coordinator() {
+        Ok(true) => report.restored.push("coordinator".to_string()),
+        Ok(false) => {}
+        Err(e) => report.failures.push(format!("coordinator: {e}")),
+    }
     let saved = config::load_sessions();
     if saved.is_empty() {
         return report;

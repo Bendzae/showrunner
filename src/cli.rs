@@ -75,7 +75,10 @@ What the TUI's menus do:
 
 Housekeeping:
   showrunner restore                            recreate saved sessions that
-                                                    are no longer running (reboot)
+                                                    are no longer running (reboot),
+                                                    and the coordinator
+  showrunner coordinator                        start the coordinator (one agent
+                                                    above all projects) unless it runs
   showrunner migrate                            move idle sessions still running
                                                     in tmux (older versions) into hc
 
@@ -113,6 +116,7 @@ pub fn dispatch(args: &[String]) -> Option<Result<()>> {
         Some("output") => Some(cmd_output(rest)),
         Some("attach") => Some(cmd_attach(rest)),
         Some("restore") => Some(cmd_restore(rest)),
+        Some("coordinator") => Some(cmd_coordinator(rest)),
         Some("migrate") => Some(cmd_migrate(rest)),
         Some("project") => Some(cli_actions::cmd_project(rest)),
         Some("group") => Some(cli_actions::cmd_group(rest)),
@@ -191,6 +195,18 @@ fn cmd_restore(args: &[String]) -> Result<()> {
     }
     if report.restored.is_empty() && report.failures.is_empty() {
         println!("nothing to restore");
+    }
+    Ok(())
+}
+
+fn cmd_coordinator(args: &[String]) -> Result<()> {
+    if let Some(extra) = args.first() {
+        bail!("unexpected argument '{extra}' (usage: coordinator)");
+    }
+    if session::ensure_coordinator()? {
+        println!("started the coordinator");
+    } else {
+        println!("the coordinator is running");
     }
     Ok(())
 }
@@ -542,7 +558,14 @@ fn cmd_list(args: &[String]) -> Result<()> {
                 v
             })
             .collect();
-        let mut out = json!({ "projects": projects, "default_agent": cfg.default_agent });
+        let mut out = json!({
+            "projects": projects,
+            "default_agent": cfg.default_agent,
+            "coordinator": {
+                "cm_name": session::COORDINATOR,
+                "space": session::coordinator_space(),
+            },
+        });
         let hosts: Vec<Value> = host_listings
             .into_iter()
             .map(|(host, listing)| {

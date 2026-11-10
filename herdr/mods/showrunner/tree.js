@@ -5,12 +5,12 @@
 import { div, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input } from "gpui-base";
 import { spaces, focused, run, theme, settings, shared, setShared, nextCommand, readTextFile, window, layout, themes, openOverlay } from "herdr";
-import { sr, clean, loadConfig, liveSessions, liveRuns, guessedStatus, worst, menuItems, show, runAct } from "./lib.js";
+import { sr, act, clean, loadConfig, liveSessions, liveRuns, guessedStatus, worst, menuItems, show, runAct } from "./lib.js";
 import { perform, openMenu, form } from "./actions.js";
 import { togglePanel, showPanel, panelEntries } from "./panels.js";
 import { icon, programIcon, statusGlyph, prColor, diffBadge, activityBadge, avatar, avatarColor, linearId, prSummary } from "./ui.js";
 
-const H = { project: 34, group: 26, task: 28, session: 26, stopped: 26, "adhoc-group": 26, adhoc: 26, "other-head": 32, space: 28, hint: 30 };
+const H = { coordinator: 34, project: 34, group: 26, task: 28, session: 26, stopped: 26, "adhoc-group": 26, adhoc: 26, "other-head": 32, space: 28, hint: 30 };
 const HOT_SECONDS = 2 * 3600;
 const HEADER = 31;
 
@@ -94,6 +94,7 @@ export class Tree {
     else if (c === "refresh") this.refresh(cx);
     else if (c === "jobs") this.runJobs(cx);
     else if (c === "panels") this.panelMenu();
+    else if (c === "coordinator") this.openCoordinator();
     // `showrunner.select:<row key>`, e.g. `s:cm__app__fix__main` or `t:app/Fix login`.
     else if (c.startsWith("select:")) { this.expandTo(c.slice(7)); this.select(c.slice(7)); this.handle.focus(); }
   }
@@ -104,6 +105,18 @@ export class Tree {
     const entries = panelEntries();
     const back = this.handle.is_focused() ? "tree" : focused()?.pane ?? null;
     openOverlay({ mod: "showrunner", kind: "dialog", width: 280, height: 48 + entries.length * 30, props: { view: "menu", title: "Right panel", entries, back } });
+  }
+
+  // The Coordinator's terminal gets the keyboard (⌃; from anywhere); it starts
+  // first when it isn't running.
+  openCoordinator() {
+    const c = this.data?.coordinator;
+    if (!c) return;
+    const live = liveSessions(this.guessed)[c.cm_name];
+    this.select(`s:${c.cm_name}`);
+    if (live) return show(c.space, c.cm_name, live.address, true);
+    act("Starting the coordinator", ["coordinator"],
+      { success: "Coordinator started", after: { reveal: { space: c.space, tab: c.cm_name, focus: true } } });
   }
 
   // Back to the terminal on screen.
@@ -218,6 +231,16 @@ export class Tree {
       remote_control: s.remote_control ?? false,
       in_tmux: Boolean(stopped && s.in_tmux),
     });
+    // The Coordinator, above every project: always the first row.
+    const c = this.data?.coordinator;
+    if (c && !this.archived && has("Coordinator")) {
+      const l = live[c.cm_name];
+      this.names[c.space] = this.names[c.cm_name] = "Coordinator";
+      this.spaceOrder.push(c.space);
+      this.tabOrder.push(c.cm_name);
+      rows.push({ key: `s:${c.cm_name}`, kind: "coordinator", depth: 0, status: l ? l.status : "stopped",
+        item: { kind: "coordinator", space: c.space, session: { cm_name: c.cm_name, name: "Coordinator", agent: "claude", live: Boolean(l), address: l?.address ?? null } } });
+    }
     for (const p of this.data?.projects ?? []) {
       const P = { name: p.name, path: p.path, run_command: p.run_command, space: p.space, run: p.run, agent: this.data.default_agent ?? "claude" };
       const pkey = `p:${p.name}`;
@@ -426,6 +449,8 @@ export class Tree {
   activate(row) {
     const { item } = row;
     switch (row.kind) {
+      case "coordinator":
+        return this.openCoordinator();
       case "adhoc-group":
         if (!row.count) return perform("new-adhoc", item);
         return this.toggle(row.key);
@@ -448,13 +473,13 @@ export class Tree {
   // A click shows a session (or a task's main one) without taking the keyboard.
   preview(row) {
     const { item } = row;
-    if (row.kind === "session" || row.kind === "adhoc") show(item.space, item.session.cm_name, item.session.address, false);
+    if (row.kind === "session" || row.kind === "adhoc" || (row.kind === "coordinator" && item.session.live)) show(item.space, item.session.cm_name, item.session.address, false);
     else if (row.kind === "task" && item.main) show(item.space, item.main.cm_name, item.main.address, false);
     else if (row.kind === "space") run("space.select", { id: item.space });
   }
 
   menu(row, at) {
-    if (!row?.item || row.kind === "space") return;
+    if (!row?.item || row.kind === "space" || row.kind === "coordinator") return;
     const item = { ...row.item, groups: this.groupsOf(row.item.project?.name) };
     if (!menuItems(item).length) return;
     openMenu(item, at ?? this.anchor(row));
@@ -661,7 +686,7 @@ export class Tree {
         agent: item.session?.agent ?? null,
         inTmux: item.session?.in_tmux ?? false,
         // What the right panel's views follow: a session (a task's main one).
-        ref: item.session?.cm_name ?? (item.task ? item.main?.cm_name ?? `${item.space}__main` : null),
+        ref: item.kind === "coordinator" ? null : item.session?.cm_name ?? (item.task ? item.main?.cm_name ?? `${item.space}__main` : null),
         space: item.space ?? null,
         project: item.project?.name ?? null,
         task: item.task?.name ?? null,
@@ -678,17 +703,19 @@ export class Tree {
   // The folded sidebar: a cell per task (and adhoc space), its project's color
   // and initial, its most urgent status in the corner. Click shows it.
   rail(t, rows) {
-    const cells = rows.filter((r) => r.kind === "task" || (r.kind === "adhoc-group" && r.count > 0));
+    const cells = rows.filter((r) => r.kind === "coordinator" || r.kind === "task" || (r.kind === "adhoc-group" && r.count > 0));
     return v_flex().id("showrunner-rail").size_full().min_h(0).bg(t.chrome).pt(8).gap(4).items_center().overflow_y_scrollbar()
       .children(cells.map((r) => {
         const on = this.activeSpace(r.item.space);
+        const coordinator = r.kind === "coordinator";
         const name = r.item.task?.name ?? "adhoc";
         return h_flex().id(`sr-rail-${r.key}`).relative().size(32).flex_none().rounded(7).items_center().justify_center()
           .when(on, (el) => el.bg(t.selected)).hover((s) => s.bg(t.hover))
-          .tooltip(`${r.item.project.name} · ${name}`)
+          .tooltip(coordinator ? "Coordinator" : `${r.item.project.name} · ${name}`)
           .on_click(() => this.activate(r))
-          .child(h_flex().size(20).rounded(5).bg(avatarColor(r.item.project.name)).items_center().justify_center()
-            .text_size(11).font_bold().text_color("#ffffff").child([...name][0]?.toUpperCase() ?? "?"))
+          .child(coordinator ? this.coordinatorMark(t, 20)
+            : h_flex().size(20).rounded(5).bg(avatarColor(r.item.project.name)).items_center().justify_center()
+              .text_size(11).font_bold().text_color("#ffffff").child([...name][0]?.toUpperCase() ?? "?"))
           .when(Boolean(r.status) && r.status !== "idle", (el) => el.child(div().absolute().right(1).bottom(1).size(9).rounded(5)
             .border_2().border_color(t.chrome).bg(t[r.status] ?? t.dim)));
       }));
@@ -743,6 +770,18 @@ export class Tree {
     };
 
     switch (r.kind) {
+      case "coordinator": {
+        const stopped = r.status === "stopped";
+        return base.mt(4).pl(4)
+          .child(div().size(12).flex_none())
+          .child(this.coordinatorMark(t, 18))
+          .child(div().font_semibold().text_color(stopped ? t.muted : t.foreground)
+            .when(this.activeSpace(r.item.space), (el) => el.text_color(t.accent))
+            .child("Coordinator"))
+          .child(div().flex_1())
+          .when(stopped, (el) => el.child(div().text_size(11).text_color(t.dim).child("stopped")))
+          .when(!stopped, (el) => el.child(statusGlyph(t, r.status)));
+      }
       case "project": {
         const { project } = r.item;
         return base.mt(4).pl(4)
@@ -841,6 +880,11 @@ export class Tree {
       default:
         return div();
     }
+  }
+
+  coordinatorMark(t, size) {
+    return h_flex().size(size).flex_none().rounded(5).bg("#8b5cf6").items_center().justify_center()
+      .child(icon("compass", Math.round(size * 0.72), "#ffffff"));
   }
 
   activeSpace(id) {

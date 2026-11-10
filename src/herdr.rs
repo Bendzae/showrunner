@@ -29,6 +29,7 @@ const FILES: &[(&str, &str)] = files![
     "mods/showrunner/panels.js",
     "mods/showrunner/icons/archive.svg",
     "mods/showrunner/icons/check.svg",
+    "mods/showrunner/icons/compass.svg",
     "mods/showrunner/icons/chevron-down.svg",
     "mods/showrunner/icons/chevron-right.svg",
     "mods/showrunner/icons/diamond.svg",
@@ -49,11 +50,12 @@ const FILES: &[(&str, &str)] = files![
 ];
 
 /// The keys, in the layout's own section: `Ctrl-/` jumps between the tree and
-/// the terminal, `Ctrl-'` picks the right panel.
+/// the terminal, `Ctrl-'` picks the right panel, `Ctrl-;` opens the Coordinator.
 const KEY_SECTION: &str = "layout:showrunner";
-const KEYS: [(&str, &str); 2] = [
+const KEYS: [(&str, &str); 3] = [
     ("ctrl-/", "showrunner.toggle"),
     ("ctrl-'", "showrunner.panels"),
+    ("ctrl-;", "showrunner.coordinator"),
 ];
 
 pub fn default_home() -> PathBuf {
@@ -140,8 +142,8 @@ pub fn install(home: &Path, bin: Option<&str>, keys: bool) -> Result<Installed> 
             fs::write(&path, serde_json::to_string_pretty(&map)? + "\n")?;
             notes.push(
                 "keys.json: in the Showrunner layout ctrl-/ jumps between the tree and the \
-                 terminal, ctrl-' picks the right panel (Herdr no longer updates an edited \
-                 keys.json's defaults: add new ones by hand)"
+                 terminal, ctrl-' picks the right panel, ctrl-; opens the coordinator (Herdr no \
+                 longer updates an edited keys.json's defaults: add new ones by hand)"
                     .to_string(),
             );
         }

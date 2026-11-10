@@ -363,8 +363,9 @@ What works differently there:
 - A session whose tab was closed stays in the list as *stopped*; `Enter` starts it again, resuming its conversation.
 - Creating a task or session shows its tab; the keyboard stays in the list.
 - Remote hosts (`[remote]`) aren't shown there, only this machine's projects.
+- The **Coordinator** row on top is one Claude session above all projects: it keeps the overview across projects, tasks and sessions, starts and steers work through the `showrunner` CLI, and knows hc and Herdr (their `--skill` manuals are its skills). It runs in `~/.showrunner/coordinator`, starts with Herdr (`showrunner coordinator` starts it by hand) and resumes its conversation; `Ctrl-;` jumps to it from anywhere.
 
-`showrunner herdr install` adds `Ctrl-/` to `keys.json` (skip with `--no-keys`); Herdr stops updating the defaults of a `keys.json` once it's edited. Run it again after updating showrunner.
+`showrunner herdr install` adds `Ctrl-/`, `Ctrl-'` and `Ctrl-;` to `keys.json` (skip with `--no-keys`); Herdr stops updating the defaults of a `keys.json` once it's edited. Run it again after updating showrunner.
 
 ## Mobile web UI (`serve`)
 
