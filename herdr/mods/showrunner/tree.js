@@ -69,12 +69,13 @@ export class Tree {
       }
     });
     // Like the TUI's start: sessions saved but not running (a reboot) come back.
-    cx.spawn(async (cx) => {
+    // From a timer: after a layout switch, work spawned here never finishes.
+    cx.timer.after(1, (cx) => cx.spawn(async (cx) => {
       await loadConfig();
       await sr(["restore"]);
       this.refresh(cx);
       this.refreshStats(cx);
-    });
+    }));
     // Herdr moving the keyboard away (Ctrl-B l) tells the tree nothing: the
     // selection would stay lit and the tree wouldn't follow the tabs.
     cx.timer.every(150, (cx) => {
