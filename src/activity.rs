@@ -229,6 +229,10 @@ impl Loop {
                     &at,
                 ));
             }
+            // A subagent gets its background tasks' notices as queued commands.
+            Some("attachment") if line["attachment"]["type"] == "queued_command" => {
+                notices.extend(notices_in(&text_of(&line["attachment"]["prompt"]), &at));
+            }
             Some("system") if line["subtype"] == "turn_duration" => self.turn_ended_at = Some(at),
             _ => {}
         }
@@ -410,20 +414,41 @@ fn subagents(transcript: &Path, notices: &mut Vec<Notice>) -> Vec<Loop> {
             };
             let mut first = None;
             let mut last = None;
+            // How the conversation's last message ended it, if it did: on
+            // the final answer or on an interruption (until resumed).
+            let mut ending = None;
             for line in tail_lines(&dir.join(format!("agent-{}.jsonl", lp.id)), TAIL_BYTES) {
                 lp.read(&line, notices);
+                if matches!(line["type"].as_str(), Some("user" | "assistant")) {
+                    ending = if line["message"]["stop_reason"] == "end_turn" {
+                        Some("completed")
+                    } else if is_interrupt(&line) {
+                        Some("killed")
+                    } else {
+                        None
+                    };
+                }
                 if let Some(at) = str_of(&line["timestamp"]) {
                     first.get_or_insert_with(|| at.to_string());
                     last = Some(at.to_string());
                 }
             }
-            let finished = meta["finished"] == true;
-            lp.status = if finished { "completed" } else { "running" };
+            // `finished` in the meta is missing for a stopped subagent, and
+            // for any written by Claude Code before it kept one.
+            let finished = meta["finished"] == true || ending == Some("completed");
+            let stopped = !finished && (meta["stoppedByUser"] == true || ending == Some("killed"));
+            lp.status = if finished {
+                "completed"
+            } else if stopped {
+                "killed"
+            } else {
+                "running"
+            };
             lp.started_at = first;
-            if finished {
+            if finished || stopped {
                 lp.ended_at = last;
             }
-            lp.settle(!finished, None);
+            lp.settle(lp.status == "running", None);
             lp
         })
         .collect()
@@ -476,6 +501,14 @@ fn is_prompt(text: &str) -> bool {
         ]
         .iter()
         .any(|p| text.starts_with(p))
+}
+
+/// Claude's note that the person stopped the loop mid-turn.
+fn is_interrupt(line: &Value) -> bool {
+    line["type"] == "user"
+        && text_of(&line["message"]["content"])
+            .trim_start()
+            .starts_with("[Request interrupted by user")
 }
 
 fn notices_in(text: &str, at: &str) -> Vec<Notice> {
@@ -871,6 +904,108 @@ mod tests {
         assert_eq!(find("x1").current.as_deref(), Some("Grep: fn main"));
         assert_eq!(find("x2").parent.as_deref(), Some("x1"));
         assert_eq!(find("x2").status, "completed");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_queued_notice_ends_a_subagents_shell() {
+        let dir = scratch("queued");
+        let transcript = write(
+            &dir,
+            "c.jsonl",
+            &[
+                json!({"type": "user", "timestamp": "2026-11-10T10:00:00Z", "message": {"content": "Check it"}}),
+                assistant(
+                    "2026-11-10T10:00:01Z",
+                    json!([
+                        {"type": "tool_use", "id": "a1", "name": "Agent", "input": {"description": "Run the checks"}},
+                    ]),
+                ),
+            ],
+        );
+        let subagents = dir.join("c/subagents");
+        fs::create_dir_all(&subagents).unwrap();
+        fs::write(
+            subagents.join("agent-x1.meta.json"),
+            json!({"description": "Run the checks", "toolUseId": "a1", "finished": true})
+                .to_string(),
+        )
+        .unwrap();
+        write(
+            &subagents,
+            "agent-x1.jsonl",
+            &[
+                json!({"type": "user", "timestamp": "2026-11-10T10:00:02Z", "message": {"content": "Run them"}}),
+                assistant(
+                    "2026-11-10T10:00:03Z",
+                    json!([
+                        {"type": "tool_use", "id": "s1", "name": "Bash", "input": {"command": "cargo test", "run_in_background": true}},
+                    ]),
+                ),
+                result(
+                    "2026-11-10T10:00:04Z",
+                    "s1",
+                    "started",
+                    json!({"backgroundTaskId": "bg1"}),
+                ),
+                json!({"type": "attachment", "timestamp": "2026-11-10T10:00:30Z", "isSidechain": true, "attachment": {
+                    "type": "queued_command",
+                    "prompt": "<task-notification>\n<task-id>bg1</task-id>\n<status>completed</status>\n</task-notification>"}}),
+            ],
+        );
+
+        fs::write(
+            subagents.join("agent-x2.meta.json"),
+            json!({"description": "Play it", "toolUseId": "a2", "requestShape": "background"})
+                .to_string(),
+        )
+        .unwrap();
+        write(
+            &subagents,
+            "agent-x2.jsonl",
+            &[
+                json!({"type": "user", "timestamp": "2026-11-10T10:00:05Z", "message": {"content": "Play"}}),
+                assistant(
+                    "2026-11-10T10:00:06Z",
+                    json!([{"type": "tool_use", "id": "p1", "name": "Read", "input": {"file_path": "/x"}}]),
+                ),
+                result("2026-11-10T10:00:07Z", "p1", "ok", json!({})),
+                json!({"type": "user", "timestamp": "2026-11-10T10:00:08Z", "message": {"content":
+                    [{"type": "text", "text": "[Request interrupted by user for tool use]"}]}}),
+            ],
+        );
+
+        // Written before Claude Code kept `finished`: it ends on its answer.
+        fs::write(
+            subagents.join("agent-x3.meta.json"),
+            json!({"description": "Old one", "toolUseId": "a3"}).to_string(),
+        )
+        .unwrap();
+        write(
+            &subagents,
+            "agent-x3.jsonl",
+            &[
+                json!({"type": "user", "timestamp": "2026-08-08T10:00:00Z", "message": {"content": "Look"}}),
+                json!({"type": "assistant", "timestamp": "2026-08-08T10:00:09Z", "message": {"model": "claude-opus-4-1",
+                    "stop_reason": "end_turn", "content": [{"type": "text", "text": "Found it."}]}}),
+            ],
+        );
+
+        let board = board(&transcript);
+        let old = board.loops.iter().find(|l| l.id == "x3").unwrap();
+        assert_eq!(old.status, "completed");
+        assert_eq!(old.ended_at.as_deref(), Some("2026-08-08T10:00:09Z"));
+        let stopped = board.loops.iter().find(|l| l.id == "x2").unwrap();
+        assert_eq!(stopped.status, "killed");
+        assert_eq!(stopped.ended_at.as_deref(), Some("2026-11-10T10:00:08Z"));
+        assert_eq!(stopped.current, None);
+        let agent = board.loops.iter().find(|l| l.id == "x1").unwrap();
+        assert_eq!(agent.shells[0].id, "bg1");
+        assert_eq!(agent.shells[0].status, "completed");
+        assert_eq!(
+            agent.shells[0].ended_at.as_deref(),
+            Some("2026-11-10T10:00:30Z")
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 }
