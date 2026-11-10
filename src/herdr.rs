@@ -15,6 +15,8 @@ macro_rules! files {
     };
 }
 
+const LAYOUT: &str = "layouts/showrunner.json";
+
 const FILES: &[(&str, &str)] = files![
     "layouts/showrunner.json",
     "mods/showrunner/mod.json",
@@ -80,17 +82,26 @@ pub fn install(home: &Path, bin: Option<&str>, keys: bool) -> Result<Installed> 
         );
     }
     let mut notes = Vec::new();
+    let reviewer = home.join("mods/reviewer/mod.json").is_file();
     for (path, text) in FILES {
         let target = home.join(path);
         if let Some(dir) = target.parent() {
             fs::create_dir_all(dir)?;
         }
+        let text = if reviewer && *path == LAYOUT {
+            with_reviewer(text)?
+        } else {
+            text.to_string()
+        };
         fs::write(&target, text).with_context(|| format!("writing {}", target.display()))?;
     }
     notes.push(format!(
         "mods showrunner and showrunner-status, layout showrunner → {}",
         home.display()
     ));
+    if reviewer {
+        notes.push("the Changes panel shows herdr-reviewer".to_string());
+    }
 
     let local = home.join("mods/showrunner/local.json");
     let showrunner_home = std::env::var_os("SHOWRUNNER_HOME").map(PathBuf::from);
@@ -138,6 +149,31 @@ pub fn install(home: &Path, bin: Option<&str>, keys: bool) -> Result<Installed> 
     Ok(Installed { notes })
 }
 
+/// With herdr-reviewer (github.com/vytasgavelis/herdr-reviewer) installed, it
+/// takes the Changes panel's place, and the panel can be dragged as wide as a
+/// review needs.
+fn with_reviewer(layout: &str) -> Result<String> {
+    fn walk(node: &mut Value) {
+        let id = node["id"].as_str().unwrap_or_default().to_string();
+        match id.as_str() {
+            "panel" => node["max"] = json!(10000),
+            "changes" => node["content"]["mod"] = json!("reviewer"),
+            _ => {}
+        }
+        for child in node
+            .get_mut("children")
+            .and_then(Value::as_array_mut)
+            .into_iter()
+            .flatten()
+        {
+            walk(child);
+        }
+    }
+    let mut tree: Value = serde_json::from_str(layout)?;
+    walk(&mut tree);
+    Ok(serde_json::to_string_pretty(&tree)? + "\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,5 +215,14 @@ mod tests {
         .unwrap();
         assert_eq!(local["bin"], "/opt/sr");
         fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn reviewer_takes_the_changes_panel() {
+        let layout: Value = serde_json::from_str(&with_reviewer(FILES[0].1).unwrap()).unwrap();
+        let text = layout.to_string();
+        assert!(text.contains(r#""mod":"reviewer""#));
+        assert!(!text.contains(r#""mod":"changes""#));
+        assert!(text.contains(r#""max":10000"#));
     }
 }
