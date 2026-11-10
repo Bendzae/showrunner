@@ -850,7 +850,11 @@ pub fn ensure_coordinator() -> Result<bool> {
     let work_dir = dir.to_string_lossy().to_string();
     let trusted = claude_trusts(&dir);
     install_agent_skills(agent, &work_dir);
-    install_herdr_skills(&dir);
+    // The Herdr manuals come with the plugin now, like every session's; older
+    // versions put the Coordinator's in .claude/skills.
+    for (name, _) in HERDR_SKILLS {
+        let _ = fs::remove_dir_all(dir.join(".claude/skills").join(name));
+    }
     let command = build_agent_command(
         agent,
         &work_dir,
@@ -944,34 +948,61 @@ fn coordinator_prompt() -> String {
     )
 }
 
-/// `hc` and `herdr-app` describe themselves for agents (`--skill`): their
-/// manuals become the Coordinator's skills, current as of its start.
-fn install_herdr_skills(dir: &Path) {
-    for (program, description) in [
-        (
-            "hc",
-            "herdr-core's CLI: start, read, message and wait on the terminals and agents every showrunner session runs in",
-        ),
-        (
-            "herdr-app",
-            "Change what the person sees in the Herdr app window: spaces, tabs, panes, layouts",
-        ),
-    ] {
-        let Ok(out) = Command::new(program).arg("--skill").output() else {
-            continue;
-        };
-        if !out.status.success() {
-            continue;
+/// `hc` and `herdr-app` describe themselves for agents (`--skill`). Every
+/// session gets their manuals beside the showrunner skills, current as of its
+/// start. (The descriptions are plain YAML: no ": " in them.)
+const HERDR_SKILLS: [(&str, &str); 2] = [
+    (
+        "hc",
+        "herdr-core's CLI (hc, not the older herdr) for the terminals every showrunner session runs in. Start programs and agents in terminals, read their screens, send them input, wait on them",
+    ),
+    (
+        "herdr-app",
+        "The Herdr app window the person watches the sessions in (herdr-app, not the older herdr). Split a pane or open a tab running a command beside you, focus panes, switch layouts",
+    ),
+];
+
+/// Each Herdr skill's SKILL.md, or None when its program isn't installed.
+/// Read once per showrunner run: restoring many sessions asks once.
+fn herdr_skills() -> &'static [(&'static str, Option<String>)] {
+    static SKILLS: std::sync::OnceLock<Vec<(&'static str, Option<String>)>> =
+        std::sync::OnceLock::new();
+    SKILLS.get_or_init(|| {
+        HERDR_SKILLS
+            .iter()
+            .map(|&(program, description)| {
+                let manual = Command::new(program)
+                    .arg("--skill")
+                    .output()
+                    .ok()
+                    .filter(|out| out.status.success())
+                    .map(|out| {
+                        herdr_skill_md(program, description, &String::from_utf8_lossy(&out.stdout))
+                    });
+                (program, manual)
+            })
+            .collect()
+    })
+}
+
+fn herdr_skill_md(name: &str, description: &str, manual: &str) -> String {
+    format!("---\nname: {name}\ndescription: {description}\n---\n\n{manual}")
+}
+
+/// Writes the Herdr skills into `skills_dir`, and takes one out whose program
+/// is gone, so no session keeps a stale manual.
+fn install_herdr_skills(skills_dir: &Path, skills: &[(&str, Option<String>)]) {
+    for (name, skill) in skills {
+        let dir = skills_dir.join(name);
+        match skill {
+            Some(text) => {
+                let _ = fs::create_dir_all(&dir);
+                let _ = fs::write(dir.join("SKILL.md"), text);
+            }
+            None => {
+                let _ = fs::remove_dir_all(&dir);
+            }
         }
-        let skill = dir.join(".claude/skills").join(program);
-        let _ = fs::create_dir_all(&skill);
-        let _ = fs::write(
-            skill.join("SKILL.md"),
-            format!(
-                "---\nname: {program}\ndescription: {description}\n---\n\n{}",
-                String::from_utf8_lossy(&out.stdout)
-            ),
-        );
     }
 }
 
@@ -1939,6 +1970,7 @@ fn install_agents_dir_skills(work_dir: &str) {
         let _ = fs::create_dir_all(&dir);
         let _ = fs::write(dir.join("SKILL.md"), content);
     }
+    install_herdr_skills(&skills_dir, herdr_skills());
     // Exclude only our own skill folders so a repo's own .agents/skills stay
     // visible to git.
     add_git_excludes(
@@ -1946,6 +1978,9 @@ fn install_agents_dir_skills(work_dir: &str) {
         &[
             ".agents/skills/commit-push-task/",
             ".agents/skills/manage-sessions/",
+            ".agents/skills/idea-queue/",
+            ".agents/skills/hc/",
+            ".agents/skills/herdr-app/",
         ],
     );
 }
@@ -2009,6 +2044,7 @@ fn install_showrunner_plugin(work_dir: &str) {
             .join("SKILL.md"),
         PLUGIN_SKILL_MANAGE_SESSIONS,
     );
+    install_herdr_skills(&plugin_dir.join("skills"), herdr_skills());
 
     // Git-ignore the locally installed plugin via .git/info/exclude.
     add_git_excludes(work_dir, &[".claude/plugins/showrunner/"]);
@@ -3899,5 +3935,31 @@ Some transcript output.\n\
         };
         assert_eq!(record_branch(&record(MAIN_SESSION)), "feat");
         assert_eq!(record_branch(&record("code review")), "feat-code-review");
+    }
+
+    #[test]
+    fn herdr_skills_are_written_and_a_missing_programs_taken_out() {
+        let dir = std::env::temp_dir().join(format!("sr-herdr-skills-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("herdr-app")).unwrap();
+        fs::write(dir.join("herdr-app/SKILL.md"), "stale").unwrap();
+
+        let hc = herdr_skill_md("hc", HERDR_SKILLS[0].1, "# hc manual\n");
+        install_herdr_skills(&dir, &[("hc", Some(hc.clone())), ("herdr-app", None)]);
+
+        assert_eq!(fs::read_to_string(dir.join("hc/SKILL.md")).unwrap(), hc);
+        assert!(hc.starts_with("---\nname: hc\ndescription: "));
+        assert!(!dir.join("herdr-app").exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn herdr_skill_descriptions_are_plain_yaml() {
+        for (_, description) in HERDR_SKILLS {
+            assert!(
+                !description.contains(": ") && !description.contains('\n'),
+                "{description}"
+            );
+        }
     }
 }
