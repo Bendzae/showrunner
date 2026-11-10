@@ -210,7 +210,7 @@ export function menuItems(item) {
         { key: "b", label: "Checkout", action: "checkout-task" },
         { key: "o", label: "Open PR", action: "open-pr" },
         { key: "g", label: "Set group", action: "set-group" },
-        ...(task.linear ? [{ key: "l", label: "Show Linear ticket", action: "open-linear" }] : []),
+        ...(task.linear ? [{ key: "l", label: "Open Linear ticket", action: "open-linear" }] : []),
         ...remote(item.main),
         { key: "A", label: "Archive", action: "archive" },
         { key: "d", label: "Delete", action: "delete", danger: true },

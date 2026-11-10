@@ -3,7 +3,6 @@
 
 import { exec, run, openOverlay, notify, knownAgents, panes } from "herdr";
 import { act, sr, clean, show, copy, openUrl, liveRuns, loadConfig, RUN_MENU, taskRef } from "./lib.js";
-import { showPanel } from "./panels.js";
 
 const MOD = "showrunner";
 
@@ -96,7 +95,7 @@ export async function perform(action, item, at) {
       return confirm("No PR found", `Create a draft PR for ${task.branch}? Its branch is pushed first.`,
         ["task", "pr", project.name, task.name, "--create"], "Create PR");
     case "open-linear":
-      return showPanel("ticket");
+      return openUrl(task.linear);
     case "archive":
       return act("Archiving task", ["task", "archive", project.name, task.name]);
     case "unarchive":
