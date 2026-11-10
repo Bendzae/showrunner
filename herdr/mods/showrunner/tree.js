@@ -74,6 +74,12 @@ export class Tree {
       this.refresh(cx);
       this.refreshStats(cx);
     });
+    // Herdr moving the keyboard away (Ctrl-B l) tells the tree nothing: the
+    // selection would stay lit and the tree wouldn't follow the tabs.
+    cx.timer.every(150, (cx) => {
+      const focused = this.handle.is_focused();
+      if (focused !== this.wasFocused) { this.wasFocused = focused; cx.notify(); }
+    });
     cx.timer.every(1500, (cx) => this.watch(cx));
     cx.timer.every(30000, (cx) => this.refresh(cx));
     cx.timer.every(20000, (cx) => { if (window()?.active) this.refreshStats(cx); });

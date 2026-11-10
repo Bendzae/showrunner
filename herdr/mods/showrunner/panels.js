@@ -169,6 +169,12 @@ class Loading {
       if (!visible(view)) return;
       if (key !== this.loaded || (key && Date.now() - (this.loadedAt ?? 0) > every)) this.load(cx, sel, key);
     });
+    // Herdr moving the keyboard away (Ctrl-B h) tells the panel nothing: its
+    // border would stay lit.
+    cx.timer.every(150, (cx) => {
+      const focused = this.handle.is_focused();
+      if (focused !== this.wasFocused) { this.wasFocused = focused; cx.notify(); }
+    });
     cx.spawn(async (cx) => {
       for (;;) {
         if ((await nextCommand()) === "focus") this.handle.focus();
