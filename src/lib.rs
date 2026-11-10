@@ -1,3 +1,4 @@
+mod activity;
 pub mod agent;
 pub mod app;
 pub mod cli;

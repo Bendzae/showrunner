@@ -719,6 +719,8 @@ export class Tree {
         inTmux: item.session?.in_tmux ?? false,
         // What the right panel's views follow: a session (a task's main one).
         ref: item.kind === "coordinator" ? null : item.session?.cm_name ?? (item.task ? item.main?.cm_name ?? `${item.space}__main` : null),
+        // The session whose Claude the Activity panel follows: the Coordinator's too.
+        conversation: item.session?.cm_name ?? (item.task ? item.main?.cm_name ?? `${item.space}__main` : null),
         space: item.space ?? null,
         project: item.project?.name ?? null,
         task: item.task?.name ?? null,

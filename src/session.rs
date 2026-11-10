@@ -1213,6 +1213,35 @@ fn claude_project_dir(home: &Path, work_dir: &str) -> PathBuf {
     home.join(".claude/projects").join(key)
 }
 
+/// The Claude conversation file a session runs (or last ran): the one recorded
+/// for it, else the newest in its folder (the Coordinator keeps no record).
+pub fn conversation_file(cm_name: &str) -> Option<PathBuf> {
+    let home = dirs::home_dir()?;
+    let record = crate::config::load_sessions().remove(cm_name);
+    let work_dir = match &record {
+        Some(r) if r.use_worktree => record_worktree_dir(r).to_string_lossy().to_string(),
+        Some(r) => r.project_path.clone(),
+        None if cm_name == COORDINATOR => crate::config::base_dir()
+            .join("coordinator")
+            .to_string_lossy()
+            .to_string(),
+        None => session_work_dir(cm_name)?,
+    };
+    let dir = claude_project_dir(&home, &work_dir);
+    let recorded = record
+        .and_then(|r| r.claude_session_id)
+        .map(|id| dir.join(format!("{id}.jsonl")))
+        .filter(|f| f.exists());
+    recorded.or_else(|| {
+        fs::read_dir(&dir)
+            .ok()?
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
+            .max_by_key(|p| fs::metadata(p).and_then(|m| m.modified()).ok())
+    })
+}
+
 fn dir_has_jsonl(dir: &Path) -> bool {
     fs::read_dir(dir).is_ok_and(|mut entries| {
         entries.any(|e| e.is_ok_and(|e| e.path().extension().is_some_and(|x| x == "jsonl")))

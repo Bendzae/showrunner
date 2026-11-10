@@ -6,7 +6,7 @@
 import { div, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, TextView } from "gpui-base";
 import { shared, theme, layout, notify, run, nextCommand, settings } from "herdr";
-import { sr, clean, openUrl, reveal } from "./lib.js";
+import { sr, clean, openUrl, reveal, liveSessions } from "./lib.js";
 import { ICON, keycap } from "./ui.js";
 
 export const PANELS = [
@@ -15,6 +15,7 @@ export const PANELS = [
   { id: "ideas", label: "Ideas", key: "i", icon: ICON("lightbulb") },
   { id: "pr", label: "PR", key: "p", icon: ICON("git-pull-request") },
   { id: "ticket", label: "Ticket", key: "t", icon: ICON("ticket") },
+  { id: "activity", label: "Activity", key: "a", icon: ICON("activity") },
 ];
 
 function find(node, id) {
@@ -65,7 +66,7 @@ export class PanelBar {
     const t = theme();
     const sel = selection();
     const shown = shownPanel();
-    const usable = { ideas: Boolean(sel?.ref), pr: Boolean(sel?.task), ticket: Boolean(sel?.linear) };
+    const usable = { ideas: Boolean(sel?.ref), pr: Boolean(sel?.task), ticket: Boolean(sel?.linear), activity: Boolean(sel?.conversation) };
     const stop = (_e, cx) => cx.stop_propagation();
     // The tab bar's right padding is the gap before the first button.
     return h_flex().size_full().gap(3).items_center().bg(t.chrome).border_b(1).border_color(t.border)
@@ -566,5 +567,194 @@ export class IdeasPanel extends Loading {
       button(t, "idea-add", "Add", (_e, cx) => this.add(cx), Boolean(this.draft.trim())),
     ];
     return this.frame(t, head, items, footer);
+  }
+}
+
+// What the selected session's Claude is doing, read from its conversation
+// (`showrunner session activity`), as the activity Claude mod shows it: the
+// main session and its subagents (nested under whoever started them), each
+// with its task list, its shell commands (the last lines they wrote) and the
+// call under way; the turn's time, progress and context fill on top. Enter or
+// a click folds an agent or a command; c clears what has finished.
+const ENDED = new Set(["completed", "failed", "killed"]);
+
+function duration(ms) {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ${String(s % 60).padStart(2, "0")}s`;
+  return `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, "0")}m`;
+}
+
+const since = (start, end) => (start ? duration((end ? Date.parse(end) : Date.now()) - Date.parse(start)) : "");
+
+export class ActivityPanel extends Loading {
+  init(cx) {
+    super.init(cx, "activity", 1500);
+    // Agents and commands opened or shut against how they'd be by default.
+    this.flipped = new Set();
+    // Per conversation: what ended before this was cleared away.
+    this.cleared = {};
+    // Output fetched for a copy button, written from a timer: a click's
+    // context is gone by the time the fetch answers.
+    cx.timer.every(200, (cx) => {
+      if (!this.toCopy) return;
+      this.copy(cx, ...this.toCopy);
+      this.toCopy = null;
+    });
+  }
+
+  key(sel) { return sel?.conversation ?? null; }
+  fetch(sel) { return sr(["session", "activity", sel.conversation]); }
+  get pickLabel() { return "fold"; }
+  keys() { return this.hasFinished() ? { c: ["clear finished", () => this.clear()] } : {}; }
+
+  // The board less what was cleared away.
+  board() {
+    if (this.state.status !== "ready") return null;
+    const cut = this.cleared[this.state.key] ?? "";
+    const gone = (end) => Boolean(end) && end <= cut;
+    const loops = this.state.value.loops
+      .filter((l) => l.id === "main" || !(ENDED.has(l.status) && gone(l.ended_at)))
+      .map((l) => ({
+        ...l,
+        shells: l.shells.filter((s) => s.status === "running" || !gone(s.ended_at)),
+        tasks: l.tasks.length && l.tasks.every((x) => x.status === "completed" && gone(x.ended_at)) ? [] : l.tasks,
+      }));
+    return { ...this.state.value, loops };
+  }
+
+  hasFinished() {
+    return (this.board()?.loops ?? []).some((l) => (l.id !== "main" && ENDED.has(l.status))
+      || l.shells.some((s) => s.status !== "running")
+      || (l.tasks.length > 0 && l.tasks.every((x) => x.status === "completed")));
+  }
+
+  clear() {
+    if (this.state.status === "ready") this.cleared[this.state.key] = new Date().toISOString();
+  }
+
+  // Open by default: every agent; a command while it runs, and the last one
+  // until the next starts. Enter or a click flips that.
+  isOpen(id, byDefault) { return byDefault !== this.flipped.has(id); }
+  flip(id) { if (!this.flipped.delete(id)) this.flipped.add(id); }
+
+  copy(cx, text, what) {
+    cx.write_to_clipboard(text);
+    notify({ title: `Copied ${what}`, level: "success", timeout: 2000 });
+  }
+
+  copyOutput(sel, shell) {
+    sr(["session", "activity", sel.conversation, "--output", shell.id]).then((r) => {
+      const text = r.code === 0 ? r.stdout.trimEnd() : "";
+      if (!text) return notify({ title: "No output to copy", level: "warning", timeout: 2500 });
+      const lines = text.split("\n").length;
+      this.toCopy = [text, `${lines} line${lines === 1 ? "" : "s"} of output`];
+    });
+  }
+
+  render() {
+    const t = theme();
+    const sel = selection();
+    const s = this.state;
+    const refresh = headButton(t, "act-refresh", "↻", (_e, cx) => this.reload(cx));
+    if (!sel?.conversation) return this.frame(t, { title: "Activity" }, [item(note(t, "Select a session, or a task for its main session."))]);
+    if (s.status === "loading" || s.status === "idle") return this.frame(t, { title: "Activity", actions: [refresh] }, [item(note(t, "Reading the conversation…"))]);
+    if (s.status === "error") return this.frame(t, { title: "Activity", actions: [refresh] }, [item(note(t, s.message))]);
+
+    const b = this.board();
+    const main = b.loops.find((l) => l.id === "main");
+    const agents = b.loops.filter((l) => l.id !== "main");
+    const live = liveSessions()[sel.conversation]?.status;
+    let done = 0, total = 0;
+    for (const l of b.loops) {
+      for (const x of l.tasks) { total += 1; done += x.status === "completed" ? 1 : 0; }
+      for (const x of l.shells) { total += 1; done += x.status === "running" ? 0 : 1; }
+      if (l.id !== "main") { total += 1; done += ENDED.has(l.status) ? 1 : 0; }
+    }
+    const facts = [
+      main.status === "running" ? `turn ${since(main.turn_started_at)}` : live === "blocked" ? "needs you" : "idle",
+      b.context ? `context ${Math.round((100 * b.context.tokens) / b.context.window)}%` : null,
+    ].filter(Boolean);
+
+    const spinner = (color) => svg(ICON("spinner")).size(12).flex_none().text_color(color).spin(900);
+    const glyph = (status, waiting) => {
+      if (status === "running" || status === "pending") return spinner(t.working);
+      const [mark, color] = waiting ? ["◔", t.blocked] : { completed: ["✓", t.ansi2], failed: ["✗", t.ansi1], killed: ["■", t.ansi3] }[status] ?? ["○", t.dim];
+      return div().w(12).flex_none().text_center().text_size(12).text_color(color).child(mark);
+    };
+    const right = (text) => div().flex_none().text_size(11).text_color(t.dim).child(text);
+    const mono = (el) => el.font_family(settings().font ?? "JetBrains Mono").text_size(11.5);
+    const command = (text, dim) => mono(div().pl(20).pr(8).whitespace_normal().text_color(dim ? t.muted : t.foreground).child(`$ ${text}`));
+    const items = [];
+
+    const loopItems = (l, depth) => {
+      const id = `loop:${l.id}`;
+      const open = this.isOpen(id, true);
+      const isMain = l.id === "main";
+      const clock = isMain ? (l.status === "running" ? `turn ${since(l.turn_started_at)}` : "idle") : since(l.started_at, l.ended_at);
+      const label = isMain ? l.label : `${l.label}${l.type ? ` · ${l.type}` : ""}`;
+      const indent = 6 + depth * 14;
+      items.push(item(h_flex().id(`act-${l.id}`).h(28).pl(indent).pr(8).gap(7).items_center().rounded(7).cursor_pointer()
+        .hover((st) => st.bg(t.hover)).on_click(() => this.flip(id))
+        .child(div().w(10).flex_none().text_size(10).text_color(t.dim).child(open ? "▾" : "▸"))
+        .child(glyph(l.status, isMain && live === "blocked"))
+        .child(div().flex_1().min_w(0).truncate().when(depth === 0, (el) => el.font_semibold()).child(label))
+        .child(right(`${l.tools ? `${l.tools} tool${l.tools === 1 ? "" : "s"} · ` : ""}${clock}`)), () => this.flip(id)));
+      if (!open) return;
+      const inner = indent + 17;
+      for (const x of l.tasks) {
+        const finished = x.status === "completed";
+        items.push(item(h_flex().h(24).pl(inner).pr(8).gap(7).items_center().text_size(12.5)
+          .child(x.status === "in_progress" ? spinner(t.working) : div().w(12).flex_none().text_center().text_color(finished ? t.ansi2 : t.dim).child(finished ? "✓" : "○"))
+          .child(div().flex_1().min_w(0).truncate().text_color(finished ? t.dim : t.foreground).when(finished, (el) => el.line_through()).child(x.title))
+          .child(right(since(x.started_at, x.ended_at)))));
+      }
+      const last = l.shells.at(-1);
+      for (const x of l.shells) {
+        const sid = `shell:${x.id}`;
+        const sopen = this.isOpen(sid, x.status === "running" || (x.id === last.id && !l.current));
+        const ended = x.status !== "running";
+        const copyButton = (key, mark, tip, action) => div().id(`act-copy-${key}-${x.id}`).px(4).flex_none().rounded(4).text_size(11).text_color(t.dim)
+          .cursor_pointer().hover((st) => st.bg(t.hover).text_color(t.foreground)).tooltip(tip)
+          .on_click((_e, cx) => { cx.stop_propagation(); action(cx); }).child(mark);
+        items.push(item(v_flex().pl(inner).gap(2)
+          .child(h_flex().id(`act-${x.id}`).h(24).pr(8).gap(7).items_center().rounded(6).cursor_pointer().hover((st) => st.bg(t.hover)).on_click(() => this.flip(sid))
+            .child(ended ? glyph(x.status) : spinner(t.working))
+            .child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(ended ? t.muted : t.foreground).child(x.title ?? `$ ${x.command.replace(/\s+/g, " ")}`))
+            .when(sopen, (el) => el.child(copyButton("cmd", "❯", "Copy the command", (cx) => this.copy(cx, x.command, "the command")))
+              .child(copyButton("out", "☰", "Copy the output", () => this.copyOutput(sel, x))))
+            .child(right(since(x.started_at, x.ended_at))))
+          .when(sopen && Boolean(x.title), (el) => el.child(command(x.command, ended)))
+          .when(sopen && x.tail.length > 0, (el) => el.child(mono(v_flex().pl(20).pr(8).pb(2).text_color(x.status === "failed" ? t.ansi1 : t.dim)
+            .children(x.tail.map((line) => div().whitespace_normal().child(`│ ${line}`)))))), () => this.flip(sid)));
+      }
+      if (l.current) {
+        const label = l.current.replace(/^Bash: /, "");
+        const described = l.current_command && label !== l.current_command.replace(/\s+/g, " ").slice(0, 59);
+        items.push(item(v_flex().pl(inner).gap(2)
+          .child(h_flex().h(24).pr(8).gap(7).items_center()
+            .child(spinner(t.accent))
+            .child(div().flex_1().min_w(0).truncate().text_size(12.5).italic().text_color(t.accent).child(l.current_command && !described ? `$ ${l.current_command}` : `↳ ${label}`))
+            .child(right(since(l.current_at))))
+          .when(Boolean(described), (el) => el.child(command(l.current_command, false)))));
+      }
+      if (!isMain) for (const child of agents.filter((c) => c.parent === l.id)) loopItems(child, depth + 1);
+    };
+
+    if (total > 0) {
+      const pct = Math.round((100 * done) / total);
+      items.push(item(h_flex().px(8).pt(6).pb(4).gap(8).items_center()
+        .child(div().flex_1().h(4).rounded(2).bg(t.border).child(div().h_full().rounded(2).bg(done === total ? t.ansi2 : t.accent).w(`${pct}%`)))
+        .child(div().flex_none().text_size(11.5).font_semibold().child(`${pct}%`))
+        .child(right(`${done}/${total}`))));
+    }
+    loopItems(main, 0);
+    for (const agent of agents.filter((a) => a.parent === "main")) loopItems(agent, 0);
+    if (!main.tasks.length && !main.shells.length && !main.current && !agents.length) {
+      items.push(item(note(t, "Nothing yet: tasks, commands and subagents show here as the session works.")));
+    }
+    const footer = this.hasFinished() ? [div().flex_1(), button(t, "act-clear", "Clear finished", () => this.clear(), false)] : null;
+    return this.frame(t, { title: "Activity", badge: total ? `${done}/${total}` : null, subtitle: facts.join(" · "), actions: [refresh] }, items, footer);
   }
 }

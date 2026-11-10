@@ -49,6 +49,10 @@ Managing tasks and sessions (usable from inside a session):
   showrunner session ticket [<session>]         JSON: the task's Linear ticket, live
   showrunner session pr [<session>]             JSON: the task's PR with checks and
                                                     unresolved review threads, live
+  showrunner session activity [<session>] [--output <shell>]
+                                                JSON: what its Claude is doing (tool calls,
+                                                    subagents, tasks, shells), from its
+                                                    conversation; --output: a shell's output
   showrunner session set-conversation <session> <id>
                                                 record the Claude conversation it resumes
 
@@ -871,6 +875,7 @@ fn cmd_session(args: &[String]) -> Result<()> {
         Some("info") => cmd_session_info(&args[1..]),
         Some("ticket") => cmd_session_ticket(&args[1..]),
         Some("pr") => cmd_session_pr(&args[1..]),
+        Some("activity") => cmd_session_activity(&args[1..]),
         Some("set-conversation") => cmd_session_set_conversation(&args[1..]),
         Some(other) if let Some(result) = cli_actions::session_action(other, &args[1..]) => result,
         Some(other) => bail!(
@@ -1068,6 +1073,29 @@ fn cmd_session_pr(args: &[String]) -> Result<()> {
     }
     let pr = ops::pr_details(&record.project_path, &record.task_branch)?;
     println!("{}", serde_json::to_string(&pr)?);
+    Ok(())
+}
+
+/// What a session's Claude is doing, read from its conversation, as JSON: the
+/// board Herdr's Activity panel shows.
+fn cmd_session_activity(args: &[String]) -> Result<()> {
+    let (positional, flags) = parse_args(args, &["output"], &[])?;
+    let cm_name = match positional.as_slice() {
+        [reference] if reference == session::COORDINATOR => reference.clone(),
+        [reference] => resolve_recorded_session(reference)?,
+        [] => current_session_name()
+            .ok_or_else(|| anyhow::anyhow!("not inside a showrunner session; pass <session>"))?,
+        _ => bail!("usage: session activity [<session>] [--output <shell id>]"),
+    };
+    let file = session::conversation_file(&cm_name)
+        .ok_or_else(|| anyhow::anyhow!("no Claude conversation for this session"))?;
+    if let Some(shell) = flags.get("output") {
+        let output = crate::activity::shell_output(&file, shell)
+            .ok_or_else(|| anyhow::anyhow!("no output for shell {shell}"))?;
+        print!("{output}");
+        return Ok(());
+    }
+    println!("{}", serde_json::to_string(&crate::activity::board(&file))?);
     Ok(())
 }
 

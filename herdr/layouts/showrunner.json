@@ -85,7 +85,7 @@
               "id": "panel-tabs",
               "type": "block",
               "size": {
-                "px": 196
+                "px": 280
               },
               "window_drag": true,
               "content": {
@@ -188,6 +188,16 @@
                         "mod": "showrunner",
                         "props": {
                           "view": "ticket"
+                        }
+                      }
+                    },
+                    {
+                      "id": "activity",
+                      "type": "block",
+                      "content": {
+                        "mod": "showrunner",
+                        "props": {
+                          "view": "activity"
                         }
                       }
                     }

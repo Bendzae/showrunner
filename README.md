@@ -363,6 +363,7 @@ What works differently there:
 - A session whose tab was closed stays in the list as *stopped*; `Enter` starts it again, resuming its conversation.
 - Creating a task or session shows its tab; the keyboard stays in the list.
 - Remote hosts (`[remote]`) aren't shown there, only this machine's projects.
+- The right panel (`Ctrl-'`) shows Files, Changes, the task's ideas, PR and Linear ticket, and **Activity**: what the selected session's Claude is doing, read from its conversation (`showrunner session activity`): its subagents nested under whoever started them, the call under way, task lists, shell commands with their last output lines, the turn's time and context fill.
 - `Cmd-K` switches sessions: a fuzzy list of the running sessions (`project - task - session`) but the one on screen, those that need you first, then those done since you looked, then the most recently used.
 - The **Coordinator** row on top is one Claude session above all projects: it keeps the overview across projects, tasks and sessions, starts and steers work through the `showrunner` CLI, and knows hc and Herdr (their `--skill` manuals are its skills). It runs in `~/.showrunner/coordinator`, starts with Herdr (`showrunner coordinator` starts it by hand) and resumes its conversation; `Ctrl-;` jumps to it from anywhere.
 
