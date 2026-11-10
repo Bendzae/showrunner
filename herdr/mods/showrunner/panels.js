@@ -39,6 +39,12 @@ export function showPanel(view) {
   run("layout.show", { id: "panel" });
 }
 
+// The command that puts the keyboard on a panel, for those that take it: our
+// views, and herdr-reviewer in the Changes panel's place.
+export function panelFocus(view) {
+  return { showrunner: "showrunner.focus-panel", reviewer: "reviewer.focus" }[find(layout(), view)?.content?.mod] ?? null;
+}
+
 export function togglePanel(view) {
   if (visible(view)) run("layout.hide", { id: "panel" });
   else showPanel(view);
@@ -177,7 +183,8 @@ class Loading {
     });
     cx.spawn(async (cx) => {
       for (;;) {
-        if ((await nextCommand()) === "focus") this.handle.focus();
+        const c = await nextCommand();
+        if (c === "focus" || (c === "focus-panel" && visible(this.view))) this.handle.focus();
         cx.notify();
       }
     });

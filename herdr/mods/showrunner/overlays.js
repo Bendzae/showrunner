@@ -7,7 +7,7 @@ import { props, closeOverlay, theme, settings, pickFolder, home, run } from "her
 import { menuItems, enqueue, show } from "./lib.js";
 import { FORMS, PICKERS, agentChoices, loadKnownAgents, toBranch } from "./actions.js";
 import { icon, keycap, statusGlyph } from "./ui.js";
-import { showPanel } from "./panels.js";
+import { showPanel, panelFocus } from "./panels.js";
 
 // Closing gives the keyboard back to the tree, then has it run `jobs` (which
 // may move the keyboard on). Queued first: a closed popup changes nothing.
@@ -48,9 +48,16 @@ export class Menu {
     if (!entry) return;
     if (entry.action.startsWith("panel:")) {
       const view = entry.action.slice(6);
-      if (view) showPanel(view);
-      else run("layout.hide", { id: "panel" });
-      return this.close();
+      if (!view) {
+        run("layout.hide", { id: "panel" });
+        return this.close();
+      }
+      showPanel(view);
+      // A panel that takes the keyboard gets it; Files keeps it where it was.
+      const focus = panelFocus(view);
+      if (!focus) return this.close();
+      closeOverlay(props().overlay);
+      return run(focus);
     }
     close({ kind: "perform", action: entry.action, item: props().item });
   }
