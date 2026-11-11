@@ -927,6 +927,8 @@ fn coordinator_prompt() -> String {
          - Keep the overview across projects, tasks and sessions: what is working, what\n  \
          waits for the person, what is done, where PRs and tickets stand. `showrunner list`\n  \
          shows it (`--json` for details)\n\
+         - Other machines Herdr reaches (`hc machine ls`) may run showrunner with projects of\n  \
+         their own: run its commands there with `hc exec --on <machine> -- showrunner ...`\n\
          - Start, steer and coordinate work: create tasks and sessions with self-contained\n  \
          prompts, ask other sessions' agents what they know (`showrunner ask`), brief them\n  \
          (`showrunner send`), read their screens (`showrunner output`). See the\n  \

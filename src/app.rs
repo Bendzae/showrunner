@@ -480,7 +480,7 @@ impl App {
         let config = Config::load()?;
         let keybindings = KeyBindings::load();
         // Recreate any saved sessions that are no longer running (e.g. after a reboot)
-        let restore_failures = crate::ops::restore_sessions(&config).failures;
+        let restore_failures = crate::ops::restore_sessions(&config, true).failures;
         let sessions = session::list_sessions().unwrap_or_default();
         let (tx, rx) = mpsc::channel();
         let (review_tx, review_rx) = mpsc::channel();

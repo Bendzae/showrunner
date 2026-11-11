@@ -72,6 +72,32 @@ During the trial, never start the old `showrunner-tmux` TUI while sessions
 run in hc. It recreates every saved session that isn't in tmux, so each
 agent would run twice.
 
+## Another machine
+
+Sessions can also run on another machine, e.g. a dev box reached over ssh:
+it runs its own hc and showrunner, and Herdr here shows its spaces. The tree
+gets a section for it and runs every command there (`exec` with `on`).
+
+1. On that machine: Claude (or the other agents), git, `gh`, and this
+   branch built and installed as `showrunner` (keep the old binary as
+   `showrunner-tmux` to switch back). Its non-interactive shell must find
+   `showrunner` on the PATH (e.g. `~/.cargo/bin` in `~/.zshenv`).
+   Claude starts a worktree without asking when it trusts the repository:
+   open `claude` once in each project's repository there.
+2. Here: `hc machine add <ssh host> --name <name> --install` (or Herdr's
+   Settings > Machines). It copies hc there.
+3. Sessions still running in tmux there move with `showrunner migrate`, run
+   there from outside tmux. Saved sessions that aren't running come back by
+   themselves when Herdr reaches the machine (`restore --no-coordinator`: the
+   Coordinator runs here only).
+4. After updating the branch, build and install it there again, and run
+   `hc machine update <name>` when hc here was updated.
+
+To switch that machine back: `hc machine rm <name>` here, then there
+`hc server stop` (this ends its agents) and put `showrunner-tmux` back as
+`showrunner`. The old version recreates the saved sessions in tmux when it
+starts.
+
 ## Switching back to tmux
 
 1. Quit Herdr, then run `hc server stop`. This ends the agents in hc.
@@ -111,3 +137,10 @@ HC_SESSION=srtest HERDR_APP_HOME=$T/app nohup env -u CLAUDECODE -u CLAUDE_CODE_C
   keyboard handling by asking the user to try it.
 - Rebuild before `herdr install`: the mod files are embedded with
   `include_str!`.
+- Another machine for the test instance: add it in its hc session with its
+  own hc session there (`HC_SESSION=srtest hc machine add <host> --name
+  devbox --session srtest`), give it a wrapper there like the one above
+  (its own `SHOWRUNNER_HOME`, `HC_SESSION=srtest`), and point the mods at it
+  in `$T/app/mods/showrunner/local.json`:
+  `"machines": { "devbox": { "bin": "/path/to/wrapper" } }` (add it again
+  after each `herdr install`).

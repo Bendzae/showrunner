@@ -1,18 +1,57 @@
 // The sidebar: projects, task groups, tasks and their sessions, as the TUI
 // lists them, with the TUI's keys. Statuses are Herdr's live ones; structure,
-// diffs and PRs come from `showrunner list`.
+// diffs and PRs come from `showrunner list`. Below this machine's projects,
+// each of Herdr's other machines that runs showrunner gets a section with its
+// own: its listing's ids carry the machine's name, as Herdr's ids for its
+// spaces and tabs do.
 
 import { div, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input } from "gpui-base";
-import { spaces, focused, run, theme, settings, shared, setShared, nextCommand, readTextFile, window, layout, themes, openOverlay } from "herdr";
-import { sr, act, clean, loadConfig, liveSessions, liveRuns, guessedStatus, worst, menuItems, show, runAct } from "./lib.js";
+import { spaces, focused, run, theme, settings, shared, setShared, nextCommand, readTextFile, window, layout, themes, openOverlay, machines } from "herdr";
+import { sr, act, clean, loadConfig, liveSessions, liveRuns, guessedStatus, worst, menuItems, show, runAct, qualify, bare, machineOf } from "./lib.js";
 import { perform, openMenu, form } from "./actions.js";
 import { togglePanel, showPanel, panelEntries } from "./panels.js";
 import { icon, programIcon, statusGlyph, prColor, diffBadge, activityBadge, avatar, avatarColor, linearId, prSummary } from "./ui.js";
 
-const H = { coordinator: 34, project: 34, group: 26, task: 28, session: 26, stopped: 26, "adhoc-group": 26, adhoc: 26, "other-head": 32, space: 28, hint: 30 };
+const H = { coordinator: 34, machine: 34, project: 34, group: 26, task: 28, session: 26, stopped: 26, "adhoc-group": 26, adhoc: 26, "other-head": 32, space: 28, hint: 30 };
 const HOT_SECONDS = 2 * 3600;
 const HEADER = 31;
+// How long a machine without showrunner is left alone before it's asked again.
+const ABSENT_RETRY = 5 * 60 * 1000;
+
+// Another machine's listing with Herdr's names for its sessions, runs and spaces.
+function qualifyListing(data, m) {
+  const q = (id) => qualify(m, id);
+  const session = (s) => ({ ...s, cm_name: q(s.cm_name), run: q(s.run) });
+  for (const p of data.projects ?? []) {
+    Object.assign(p, { space: q(p.space), run: q(p.run) });
+    p.adhoc_sessions = (p.adhoc_sessions ?? []).map(session);
+    p.adhoc_stopped = (p.adhoc_stopped ?? []).map(session);
+    for (const t of p.tasks ?? []) {
+      Object.assign(t, { space: q(t.space), run: q(t.run) });
+      t.sessions = (t.sessions ?? []).map(session);
+      t.stopped = (t.stopped ?? []).map(session);
+    }
+  }
+  data.coordinator = null;
+  return data;
+}
+
+// Diffs, branches, PRs and last activity from a `list --stats`, by the tree's keys.
+function statsOf(data, m) {
+  const stats = { projects: {}, tasks: {}, sessions: {} };
+  for (const p of data.projects ?? []) {
+    const K = qualify(m, p.name);
+    stats.projects[K] = { branch: p.branch };
+    const sessions = [...(p.adhoc_sessions ?? [])];
+    for (const t of p.tasks ?? []) {
+      stats.tasks[`${K}/${t.name}`] = { diff: t.diff, pr: t.pr };
+      sessions.push(...(t.sessions ?? []));
+    }
+    for (const s of sessions) stats.sessions[qualify(m, s.cm_name)] = { diff: s.diff, branch: s.branch, last_active: s.last_active };
+  }
+  return stats;
+}
 
 function find(node, id) {
   if (node?.id === id) return node;
@@ -40,6 +79,10 @@ export class Tree {
     this.data = null;
     this.error = null;
     this.stats = { projects: {}, tasks: {}, sessions: {} };
+    // Stats by machine ("" for this one), merged into `stats`.
+    this.statsBy = {};
+    // Other machines: { data, error, absent (when it had no showrunner), restored, ... }.
+    this.remote = {};
     this.guessed = {};
     // Folded unless opened: projects, groups, tasks and adhoc start closed.
     this.expanded = new Set(JSON.parse(localStorage.getItem("expanded") ?? "[]"));
@@ -85,6 +128,7 @@ export class Tree {
       if (focused !== this.wasFocused) { this.wasFocused = focused; cx.notify(); }
     });
     cx.timer.every(1500, (cx) => this.watch(cx));
+    cx.timer.every(3000, (cx) => this.watchRemotes(cx));
     cx.timer.every(30000, (cx) => this.refresh(cx));
     cx.timer.every(20000, (cx) => { if (window()?.active) this.refreshStats(cx); });
     cx.timer.every(4000, (cx) => this.refreshGuesses(cx));
@@ -129,17 +173,19 @@ export class Tree {
     const live = liveSessions(this.guessed);
     const current = spaces().find((s) => s.active)?.tabs?.find((t) => t.active)?.id;
     const entries = [];
-    const add = (parts, space, cm) => {
+    const add = (parts, space, cm, machine = null) => {
       const l = live[cm];
       if (!l || cm === current) return;
       const at = this.visited[cm] ?? (this.stats.sessions[cm]?.last_active ?? 0) * 1000;
-      entries.push({ parts, label: parts.join(" - "), space, tab: cm, address: l.address, status: l.status, at });
+      entries.push({ parts, machine, label: [machine, ...parts].filter(Boolean).join(" - "), space, tab: cm, address: l.address, status: l.status, at });
     };
     const c = this.data?.coordinator;
     if (c) add(["Coordinator"], c.space, c.cm_name);
-    for (const p of this.data?.projects ?? []) {
-      for (const s of p.adhoc_sessions ?? []) add([p.name, "adhoc", s.name], p.space, s.cm_name);
-      for (const t of p.tasks ?? []) for (const s of t.sessions ?? []) add([p.name, t.name, s.name], t.space, s.cm_name);
+    for (const { machine: m, data } of this.sources()) {
+      for (const p of data?.projects ?? []) {
+        for (const s of p.adhoc_sessions ?? []) add([p.name, "adhoc", s.name], p.space, s.cm_name, m);
+        for (const t of p.tasks ?? []) for (const s of t.sessions ?? []) add([p.name, t.name, s.name], t.space, s.cm_name, m);
+      }
     }
     const rank = (s) => ({ blocked: 0, done: 1 })[s] ?? 2;
     entries.sort((a, b) => rank(a.status) - rank(b.status) || b.at - a.at);
@@ -169,6 +215,7 @@ export class Tree {
   }
 
   refresh(cx) {
+    this.refreshRemotes(cx);
     if (this.loading) { this.again = true; return; }
     this.loading = true;
     cx.spawn(async (cx) => {
@@ -186,46 +233,104 @@ export class Tree {
 
   // Diffs, branches, PRs, last activity: what the TUI's worker computes.
   refreshStats(cx) {
-    if (this.statsLoading) return;
-    this.statsLoading = true;
+    for (const m of [null, ...Object.keys(this.remote).filter((m) => this.online(m))]) this.refreshStatsOn(cx, m);
+  }
+
+  refreshStatsOn(cx, m) {
+    const key = m ?? "";
+    this.statsLoading ??= {};
+    if (this.statsLoading[key]) return;
+    this.statsLoading[key] = true;
     cx.spawn(async (cx) => {
-      const r = await sr(["list", "--json", "--stats", "--no-status", "--local"], 180000);
-      this.statsLoading = false;
+      const r = await sr(["list", "--json", "--stats", "--no-status", "--local"], 180000, m);
+      this.statsLoading[key] = false;
       if (r.code !== 0) return;
       let data;
       try { data = JSON.parse(r.stdout); } catch { return; }
-      const stats = { projects: {}, tasks: {}, sessions: {} };
-      for (const p of data.projects ?? []) {
-        stats.projects[p.name] = { branch: p.branch };
-        const sessions = [...(p.adhoc_sessions ?? [])];
-        for (const t of p.tasks ?? []) {
-          stats.tasks[`${p.name}/${t.name}`] = { diff: t.diff, pr: t.pr };
-          sessions.push(...(t.sessions ?? []));
-        }
-        for (const s of sessions) stats.sessions[s.cm_name] = { diff: s.diff, branch: s.branch, last_active: s.last_active };
-      }
-      this.stats = stats;
+      this.statsBy[key] = statsOf(data, m);
+      const merged = { projects: {}, tasks: {}, sessions: {} };
+      for (const st of Object.values(this.statsBy)) for (const k of Object.keys(merged)) Object.assign(merged[k], st[k]);
+      this.stats = merged;
       cx.notify();
     });
+  }
+
+  // A machine whose showrunner answered and that Herdr reaches now.
+  online(m) {
+    const st = this.remote[m];
+    return Boolean(st?.data) && machines().some((x) => x.name === m && x.layout === "ready");
+  }
+
+  // Herdr's other machines: each one's listing, the way this machine's comes.
+  // Its saved sessions come back when it first answers, and again after it
+  // was out of reach (a reboot), as here on start.
+  refreshRemotes(cx) {
+    for (const { name: m, layout: state } of machines()) {
+      if (!m) continue;
+      // Back from a reboot, its sessions come back again.
+      if (state !== "ready") { if (this.remote[m]) this.remote[m].restored = false; continue; }
+      const st = (this.remote[m] ??= { data: null, error: null });
+      if (st.loading || (st.absent && Date.now() - st.absent < ABSENT_RETRY)) continue;
+      st.loading = true;
+      cx.spawn(async (cx) => {
+        if (!st.restored) {
+          // Without a Coordinator: the one here oversees.
+          const r = await sr(["restore", "--no-coordinator"], 300000, m);
+          st.restored = r.code !== 127;
+        }
+        const r = await sr(["list", "--json", "--no-status", "--local"], undefined, m);
+        st.loading = false;
+        if (r.code === 0) {
+          try { st.data = qualifyListing(JSON.parse(r.stdout), m); st.error = null; st.absent = null; } catch (e) { st.error = `Unreadable listing: ${e}`; }
+        } else if (r.code === 127) {
+          // No showrunner there: no section for it.
+          Object.assign(st, { data: null, error: null, absent: Date.now(), restored: false });
+        } else {
+          st.error = clean(r.stderr) || "showrunner did not answer";
+        }
+        cx.notify();
+        if (!st.statsAsked && st.data) { st.statsAsked = true; this.refreshStatsOn(cx, m); }
+      });
+    }
+  }
+
+  // Other machines' config.toml and sessions.json, as `watch` reads this one's.
+  watchRemotes(cx) {
+    // A machine Herdr just reached is asked at once.
+    if (machines().some((x) => x.name && x.layout === "ready" && !this.remote[x.name])) this.refreshRemotes(cx);
+    for (const [m, st] of Object.entries(this.remote)) {
+      const dir = st.data?.data_dir;
+      if (!dir || st.watching || !this.online(m)) continue;
+      st.watching = true;
+      cx.spawn(async (cx) => {
+        const read = (f) => readTextFile(`${dir}/${f}`, { on: m }).catch(() => null);
+        const text = `${await read("config.toml")}\0${await read("sessions.json")}`;
+        st.watching = false;
+        if (st.seen !== undefined && text !== st.seen) this.refresh(cx);
+        st.seen = text;
+      });
+    }
   }
 
   // Agents that don't report a status (codex, pi): showrunner reads their screens.
   refreshGuesses(cx) {
     if (this.guessing || !this.data) return;
-    const live = liveSessions();
-    const silent = Object.values(live).some((s) => !s.status);
-    if (!silent) { this.guessed = {}; return; }
+    // The machines (null: this one) with a session that reports nothing.
+    const silent = new Set(Object.entries(liveSessions()).filter(([, s]) => !s.status).map(([name]) => machineOf(name)));
+    if (!silent.size) { this.guessed = {}; return; }
     this.guessing = true;
     cx.spawn(async (cx) => {
-      const r = await sr(["list", "--json", "--local"]);
-      this.guessing = false;
-      if (r.code !== 0) return;
       const guessed = {};
-      try {
-        for (const p of JSON.parse(r.stdout).projects ?? [])
-          for (const s of [...(p.adhoc_sessions ?? []), ...(p.tasks ?? []).flatMap((t) => t.sessions ?? [])])
-            guessed[s.cm_name] = guessedStatus(s.status);
-      } catch { return; }
+      for (const m of silent) {
+        const r = await sr(["list", "--json", "--local"], undefined, m);
+        if (r.code !== 0) continue;
+        try {
+          for (const p of JSON.parse(r.stdout).projects ?? [])
+            for (const s of [...(p.adhoc_sessions ?? []), ...(p.tasks ?? []).flatMap((t) => t.sessions ?? [])])
+              guessed[qualify(m, s.cm_name)] = guessedStatus(s.status);
+        } catch {}
+      }
+      this.guessing = false;
       this.guessed = guessed;
       cx.notify();
     });
@@ -240,6 +345,16 @@ export class Tree {
   expandTo(key) {
     const row = this.allRows?.find((r) => r.key === key);
     for (const parent of row?.parents ?? []) if (!this.expanded.has(parent)) this.toggle(parent);
+  }
+
+  // This machine's listing, then those of the other machines Herdr reaches
+  // that have showrunner, by name.
+  sources() {
+    const known = new Set(machines().map((m) => m.name).filter(Boolean));
+    const others = Object.entries(this.remote)
+      .filter(([m, st]) => known.has(m) && (st.data || st.error))
+      .sort(([a], [b]) => a.localeCompare(b));
+    return [{ machine: null, data: this.data }, ...others.map(([m, st]) => ({ machine: m, data: st.data, error: st.error }))];
   }
 
   // Every row, in order, as the TUI lists them; `allRows` keeps the ones
@@ -269,93 +384,110 @@ export class Tree {
       rows.push({ key: `s:${c.cm_name}`, kind: "coordinator", depth: 0, status: l ? l.status : "stopped",
         item: { kind: "coordinator", space: c.space, session: { cm_name: c.cm_name, name: "Coordinator", agent: "claude", live: Boolean(l), address: l?.address ?? null } } });
     }
-    for (const p of this.data?.projects ?? []) {
-      const P = { name: p.name, path: p.path, run_command: p.run_command, space: p.space, run: p.run, agent: this.data.default_agent ?? "claude" };
-      const pkey = `p:${p.name}`;
-      const projectHit = has(p.name);
-      const tasks = (p.tasks ?? []).filter((t) => Boolean(t.archived) === this.archived);
-      const projectRows = [];
-      let sessionsTotal = 0;
-      let lastGroup = null;
-      // Adhoc sessions, the project's own space: always first, also when empty.
-      if (!this.archived) {
-        const running = (p.adhoc_sessions ?? []).filter((s) => live[s.cm_name]);
-        const stopped = [...(p.adhoc_stopped ?? []), ...(p.adhoc_sessions ?? []).filter((s) => !live[s.cm_name])];
-        const hits = [...running.map((s) => [s, false]), ...stopped.map((s) => [s, true])].filter(([s]) => projectHit || has(s.name, "adhoc"));
-        this.names[p.space] = p.name;
-        this.names[p.run] = "▶ run";
-        if (hits.length) this.spaceOrder.push(p.space);
-        if (hits.length || !f) {
-          const akey = `a:${p.name}`;
-          const status = worst(running.map((s) => live[s.cm_name].status));
-          sessionsTotal += running.length;
-          projectRows.push({ key: akey, kind: "adhoc-group", depth: 1, parents: [pkey], status, folded: !open(akey), count: hits.length,
-            item: { kind: "adhoc-group", project: P, space: p.space } });
-          for (const [s, isStopped] of hits) {
-            this.names[s.cm_name] = s.name;
-            this.tabOrder.push(s.cm_name);
-            projectRows.push({
-              key: `s:${s.cm_name}`, kind: isStopped ? "stopped" : "adhoc", depth: 2, parents: [pkey, akey],
-              item: { kind: isStopped ? "stopped" : "adhoc", project: P, session: sessionInfo(s, isStopped), space: p.space, run: s.run },
-              status: isStopped ? "stopped" : live[s.cm_name]?.status, program: live[s.cm_name]?.program,
-              diff: this.stats.sessions[s.cm_name]?.diff,
-            });
+    for (const src of this.sources()) {
+      const M = src.machine;
+      // Another machine's projects sit under its row.
+      let section = [];
+      const sectionAt = rows.length;
+      if (M) {
+        const mkey = `m:${M}`;
+        const offline = !this.online(M);
+        rows.push({ key: mkey, kind: "machine", depth: 0, folded: !open(mkey), offline, error: src.error, item: { kind: "machine", machine: M } });
+        if (offline) continue;
+        section = [mkey];
+      }
+      for (const p of src.data?.projects ?? []) {
+        // The project's key: other machines may have one with the same name.
+        const K = qualify(M, p.name);
+        const P = { name: p.name, path: p.path, run_command: p.run_command, space: p.space, run: p.run, agent: src.data.default_agent ?? "claude", machine: M };
+        const pkey = `p:${K}`;
+        const projectHit = has(p.name);
+        const tasks = (p.tasks ?? []).filter((t) => Boolean(t.archived) === this.archived);
+        const projectRows = [];
+        let sessionsTotal = 0;
+        let lastGroup = null;
+        // Adhoc sessions, the project's own space: always first, also when empty.
+        if (!this.archived) {
+          const running = (p.adhoc_sessions ?? []).filter((s) => live[s.cm_name]);
+          const stopped = [...(p.adhoc_stopped ?? []), ...(p.adhoc_sessions ?? []).filter((s) => !live[s.cm_name])];
+          const hits = [...running.map((s) => [s, false]), ...stopped.map((s) => [s, true])].filter(([s]) => projectHit || has(s.name, "adhoc"));
+          this.names[p.space] = p.name;
+          this.names[p.run] = "▶ run";
+          if (hits.length) this.spaceOrder.push(p.space);
+          if (hits.length || !f) {
+            const akey = `a:${K}`;
+            const status = worst(running.map((s) => live[s.cm_name].status));
+            sessionsTotal += running.length;
+            projectRows.push({ key: akey, kind: "adhoc-group", depth: 1, parents: [...section, pkey], status, folded: !open(akey), count: hits.length,
+              item: { kind: "adhoc-group", project: P, space: p.space, machine: M } });
+            for (const [s, isStopped] of hits) {
+              this.names[s.cm_name] = s.name;
+              this.tabOrder.push(s.cm_name);
+              projectRows.push({
+                key: `s:${s.cm_name}`, kind: isStopped ? "stopped" : "adhoc", depth: 2, parents: [...section, pkey, akey],
+                item: { kind: isStopped ? "stopped" : "adhoc", project: P, session: sessionInfo(s, isStopped), space: p.space, run: s.run, machine: M },
+                status: isStopped ? "stopped" : live[s.cm_name]?.status, program: live[s.cm_name]?.program,
+                diff: this.stats.sessions[s.cm_name]?.diff,
+              });
+            }
           }
         }
-      }
-      for (const t of tasks) {
-        const T = { name: t.name, branch: t.branch, base_branch: t.base_branch, linear: t.linear, group: t.group, archived: t.archived, pr: this.stats.tasks[`${p.name}/${t.name}`]?.pr ?? null, stack: t.stack };
-        const space = t.space;
-        this.spaceOrder.push(space);
-        this.names[space] = t.name;
-        const running = (t.sessions ?? []).filter((s) => live[s.cm_name]);
-        // A session listed as live that Herdr has seen end is stopped now.
-        const stopped = [...(t.stopped ?? []), ...(t.sessions ?? []).filter((s) => !live[s.cm_name])];
-        const statuses = running.map((s) => live[s.cm_name].status);
-        const status = worst(statuses);
-        sessionsTotal += running.length;
-        const main = running.find((s) => s.name === "main");
-        const taskHit = projectHit || has(t.name, t.branch, linearId(t.linear));
-        const sessionHits = [...running, ...stopped].filter((s) => taskHit || has(s.name, s.agent));
-        if (!taskHit && !sessionHits.length) continue;
-        if (t.group && t.group !== lastGroup) {
-          const gkey = `g:${p.name}/${t.group}`;
-          const groupTasks = tasks.filter((x) => x.group === t.group);
-          projectRows.push({ key: gkey, kind: "group", depth: 1, parents: [pkey], label: t.group, count: groupTasks.length,
-            item: { kind: "group", project: P, group: t.group, space: p.space }, folded: !open(gkey) });
+        for (const t of tasks) {
+          const T = { name: t.name, branch: t.branch, base_branch: t.base_branch, linear: t.linear, group: t.group, archived: t.archived, pr: this.stats.tasks[`${K}/${t.name}`]?.pr ?? null, stack: t.stack };
+          const space = t.space;
+          this.spaceOrder.push(space);
+          this.names[space] = t.name;
+          const running = (t.sessions ?? []).filter((s) => live[s.cm_name]);
+          // A session listed as live that Herdr has seen end is stopped now.
+          const stopped = [...(t.stopped ?? []), ...(t.sessions ?? []).filter((s) => !live[s.cm_name])];
+          const statuses = running.map((s) => live[s.cm_name].status);
+          const status = worst(statuses);
+          sessionsTotal += running.length;
+          const main = running.find((s) => s.name === "main");
+          const taskHit = projectHit || has(t.name, t.branch, linearId(t.linear));
+          const sessionHits = [...running, ...stopped].filter((s) => taskHit || has(s.name, s.agent));
+          if (!taskHit && !sessionHits.length) continue;
+          if (t.group && t.group !== lastGroup) {
+            const gkey = `g:${K}/${t.group}`;
+            const groupTasks = tasks.filter((x) => x.group === t.group);
+            projectRows.push({ key: gkey, kind: "group", depth: 1, parents: [...section, pkey], label: t.group, count: groupTasks.length,
+              item: { kind: "group", project: P, group: t.group, space: p.space, machine: M }, folded: !open(gkey) });
+          }
+          lastGroup = t.group ?? null;
+          const inGroup = Boolean(t.group);
+          const above = inGroup ? [...section, pkey, `g:${K}/${t.group}`] : [...section, pkey];
+          const tkey = `t:${K}/${t.name}`;
+          const mainInfo = main ? sessionInfo(main, false) : null;
+          const taskItem = { kind: "task", project: P, task: T, space, run: t.run, main: mainInfo, counts: { sessions: running.length }, machine: M };
+          projectRows.push({ key: tkey, kind: "task", depth: inGroup ? 2 : 1, parents: above, item: taskItem, status, folded: !open(tkey),
+            blocked: statuses.filter((s) => s === "blocked").length, diff: this.stats.tasks[`${K}/${t.name}`]?.diff });
+          const ordered = [...running.map((s) => [s, false]), ...stopped.map((s) => [s, true])]
+            .filter(([s]) => sessionHits.includes(s))
+            .sort(([a], [b]) => (a.name !== "main") - (b.name !== "main") || a.name.localeCompare(b.name, undefined, { numeric: true }));
+          for (const [s, isStopped] of ordered) {
+            this.names[s.cm_name] = s.name === "main" ? "main" : /^\d+$/.test(s.name) ? `session ${s.name}` : s.name;
+            this.tabOrder.push(s.cm_name);
+            const S = sessionInfo(s, isStopped);
+            projectRows.push({
+              key: `s:${s.cm_name}`, kind: isStopped ? "stopped" : "session", depth: (inGroup ? 2 : 1) + 1, parents: [...above, tkey],
+              item: { kind: isStopped ? "stopped" : "session", project: P, task: T, session: S, space, run: s.run, main: mainInfo, machine: M },
+              status: isStopped ? "stopped" : live[s.cm_name]?.status, program: live[s.cm_name]?.program,
+              diff: this.stats.sessions[s.cm_name]?.diff, branch: this.stats.sessions[s.cm_name]?.branch,
+            });
+            if (s.run) this.names[s.run] = "▶ run";
+          }
+          this.names[t.run] = "▶ run";
         }
-        lastGroup = t.group ?? null;
-        const inGroup = Boolean(t.group);
-        const above = inGroup ? [pkey, `g:${p.name}/${t.group}`] : [pkey];
-        const tkey = `t:${p.name}/${t.name}`;
-        const mainInfo = main ? sessionInfo(main, false) : null;
-        const taskItem = { kind: "task", project: P, task: T, space, run: t.run, main: mainInfo, counts: { sessions: running.length } };
-        projectRows.push({ key: tkey, kind: "task", depth: inGroup ? 2 : 1, parents: above, item: taskItem, status, folded: !open(tkey),
-          blocked: statuses.filter((s) => s === "blocked").length, diff: this.stats.tasks[`${p.name}/${t.name}`]?.diff });
-        const ordered = [...running.map((s) => [s, false]), ...stopped.map((s) => [s, true])]
-          .filter(([s]) => sessionHits.includes(s))
-          .sort(([a], [b]) => (a.name !== "main") - (b.name !== "main") || a.name.localeCompare(b.name, undefined, { numeric: true }));
-        for (const [s, isStopped] of ordered) {
-          this.names[s.cm_name] = s.name === "main" ? "main" : /^\d+$/.test(s.name) ? `session ${s.name}` : s.name;
-          this.tabOrder.push(s.cm_name);
-          const S = sessionInfo(s, isStopped);
-          projectRows.push({
-            key: `s:${s.cm_name}`, kind: isStopped ? "stopped" : "session", depth: (inGroup ? 2 : 1) + 1, parents: [...above, tkey],
-            item: { kind: isStopped ? "stopped" : "session", project: P, task: T, session: S, space, run: s.run, main: mainInfo },
-            status: isStopped ? "stopped" : live[s.cm_name]?.status, program: live[s.cm_name]?.program,
-            diff: this.stats.sessions[s.cm_name]?.diff, branch: this.stats.sessions[s.cm_name]?.branch,
-          });
-          if (s.run) this.names[s.run] = "▶ run";
-        }
-        this.names[t.run] = "▶ run";
+        if (!projectHit && !projectRows.length) continue;
+        rows.push({ key: pkey, kind: "project", depth: 0, parents: section, folded: !open(pkey), branch: this.stats.projects[K]?.branch,
+          item: { kind: "project", project: P, space: p.space, run: p.run, counts: { tasks: (p.tasks ?? []).length, sessions: sessionsTotal }, machine: M } });
+        rows.push(...projectRows);
       }
-      if (!projectHit && !projectRows.length) continue;
-      rows.push({ key: pkey, kind: "project", depth: 0, folded: !open(pkey), branch: this.stats.projects[p.name]?.branch,
-        item: { kind: "project", project: P, space: p.space, run: p.run, counts: { tasks: (p.tasks ?? []).length, sessions: sessionsTotal } } });
-      rows.push(...projectRows);
+      // A filter matching nothing on a machine leaves out its row too.
+      if (M && f && rows.length === sectionAt + 1) rows.pop();
     }
     // Herdr spaces that aren't showrunner's (a plain terminal, another agent).
-    const others = spaces().filter((s) => !s.id.startsWith("cm__") && !s.machine && has(s.name));
+    const others = spaces().filter((s) => !bare(s.machine, s.id).startsWith("cm__") && has(s.name));
     if (others.length && !this.archived) {
       rows.push({ key: "o:head", kind: "other-head" });
       for (const s of others) rows.push({ key: `o:${s.id}`, kind: "space", depth: 0, space: s, status: s.status, item: { kind: "space", space: s.id } });
@@ -384,7 +516,6 @@ export class Tree {
     const present = new Set(spaces().flatMap((s) => [s.id, ...(s.tabs ?? []).map((t) => t.id)]));
     for (const id of this.renamed) if (!present.has(id)) this.renamed.delete(id);
     for (const s of spaces()) {
-      if (s.machine) continue;
       const want = this.names?.[s.id];
       if (want && !s.named && !this.renamed.has(s.id)) {
         this.renamed.add(s.id);
@@ -405,7 +536,6 @@ export class Tree {
   syncOrder() {
     const now = Date.now();
     if (this.ordering && now - this.ordering < 1500) return;
-    const sp = spaces().filter((s) => !s.machine);
     const move = (command, ids, wanted) => {
       const mine = ids.filter((id) => wanted.includes(id));
       const want = wanted.filter((id) => ids.includes(id));
@@ -416,6 +546,8 @@ export class Tree {
       run(command, { id: want[i], index: ids.indexOf(mine[i]) + 1 });
       return true;
     };
+    // This machine's: moves of another machine's spaces don't hold.
+    const sp = spaces().filter((s) => !s.machine);
     if (move("space.move", sp.map((s) => s.id), this.spaceOrder)) return;
     for (const s of sp) if (move("tab.move", (s.tabs ?? []).map((t) => t.id), this.tabOrder)) return;
   }
@@ -486,6 +618,7 @@ export class Tree {
       case "adhoc-group":
         if (!row.count) return perform("new-adhoc", item);
         return this.toggle(row.key);
+      case "machine":
       case "project":
       case "group":
         return this.toggle(row.key);
@@ -512,13 +645,14 @@ export class Tree {
 
   menu(row, at) {
     if (!row?.item || row.kind === "space" || row.kind === "coordinator") return;
-    const item = { ...row.item, groups: this.groupsOf(row.item.project?.name) };
+    const item = { ...row.item, groups: this.groupsOf(row.item.project?.name, row.item.machine) };
     if (!menuItems(item).length) return;
     openMenu(item, at ?? this.anchor(row));
   }
 
-  groupsOf(project) {
-    const p = this.data?.projects?.find((x) => x.name === project);
+  groupsOf(project, machine) {
+    const data = machine ? this.remote[machine]?.data : this.data;
+    const p = data?.projects?.find((x) => x.name === project);
     return [...new Set((p?.tasks ?? []).map((t) => t.group).filter(Boolean))].sort();
   }
 
@@ -539,7 +673,7 @@ export class Tree {
     else if (row.kind === "group") args = ["group", "move", project.name, group, dir, ...(this.archived ? ["--archived"] : [])];
     else if (row.kind === "task") args = ["task", "move", project.name, task.name, dir];
     else return;
-    sr(args).then(() => run("showrunner.refresh"));
+    sr(args, undefined, row.item.machine).then(() => run("showrunner.refresh"));
   }
 
   cycleTheme() {
@@ -560,10 +694,11 @@ export class Tree {
       case "k": case "up": this.move(rows, -1); break;
       case "enter": if (row) this.activate(row); break;
       case " ": case "space":
-        if (row && ["project", "group", "task", "adhoc-group"].includes(row.kind)) this.toggle(row.key);
+        if (row && ["machine", "project", "group", "task", "adhoc-group"].includes(row.kind)) this.toggle(row.key);
         break;
       case "a": this.menu(row); break;
-      case "p": form("project", { kind: "global" }); break;
+      // On the selected row's machine.
+      case "p": form("project", { kind: "global", machine: row?.item?.machine ?? null }); break;
       case "/":
         this.filtering = true;
         this.input.focus();
@@ -705,7 +840,7 @@ export class Tree {
     const item = row?.item;
     let summary = null;
     if (item && row.kind !== "space") {
-      const crumbs = [item.project?.name, item.task?.name ?? (item.kind === "adhoc" || item.kind === "adhoc-group" ? "adhoc" : null), item.group && !item.task ? item.group : null, item.session?.name].filter(Boolean);
+      const crumbs = [item.machine, item.project?.name, item.task?.name ?? (item.kind === "adhoc" || item.kind === "adhoc-group" ? "adhoc" : null), item.group && !item.task ? item.group : null, item.session?.name].filter(Boolean);
       const stats = item.session ? this.stats.sessions[item.session.cm_name] : null;
       summary = {
         crumbs,
@@ -713,6 +848,7 @@ export class Tree {
         base: item.task?.base_branch ?? null,
         pr: item.task ? prSummary(item.task.pr) : null,
         linear: item.task?.linear ? linearId(item.task.linear) : null,
+        linearUrl: item.task?.linear ?? null,
         diff: item.session ? stats?.diff ?? null : item.task ? this.stats.tasks[`${item.project.name}/${item.task.name}`]?.diff ?? null : null,
         status: item.session ? live[item.session.cm_name]?.status ?? (item.kind === "stopped" ? "stopped" : null) : null,
         agent: item.session?.agent ?? null,
@@ -722,6 +858,8 @@ export class Tree {
         // The session whose Claude the Activity panel follows: the Coordinator's too.
         conversation: item.session?.cm_name ?? (item.task ? item.main?.cm_name ?? `${item.space}__main` : null),
         space: item.space ?? null,
+        // Where the right panel's commands run (null: here).
+        machine: item.machine ?? null,
         project: item.project?.name ?? null,
         task: item.task?.name ?? null,
         archived: this.archived,
@@ -815,6 +953,17 @@ export class Tree {
           .child(div().flex_1())
           .when(stopped, (el) => el.child(div().text_size(11).text_color(t.dim).child("stopped")))
           .when(!stopped, (el) => el.child(statusGlyph(t, r.status)));
+      }
+      case "machine": {
+        const note = r.error ? "showrunner failed" : r.offline ? "offline" : null;
+        return base.mt(10).pl(4)
+          .child(r.offline ? div().size(12).flex_none() : chevron(r.folded))
+          .child(icon("server", 13, t.muted))
+          .child(div().text_size(12).font_semibold().text_color(r.offline ? t.dim : t.muted).child(r.item.machine))
+          .when(Boolean(hidden?.hot), (el) => el.child(fire))
+          .child(div().flex_1())
+          .when(Boolean(note), (el) => el.child(div().id(`sr-note-${r.key}`).text_size(11).text_color(t.dim).when(Boolean(r.error), (x) => x.tooltip(r.error)).child(note)))
+          .when(!note && Boolean(activityBadge(t, hidden)), (el) => el.child(activityBadge(t, hidden)));
       }
       case "project": {
         const { project } = r.item;

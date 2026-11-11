@@ -5,7 +5,8 @@
 import { exec, readTextFile, appHome, home, notify, run, shared, setShared, spaces, agents, terminals } from "herdr";
 
 // `local.json` beside this file can point at another binary or data folder
-// (a development build): { "bin": "/path/to/showrunner", "home": "/path/to/.showrunner" }.
+// (a development build): { "bin": "/path/to/showrunner", "home": "/path/to/.showrunner" },
+// and at another binary on a machine: { "machines": { "devbox": { "bin": "…" } } }.
 let config = null;
 export async function loadConfig() {
   if (config) return config;
@@ -14,13 +15,29 @@ export async function loadConfig() {
     const text = await readTextFile(`${appHome()}/mods/showrunner/local.json`);
     if (text) local = JSON.parse(text);
   } catch {}
-  config = { bin: local.bin ?? "showrunner", home: local.home ?? `${home()}/.showrunner`, ownHome: local.home ?? null };
+  config = { bin: local.bin ?? "showrunner", home: local.home ?? `${home()}/.showrunner`, ownHome: local.home ?? null, machines: local.machines ?? {} };
   return config;
 }
 
-export async function sr(args, timeout = 120000) {
+// The machine a Herdr id or terminal address is on ("devbox/t3"), null for this one.
+export const machineOf = (id) => (id?.includes("/") ? id.split("/")[0] : null);
+// Herdr's id for a name showrunner on `machine` uses: other machines' carry its name.
+export const qualify = (machine, id) => (machine && id ? `${machine}/${id}` : id);
+// Back to the name showrunner on that machine knows.
+export const bare = (machine, id) => (machine && id?.startsWith(`${machine}/`) ? id.slice(machine.length + 1) : id);
+
+// The showrunner binary on a machine (null: this one).
+export async function binOn(on) {
+  const { bin, machines } = await loadConfig();
+  return on ? machines[on]?.bin ?? "showrunner" : bin;
+}
+
+// `on`: run it on that machine, where session and run names (cm__…, cmrun-…)
+// lose the machine's prefix.
+export async function sr(args, timeout = 120000, on = null) {
   const { bin, ownHome } = await loadConfig();
   try {
+    if (on) return await exec(await binOn(on), args.map((a) => (a.startsWith(`${on}/cm`) ? bare(on, a) : a)), { timeout, on });
     // Herdr's exec takes no environment: the data folder goes through env.
     return ownHome ? await exec("env", [`SHOWRUNNER_HOME=${ownHome}`, bin, ...args], { timeout }) : await exec(bin, args, { timeout });
   } catch (e) {
@@ -63,12 +80,12 @@ export function act(label, args, opts = {}) {
 
 export async function runAct({ label, args, opts = {} }) {
   busy(label, +1);
-  const r = await sr(args, opts.timeout);
+  const r = await sr(args, opts.timeout, opts.on);
   busy(label, -1);
   run("showrunner.refresh");
   if (r.code === 0) {
     if (!opts.quiet) notify({ title: opts.success ?? firstLine(r.stdout) ?? label, level: "success", timeout: 4000 });
-    if (opts.after === "reveal-created") revealCreated(r);
+    if (opts.after === "reveal-created") revealCreated(r, opts.on);
     else if (opts.after?.reveal) reveal(opts.after.reveal.space, opts.after.reveal.tab, opts.after.reveal.focus);
   } else {
     notify({ title: `${label} failed`, body: clean(r.stderr) || clean(r.stdout) || `exit ${r.code}`, level: "error", timeout: 9000 });
@@ -87,12 +104,14 @@ export function worst(statuses) {
 // Live facts per session terminal: its address and status. Herdr's agents()
 // knows "done" (finished while you weren't looking); a terminal it doesn't show
 // has hc's own word; agents without a status report get showrunner's guess.
+// Keyed by Herdr's name for the session (another machine's carry its name).
 export function liveSessions(guessed = {}) {
   const byAddress = new Map(agents().map((a) => [a.address, a]));
   const out = {};
   for (const t of terminals()) {
-    const name = t.labels?.["showrunner.session"];
-    if (!name || t.state !== "live") continue;
+    const label = t.labels?.["showrunner.session"];
+    if (!label || t.state !== "live") continue;
+    const name = qualify(machineOf(t.address), label);
     // A kept terminal whose agent was lost runs a recovered shell: ended.
     if (!(t.argv?.[2] ?? "").startsWith("exec ")) continue;
     const agent = byAddress.get(t.address);
@@ -107,9 +126,9 @@ export function liveSessions(guessed = {}) {
 export function liveRuns() {
   const out = {};
   for (const t of terminals()) {
-    const name = t.labels?.["showrunner.run"];
-    if (!name || t.state !== "live") continue;
-    out[name] = { address: t.address, running: !isShellIdle(t) };
+    const label = t.labels?.["showrunner.run"];
+    if (!label || t.state !== "live") continue;
+    out[qualify(machineOf(t.address), label)] = { address: t.address, running: !isShellIdle(t) };
   }
   return out;
 }
@@ -140,12 +159,12 @@ export function reveal(space, tab, focus) {
 }
 
 // After a create: the session it printed ("main session: p/t/s", "created
-// session: p/t/s"), shown.
-export function revealCreated(r) {
+// session: p/t/s"), shown. `on`: the machine it was created on.
+export function revealCreated(r, on) {
   const ref = r?.code === 0 && /session: (\S+)\s*$/m.exec(r.stdout)?.[1];
   if (!ref) return;
   const parts = ref.split("/");
-  reveal(`cm__${parts.slice(0, 2).join("__")}`, `cm__${parts.join("__")}`, false);
+  reveal(qualify(on, `cm__${parts.slice(0, 2).join("__")}`), qualify(on, `cm__${parts.join("__")}`), false);
 }
 
 export function copy(text, what) {
@@ -185,6 +204,8 @@ export function menuItems(item) {
       ];
     case "adhoc-group":
       return [{ key: "A", label: "New adhoc session", action: "new-adhoc" }];
+    case "machine":
+      return [{ key: "p", label: "Add project", action: "add-project" }];
     case "group":
       return [
         { key: "t", label: "Add task to group", action: "add-task" },

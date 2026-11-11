@@ -308,7 +308,7 @@ class Loading {
 export class PrPanel extends Loading {
   init(cx) { super.init(cx, "pr", 60000); }
   key(sel) { return sel?.ref && sel.task ? `${sel.ref}` : null; }
-  fetch(sel) { return sr(["session", "pr", sel.ref], 60000); }
+  fetch(sel) { return sr(["session", "pr", sel.ref], 60000, sel.machine); }
 
   get pickLabel() { return "open"; }
 
@@ -322,7 +322,7 @@ export class PrPanel extends Loading {
 
   sendThreads(sel, pr) {
     const text = pr.threads.map((x) => `- ${x.path}${x.line ? `:${x.line}` : ""} (${x.author ?? "reviewer"}): ${firstParagraph(x.body)}`).join("\n");
-    sr(["send", sel.ref, `Address these unresolved review comments on the PR:\n${text}\n`, "--no-submit"]).then((r) => {
+    sr(["send", sel.ref, `Address these unresolved review comments on the PR:\n${text}\n`, "--no-submit"], undefined, sel.machine).then((r) => {
       if (r.code !== 0) return notify({ title: "Couldn't send the comments", body: clean(r.stderr), level: "error" });
       notify({ title: "Review comments in the prompt", body: "Edit them if you like, then press Enter.", level: "success", timeout: 4000 });
       reveal(sel.space, sel.ref, true);
@@ -339,7 +339,7 @@ export class PrPanel extends Loading {
     if (s.status === "error") return this.frame(t, { title: "Pull request", subtitle: sel.task, actions: [refresh] }, [item(note(t, s.message))], [
       div().flex_1(),
       button(t, "pr-create", "Push and open a draft PR", () => {
-        sr(["task", "pr", sel.project, sel.task, "--create"], 300000).then((r) =>
+        sr(["task", "pr", sel.project, sel.task, "--create"], 300000, sel.machine).then((r) =>
           r.code === 0 ? (notify({ title: "Draft PR opened", body: r.stdout.trim(), level: "success" }), this.loaded = null)
             : notify({ title: "Couldn't open a PR", body: clean(r.stderr), level: "error" }));
       }),
@@ -397,7 +397,8 @@ const TICKET_GLYPH = { completed: "✔", canceled: "✕", started: "◐", unstar
 export class TicketPanel extends Loading {
   init(cx) { super.init(cx, "ticket", 120000); }
   key(sel) { return sel?.ref && sel.linear ? `${sel.ref}` : null; }
-  fetch(sel) { return sr(["session", "ticket", sel.ref], 60000); }
+  // By its URL, here: other machines may have no Linear token.
+  fetch(sel) { return sr(["session", "ticket", sel.machine ? sel.linearUrl : sel.ref], 60000); }
 
   keys() {
     const k = this.state.status === "ready" ? this.state.value : null;
@@ -463,7 +464,7 @@ export class IdeasPanel extends Loading {
   }
 
   key(sel) { return sel?.ref ?? null; }
-  fetch(sel) { return sr(["ideas", "list", "--json", "--for", sel.ref]); }
+  fetch(sel) { return sr(["ideas", "list", "--json", "--for", sel.ref], undefined, sel.machine); }
 
   get pickLabel() {
     const idea = this.state.status === "ready" ? this.state.value[this.pos] : null;
@@ -503,7 +504,7 @@ export class IdeasPanel extends Loading {
     const sel = selection();
     if (!sel?.ref) return;
     cx.spawn(async (cx) => {
-      const r = await sr(["ideas", ...args, "--for", sel.ref]);
+      const r = await sr(["ideas", ...args, "--for", sel.ref], undefined, sel.machine);
       if (r.code !== 0) notify({ title: "The idea queue didn't change", body: clean(r.stderr), level: "error" });
       this.reload(cx);
     });
@@ -513,9 +514,9 @@ export class IdeasPanel extends Loading {
     const sel = selection();
     const prompt = `${idea.text}\n\n(From my idea queue, id ${idea.id}: mark it started and done with \`showrunner ideas start ${idea.id}\` and \`showrunner ideas done ${idea.id}\`.)`;
     cx.spawn(async (cx) => {
-      const r = await sr(["send", sel.ref, prompt]);
+      const r = await sr(["send", sel.ref, prompt], undefined, sel.machine);
       if (r.code !== 0) return notify({ title: "Couldn't send the idea", body: clean(r.stderr), level: "error" });
-      await sr(["ideas", "sent", idea.id, "--for", sel.ref]);
+      await sr(["ideas", "sent", idea.id, "--for", sel.ref], undefined, sel.machine);
       notify({ title: "Sent: it runs as soon as the session is free.", level: "success", timeout: 3000 });
       this.reload(cx);
     });
@@ -524,7 +525,7 @@ export class IdeasPanel extends Loading {
   workThrough(cx) {
     const sel = selection();
     cx.spawn(async () => {
-      const r = await sr(["send", sel.ref, WORK_PROMPT]);
+      const r = await sr(["send", sel.ref, WORK_PROMPT], undefined, sel.machine);
       notify(r.code === 0
         ? { title: "The session works through the queue once it is free.", level: "success", timeout: 3000 }
         : { title: "Couldn't ask the session", body: clean(r.stderr), level: "error" });
@@ -621,7 +622,7 @@ export class ActivityPanel extends Loading {
   }
 
   key(sel) { return sel?.conversation ?? null; }
-  fetch(sel) { return sr(["session", "activity", sel.conversation]); }
+  fetch(sel) { return sr(["session", "activity", sel.conversation], undefined, sel.machine); }
   get pickLabel() { return "fold"; }
   keys() { return this.hasFinished() ? { c: ["clear finished", () => this.clear()] } : {}; }
 
@@ -661,7 +662,7 @@ export class ActivityPanel extends Loading {
   }
 
   copyOutput(sel, shell) {
-    sr(["session", "activity", sel.conversation, "--output", shell.id]).then((r) => {
+    sr(["session", "activity", sel.conversation, "--output", shell.id], undefined, sel.machine).then((r) => {
       const text = r.code === 0 ? r.stdout.trimEnd() : "";
       if (!text) return notify({ title: "No output to copy", level: "warning", timeout: 2500 });
       const lines = text.split("\n").length;

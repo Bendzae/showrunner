@@ -2,7 +2,7 @@
 // showrunner command, or move Herdr (show a tab, open a terminal beside one).
 
 import { exec, run, openOverlay, notify, knownAgents, panes } from "herdr";
-import { act, sr, clean, show, copy, openUrl, liveRuns, loadConfig, RUN_MENU, taskRef } from "./lib.js";
+import { act, sr, clean, show, copy, openUrl, liveRuns, loadConfig, binOn, bare, RUN_MENU, taskRef } from "./lib.js";
 
 const MOD = "showrunner";
 
@@ -24,7 +24,7 @@ export function openMenu(item, at, entries) {
 // As tall as its fields: a dialog doesn't size itself to its content.
 function formHeight(spec, props) {
   let h = 128;
-  for (const f of spec.fields) h += (f.multiline ? 142 : 70) + (f.id === "path" ? 38 : 0);
+  for (const f of spec.fields) h += (f.multiline ? 142 : 70) + (f.id === "path" && !props.item?.machine ? 38 : 0);
   const hint = typeof spec.hint === "function" ? spec.hint(props) : spec.hint;
   if (hint) h += 12 + 18 * Math.ceil(hint.length / 72);
   return h;
@@ -35,8 +35,8 @@ export const form = (name, item, extra) => {
   return overlay("form", props, { width: 520, height: formHeight(FORMS[name], props) });
 };
 export const picker = (name, item, extra) => overlay("picker", { picker: name, item, ...extra }, { width: 480, height: 440 });
-export const confirm = (title, detail, args, label) =>
-  overlay("confirm", { title, detail, args, label }, { width: 440, height: 190 });
+export const confirm = (title, detail, args, label, on = null) =>
+  overlay("confirm", { title, detail, args, label, on }, { width: 440, height: 190 });
 
 // The ref `run` and `review` take for an item.
 function itemRef(item) {
@@ -53,6 +53,8 @@ function anchorTab(item) {
 // `at`: where a menu it opens goes (beside the tree's selection).
 export async function perform(action, item, at) {
   const { project, task, session, group } = item;
+  // Items on another machine run showrunner there.
+  const on = item.machine ?? null;
   switch (action) {
     case "show":
       return show(item.space, session?.cm_name, session?.address, false);
@@ -73,7 +75,7 @@ export async function perform(action, item, at) {
     case "rename-group":
       return form("rename-group", item);
     case "ungroup":
-      return act("Ungrouping", ["group", "ungroup", project.name, group], { success: `Group '${group}' dissolved` });
+      return act("Ungrouping", ["group", "ungroup", project.name, group], { success: `Group '${group}' dissolved`, on });
     case "set-group":
       return picker("group", item);
     case "set-base":
@@ -81,36 +83,36 @@ export async function perform(action, item, at) {
     case "checkout-branch":
       return picker("branch", item);
     case "fetch":
-      return act(`Fetching all branches for ${project.name}`, ["project", "fetch", project.name], { timeout: 300000 });
+      return act(`Fetching all branches for ${project.name}`, ["project", "fetch", project.name], { timeout: 300000, on });
     case "copy-path":
       return copy(session?.worktree ?? project.path, session ? "worktree path" : "project path");
     case "update":
-      return act("Updating task branch", ["task", "update", project.name, task.name], { timeout: 300000 });
+      return act("Updating task branch", ["task", "update", project.name, task.name], { timeout: 300000, on });
     case "push":
-      return act("Pushing", ["task", "push", project.name, task.name], { timeout: 300000 });
+      return act("Pushing", ["task", "push", project.name, task.name], { timeout: 300000, on });
     case "checkout-task":
-      return act("Checking out", ["task", "checkout", project.name, task.name]);
+      return act("Checking out", ["task", "checkout", project.name, task.name], { on });
     case "open-pr":
       if (task.pr?.url) return openUrl(task.pr.url);
       return confirm("No PR found", `Create a draft PR for ${task.branch}? Its branch is pushed first.`,
-        ["task", "pr", project.name, task.name, "--create"], "Create PR");
+        ["task", "pr", project.name, task.name, "--create"], "Create PR", on);
     case "open-linear":
       return openUrl(task.linear);
     case "archive":
-      return act("Archiving task", ["task", "archive", project.name, task.name]);
+      return act("Archiving task", ["task", "archive", project.name, task.name], { on });
     case "unarchive":
-      return act("Unarchiving task", ["task", "unarchive", project.name, task.name], { timeout: 300000 });
+      return act("Unarchiving task", ["task", "unarchive", project.name, task.name], { timeout: 300000, on });
     case "remote-control":
-      return act("Toggling Remote Control", ["session", "remote-control", (session ?? item.main).cm_name]);
+      return act("Toggling Remote Control", ["session", "remote-control", (session ?? item.main).cm_name], { on });
     case "update-session":
-      return act("Updating session", ["session", "update", session.cm_name], { timeout: 300000 });
+      return act("Updating session", ["session", "update", session.cm_name], { timeout: 300000, on });
     case "merge":
       return merge(item);
     case "resume":
       if (session.in_tmux)
         return notify({ title: `${session.name} still runs in tmux`, body: "Move it here with `showrunner migrate`, from a terminal outside tmux.", level: "warning", timeout: 8000 });
       return act("Starting session", ["session", "resume", session.cm_name],
-        { success: `Started ${session.name}`, after: { reveal: { space: item.space, tab: session.cm_name, focus: true } } });
+        { success: `Started ${session.name}`, after: { reveal: { space: item.space, tab: session.cm_name, focus: true } }, on });
     case "delete":
       return remove(item);
     case "terminal": {
@@ -131,52 +133,58 @@ export async function perform(action, item, at) {
     case "run-restart":
       return startRun(item);
     case "run-kill":
-      return act("Stopping run", ["run", itemRef(item), "--kill"], { success: "Run session killed" });
+      return act("Stopping run", ["run", itemRef(item), "--kill"], { success: "Run session killed", on });
+    case "add-project":
+      return form("project", { kind: "global", machine: on });
   }
 }
 
 async function merge(item) {
   const { session } = item;
-  const status = await exec("git", ["status", "--porcelain"], { cwd: session.worktree }).catch(() => null);
+  const on = item.machine ?? null;
+  const status = await exec("git", ["status", "--porcelain"], { cwd: session.worktree, on }).catch(() => null);
   if (status && status.stdout.trim()) return form("merge", item);
-  return act("Merging", ["session", "merge", session.cm_name], { timeout: 300000 });
+  return act("Merging", ["session", "merge", session.cm_name], { timeout: 300000, on });
 }
 
 // The TUI's own wording for what a delete takes with it.
 function remove(item) {
   const { kind, project, task, session } = item;
+  const on = item.machine ?? null;
   switch (kind) {
     case "project": {
       const sessions = item.counts?.sessions ?? 0, tasks = item.counts?.tasks ?? 0;
       return confirm(`Delete ${project.name}?`,
         sessions || tasks ? `Its ${tasks} task(s) and ${sessions} session(s) go too: their worktrees and branches are removed. The repository stays.` : "The repository stays.",
-        ["project", "delete", project.name, "--yes"], "Delete project");
+        ["project", "delete", project.name, "--yes"], "Delete project", on);
     }
     case "task": {
       const live = item.counts?.sessions ?? 0;
       return confirm(`Delete ${task.name}?`,
         live ? `Kills its ${live} session(s) and removes their worktrees and branches, the task branch too.` : "Removes its worktrees and branches, the task branch too.",
-        ["task", "delete", project.name, task.name, "--yes"], "Delete task");
+        ["task", "delete", project.name, task.name, "--yes"], "Delete task", on);
     }
     case "session":
     case "adhoc":
     case "stopped":
       return confirm(`Delete ${kind === "adhoc" ? "adhoc session" : "session"} ${session.name}?`,
         kind === "adhoc" || !session.worktree ? "Ends its agent." : "Ends its agent and removes its worktree and branch, with any unmerged work.",
-        ["session", "kill", session.cm_name, "--yes"], "Delete session");
+        ["session", "kill", session.cm_name, "--yes"], "Delete session", on);
   }
 }
 
 // Review in a pane beside the agent, zoomed: the tool runs there and sends the
 // comments to the agent when it closes.
 async function review(item) {
-  const { bin, ownHome } = await loadConfig();
+  const { ownHome } = await loadConfig();
+  const on = item.machine ?? null;
   const tab = anchorTab(item);
   if (!tab) return notify({ title: "No session to review beside", level: "warning", timeout: 4000 });
   const address = item.session?.address ?? item.main?.address;
   show(item.space, tab, address, true);
-  const argv = [bin, "review", itemRef(item)];
-  run("pane.split", { direction: "right", argv: ownHome ? ["env", `SHOWRUNNER_HOME=${ownHome}`, ...argv] : argv });
+  // The split runs on the tab's machine.
+  const argv = [await binOn(on), "review", bare(on, itemRef(item))];
+  run("pane.split", { direction: "right", argv: ownHome && !on ? ["env", `SHOWRUNNER_HOME=${ownHome}`, ...argv] : argv });
   run("pane.zoom", {});
 }
 
@@ -189,7 +197,7 @@ function runCommand(item, at) {
 
 export function startRun(item, command) {
   const args = ["run", itemRef(item), ...(command ? ["--command", command] : [])];
-  act("Starting run", args, { success: `Running: ${command ?? item.project.run_command}`, after: { reveal: { space: item.space, tab: item.run, focus: true } } });
+  act("Starting run", args, { success: `Running: ${command ?? item.project.run_command}`, after: { reveal: { space: item.space, tab: item.run, focus: true } }, on: item.machine ?? null });
 }
 
 // The agents a form offers, as the program table draws them. Drawn at once;
@@ -206,23 +214,23 @@ export function agentChoices(known) {
   });
 }
 
-export const loadKnownAgents = () => knownAgents().catch(() => null);
+export const loadKnownAgents = (on = null) => knownAgents({ on }).catch(() => null);
 
 // Forms: their fields and what submitting runs.
 export const FORMS = {
   project: {
-    title: () => "Add a project",
+    title: (p) => (p.item.machine ? `Add a project on ${p.item.machine}` : "Add a project"),
     action: "Add project",
     fields: [
       { id: "path", label: "Folder", placeholder: "~/code/my-app" },
       { id: "name", label: "Name", placeholder: "The folder's name" },
     ],
     hint: "A git repository. Its tasks get worktrees under showrunner's folder; the repository itself stays as it is.",
-    submit: (v) => {
+    submit: (v, p) => {
       if (!v.path.trim()) return "Which folder?";
       const args = ["project", "add", v.path.trim()];
       if (v.name.trim()) args.push("--name", v.name.trim());
-      act("Adding project", args);
+      act("Adding project", args, { on: p.item.machine ?? null });
     },
   },
   "add-task": {
@@ -242,7 +250,7 @@ export const FORMS = {
       const args = ["task", "create", p.item.project.name, v.name.trim(), "--branch", branch, "--agent", v.agent];
       if (p.group) args.push("--group", p.group);
       if (v.prompt.trim()) args.push("--prompt", v.prompt.trim());
-      act(`Creating task ${v.name.trim()}`, args, { timeout: 300000, after: "reveal-created" });
+      act(`Creating task ${v.name.trim()}`, args, { timeout: 300000, after: "reveal-created", on: p.item.machine ?? null });
     },
   },
   ticket: {
@@ -255,7 +263,7 @@ export const FORMS = {
     hint: "Named after the ticket, on its branch, linked to it, with the main session starting on it.",
     submit: (v, p) => {
       if (!v.ticket.trim()) return "Which ticket?";
-      act("Creating task from Linear ticket", ["task", "from-ticket", p.item.project.name, v.ticket.trim(), "--agent", v.agent], { timeout: 300000, after: "reveal-created" });
+      act("Creating task from Linear ticket", ["task", "from-ticket", p.item.project.name, v.ticket.trim(), "--agent", v.agent], { timeout: 300000, after: "reveal-created", on: p.item.machine ?? null });
     },
   },
   adhoc: {
@@ -268,7 +276,7 @@ export const FORMS = {
     hint: "Runs in the project folder, on whatever branch is checked out there.",
     submit: (v, p) => {
       if (!v.name.trim()) return "An adhoc session needs a name";
-      act("Creating adhoc session", ["session", "adhoc", p.item.project.name, v.name.trim(), "--agent", v.agent], { timeout: 300000, after: "reveal-created" });
+      act("Creating adhoc session", ["session", "adhoc", p.item.project.name, v.name.trim(), "--agent", v.agent], { timeout: 300000, after: "reveal-created", on: p.item.machine ?? null });
     },
   },
   session: {
@@ -283,7 +291,7 @@ export const FORMS = {
       const args = ["session", "create", p.item.project.name, p.item.task.name, "--agent", v.agent];
       if (!p.worktree) args.push("--no-worktree");
       if (v.prompt.trim()) args.push("--prompt", v.prompt.trim());
-      act("Creating session", args, { timeout: 300000, after: "reveal-created" });
+      act("Creating session", args, { timeout: 300000, after: "reveal-created", on: p.item.machine ?? null });
     },
   },
   "rename-group": {
@@ -292,7 +300,7 @@ export const FORMS = {
     fields: [{ id: "name", label: "Name", value: (p) => p.item.group }],
     submit: (v, p) => {
       if (!v.name.trim()) return "Group name cannot be empty";
-      act("Renaming group", ["group", "rename", p.item.project.name, p.item.group, v.name.trim()]);
+      act("Renaming group", ["group", "rename", p.item.project.name, p.item.group, v.name.trim()], { on: p.item.machine ?? null });
     },
   },
   "run-command": {
@@ -313,7 +321,7 @@ export const FORMS = {
     submit: (v, p) => {
       const args = ["session", "merge", p.item.session.cm_name];
       if (v.message.trim()) args.push("--message", v.message.trim());
-      act("Merging", args, { timeout: 300000 });
+      act("Merging", args, { timeout: 300000, on: p.item.machine ?? null });
     },
   },
 };
@@ -322,17 +330,17 @@ export const FORMS = {
 export const PICKERS = {
   branch: {
     title: (p) => `Checkout a branch in ${p.item.project.name}`,
-    load: async (p) => branches(p.item.project.name),
-    pick: (value, p) => act(`Checking out ${value}`, ["project", "checkout", p.item.project.name, value]),
+    load: async (p) => branches(p.item),
+    pick: (value, p) => act(`Checking out ${value}`, ["project", "checkout", p.item.project.name, value], { on: p.item.machine ?? null }),
   },
   base: {
     title: (p) => `Base branch for ${p.item.task.name}`,
     load: async (p) => {
-      const list = await branches(p.item.project.name);
+      const list = await branches(p.item);
       return ["main", ...list.filter((b) => b !== "main" && b !== p.item.task.branch)];
     },
     current: (p) => p.item.task.base_branch,
-    pick: (value, p) => act("Setting base branch", ["task", "set-base", p.item.project.name, p.item.task.name, value]),
+    pick: (value, p) => act("Setting base branch", ["task", "set-base", p.item.project.name, p.item.task.name, value], { on: p.item.machine ?? null }),
   },
   group: {
     title: (p) => `Group for ${p.item.task.name}`,
@@ -342,13 +350,13 @@ export const PICKERS = {
     pick: (value, p) => {
       const args = ["task", "set-group", p.item.project.name, p.item.task.name];
       if (value !== "No group") args.push(value);
-      act("Setting group", args);
+      act("Setting group", args, { on: p.item.machine ?? null });
     },
   },
 };
 
-async function branches(project) {
-  const r = await sr(["project", "branches", project]);
+async function branches(item) {
+  const r = await sr(["project", "branches", item.project.name], undefined, item.machine ?? null);
   if (r.code !== 0) throw new Error(clean(r.stderr));
   return r.stdout.split("\n").map((b) => b.trim()).filter(Boolean);
 }

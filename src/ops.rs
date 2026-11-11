@@ -401,13 +401,17 @@ pub struct RestoreReport {
 /// rebooted). Whether to recreate or prune depends on the task still existing
 /// in the config — not on liveness — so sessions come back after a
 /// restart, while those of deleted tasks are reaped instead of resurrected.
-pub fn restore_sessions(cfg: &Config) -> RestoreReport {
+/// `coordinator`: start the Coordinator too. A machine the person's Herdr
+/// reaches over ssh has none: theirs runs where Herdr does.
+pub fn restore_sessions(cfg: &Config, coordinator: bool) -> RestoreReport {
     let mut report = RestoreReport::default();
     session::label_for_herdr();
-    match session::ensure_coordinator() {
-        Ok(true) => report.restored.push("coordinator".to_string()),
-        Ok(false) => {}
-        Err(e) => report.failures.push(format!("coordinator: {e}")),
+    if coordinator {
+        match session::ensure_coordinator() {
+            Ok(true) => report.restored.push("coordinator".to_string()),
+            Ok(false) => {}
+            Err(e) => report.failures.push(format!("coordinator: {e}")),
+        }
     }
     let saved = config::load_sessions();
     if saved.is_empty() {

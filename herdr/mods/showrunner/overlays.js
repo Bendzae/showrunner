@@ -149,7 +149,7 @@ export class Form {
     if (spec.fields.some((f) => f.agent)) {
       this.agents = agentChoices(null);
       cx.spawn(async (cx) => {
-        this.agents = agentChoices(await loadKnownAgents());
+        this.agents = agentChoices(await loadKnownAgents(p.item?.machine ?? null));
         cx.notify();
       });
     }
@@ -185,7 +185,7 @@ export class Form {
       return v_flex().child(label(f.label))
         .child(box.when(!f.multiline, (el) => el.h(36)).px(10).py(f.multiline ? 8 : 0).rounded(9).border_1()
           .border_color(focusedHere ? t.accent : t.input).bg(t.background).text_size(12.8).text_color(t.foreground))
-        .when(f.id === "path", (el) => el.child(this.browse(t)));
+        .when(f.id === "path" && !props().item?.machine, (el) => el.child(this.browse(t)));
     };
     return v_flex().id("sr-form").track_focus(this.handle).w_full().min_h(0).p(18).bg(t.popover).text_color(t.foreground)
       .on_key_down((e, cx) => {
@@ -392,6 +392,8 @@ export class Switcher {
           const index = start + i;
           const [project, task, session] = x.parts;
           const label = h_flex().flex_1().min_w(0).gap(6).items_center()
+            .when(Boolean(x.machine), (el) => el.child(h_flex().flex_none().gap(4).items_center().text_size(11.5).text_color(t.dim)
+              .child(icon("server", 11)).child(x.machine)))
             .child(div().flex_shrink(0).max_w(150).truncate().text_color(t.muted).child(project))
             .when(Boolean(task), (el) => el.child(sep()).child(div().flex_shrink(1).min_w(0).truncate().text_color(t.foreground).child(task)))
             .when(Boolean(session), (el) => el.child(sep()).child(div().flex_shrink(0).max_w(140).truncate().text_color(t.muted).child(session)));
@@ -439,7 +441,7 @@ export class Confirm {
 
   yes() {
     const p = props();
-    close({ kind: "act", label: p.label ?? "Working", args: p.args, opts: { timeout: 300000 } });
+    close({ kind: "act", label: p.label ?? "Working", args: p.args, opts: { timeout: 300000, on: p.on ?? null } });
   }
 
   render() {

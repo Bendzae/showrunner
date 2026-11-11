@@ -46,7 +46,7 @@ Managing tasks and sessions (usable from inside a session):
   showrunner session remote-control <session> [on|off]   (omit to toggle; Claude only)
   showrunner session info [<session>]           JSON: the session's task, PR, diff and
                                                     sibling sessions (default: this one)
-  showrunner session ticket [<session>]         JSON: the task's Linear ticket, live
+  showrunner session ticket [<session> | <url>] JSON: the task's Linear ticket, live
   showrunner session pr [<session>]             JSON: the task's PR with checks and
                                                     unresolved review threads, live
   showrunner session activity [<session>] [--output <shell>]
@@ -78,7 +78,7 @@ What the TUI's menus do:
                                                 the Herdr app's Showrunner layout
 
 Housekeeping:
-  showrunner restore                            recreate saved sessions that
+  showrunner restore [--no-coordinator]         recreate saved sessions that
                                                     are no longer running (reboot),
                                                     and the coordinator
   showrunner coordinator                        start the coordinator (one agent
@@ -186,11 +186,13 @@ fn cmd_migrate(args: &[String]) -> Result<()> {
 }
 
 fn cmd_restore(args: &[String]) -> Result<()> {
-    if let Some(extra) = args.first() {
-        bail!("unexpected argument '{extra}' (usage: restore)");
-    }
+    let coordinator = match args {
+        [] => true,
+        [flag] if flag == "--no-coordinator" => false,
+        _ => bail!("usage: restore [--no-coordinator]"),
+    };
     let cfg = Config::load()?;
-    let report = ops::restore_sessions(&cfg);
+    let report = ops::restore_sessions(&cfg, coordinator);
     for reference in &report.restored {
         println!("restored {reference}");
     }
@@ -564,6 +566,7 @@ fn cmd_list(args: &[String]) -> Result<()> {
             .collect();
         let mut out = json!({
             "projects": projects,
+            "data_dir": config::base_dir(),
             "default_agent": cfg.default_agent,
             "coordinator": {
                 "cm_name": session::COORDINATOR,
@@ -1127,11 +1130,19 @@ fn cmd_session_set_conversation(args: &[String]) -> Result<()> {
 /// The Linear ticket linked to a session's task, fetched live, as JSON.
 fn cmd_session_ticket(args: &[String]) -> Result<()> {
     let (positional, _) = parse_args(args, &[], &[])?;
+    // A ticket's URL works without the session (its machine may have no token).
+    if let [url] = positional.as_slice()
+        && let Some(id) = config::linear_ticket_id(url)
+    {
+        let ticket = ops::linear_ticket(id, config::linear_workspace(url))?;
+        println!("{}", serde_json::to_string(&ticket)?);
+        return Ok(());
+    }
     let cm_name = match positional.as_slice() {
         [reference] => resolve_recorded_session(reference)?,
         [] => current_session_name()
             .ok_or_else(|| anyhow::anyhow!("not inside a showrunner session; pass <session>"))?,
-        _ => bail!("usage: session ticket [<session>]"),
+        _ => bail!("usage: session ticket [<session> | <ticket url>]"),
     };
     let record = config::load_sessions()
         .remove(&cm_name)
