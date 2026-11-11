@@ -567,6 +567,7 @@ fn cmd_list(args: &[String]) -> Result<()> {
         let mut out = json!({
             "projects": projects,
             "data_dir": config::base_dir(),
+            "machine_name": cfg.machine_name.clone().unwrap_or_else(crate::app::detect_hostname),
             "default_agent": cfg.default_agent,
             "coordinator": {
                 "cm_name": session::COORDINATOR,

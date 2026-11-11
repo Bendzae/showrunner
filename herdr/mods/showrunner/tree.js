@@ -1,9 +1,9 @@
 // The sidebar: projects, task groups, tasks and their sessions, as the TUI
 // lists them, with the TUI's keys. Statuses are Herdr's live ones; structure,
-// diffs and PRs come from `showrunner list`. Below this machine's projects,
-// each of Herdr's other machines that runs showrunner gets a section with its
-// own: its listing's ids carry the machine's name, as Herdr's ids for its
-// spaces and tabs do.
+// diffs and PRs come from `showrunner list`. Each of Herdr's other machines
+// that runs showrunner gets a section with its own projects, below this
+// machine's (then a section too): its listing's ids carry the machine's name,
+// as Herdr's ids for its spaces and tabs do.
 
 import { div, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input } from "gpui-base";
@@ -86,6 +86,8 @@ export class Tree {
     this.guessed = {};
     // Folded unless opened: projects, groups, tasks and adhoc start closed.
     this.expanded = new Set(JSON.parse(localStorage.getItem("expanded") ?? "[]"));
+    // Machine sections are open unless folded.
+    this.foldedMachines = new Set(JSON.parse(localStorage.getItem("folded-machines") ?? "[]"));
     this.archived = false;
     this.filtering = false;
     this.filter = "";
@@ -337,14 +339,19 @@ export class Tree {
   }
 
   toggle(key) {
-    this.expanded.has(key) ? this.expanded.delete(key) : this.expanded.add(key);
-    localStorage.setItem("expanded", JSON.stringify([...this.expanded]));
+    const [set, item] = key.startsWith("m:") ? [this.foldedMachines, "folded-machines"] : [this.expanded, "expanded"];
+    set.has(key) ? set.delete(key) : set.add(key);
+    localStorage.setItem(item, JSON.stringify([...set]));
+  }
+
+  isOpen(key) {
+    return key.startsWith("m:") ? !this.foldedMachines.has(key) : this.expanded.has(key);
   }
 
   // Open the rows above a row, so it shows.
   expandTo(key) {
     const row = this.allRows?.find((r) => r.key === key);
-    for (const parent of row?.parents ?? []) if (!this.expanded.has(parent)) this.toggle(parent);
+    for (const parent of row?.parents ?? []) if (!this.isOpen(parent)) this.toggle(parent);
   }
 
   // This machine's listing, then those of the other machines Herdr reaches
@@ -367,7 +374,7 @@ export class Tree {
     const f = this.filter.trim().toLowerCase();
     const has = (...xs) => !f || xs.some((x) => (x ?? "").toLowerCase().includes(f));
     // A filter opens everything, so its matches show.
-    const open = (key) => Boolean(f) || this.expanded.has(key);
+    const open = (key) => Boolean(f) || this.isOpen(key);
     const sessionInfo = (s, stopped) => ({
       cm_name: s.cm_name, name: s.name, agent: s.agent, worktree: s.worktree ?? null,
       run: s.run ?? null, live: !stopped && Boolean(live[s.cm_name]), address: live[s.cm_name]?.address ?? null,
@@ -384,15 +391,18 @@ export class Tree {
       rows.push({ key: `s:${c.cm_name}`, kind: "coordinator", depth: 0, status: l ? l.status : "stopped",
         item: { kind: "coordinator", space: c.space, session: { cm_name: c.cm_name, name: "Coordinator", agent: "claude", live: Boolean(l), address: l?.address ?? null } } });
     }
-    for (const src of this.sources()) {
+    const sources = this.sources();
+    for (const src of sources) {
       const M = src.machine;
-      // Another machine's projects sit under its row.
+      // With other machines, each machine's projects sit under its row
+      // (this one's: `m:`).
       let section = [];
       const sectionAt = rows.length;
-      if (M) {
-        const mkey = `m:${M}`;
-        const offline = !this.online(M);
-        rows.push({ key: mkey, kind: "machine", depth: 0, folded: !open(mkey), offline, error: src.error, item: { kind: "machine", machine: M } });
+      if (sources.length > 1) {
+        const mkey = `m:${M ?? ""}`;
+        const offline = Boolean(M) && !this.online(M);
+        const label = M ?? src.data?.machine_name ?? "This machine";
+        rows.push({ key: mkey, kind: "machine", depth: 0, folded: !open(mkey), offline, error: src.error, item: { kind: "machine", machine: M, label } });
         if (offline) continue;
         section = [mkey];
       }
@@ -484,7 +494,7 @@ export class Tree {
         rows.push(...projectRows);
       }
       // A filter matching nothing on a machine leaves out its row too.
-      if (M && f && rows.length === sectionAt + 1) rows.pop();
+      if (section.length && f && rows.length === sectionAt + 1) rows.pop();
     }
     // Herdr spaces that aren't showrunner's (a plain terminal, another agent).
     const others = spaces().filter((s) => !bare(s.machine, s.id).startsWith("cm__") && has(s.name));
@@ -840,7 +850,7 @@ export class Tree {
     const item = row?.item;
     let summary = null;
     if (item && row.kind !== "space") {
-      const crumbs = [item.machine, item.project?.name, item.task?.name ?? (item.kind === "adhoc" || item.kind === "adhoc-group" ? "adhoc" : null), item.group && !item.task ? item.group : null, item.session?.name].filter(Boolean);
+      const crumbs = [item.kind === "machine" ? item.label : item.machine, item.project?.name, item.task?.name ?? (item.kind === "adhoc" || item.kind === "adhoc-group" ? "adhoc" : null), item.group && !item.task ? item.group : null, item.session?.name].filter(Boolean);
       const stats = item.session ? this.stats.sessions[item.session.cm_name] : null;
       summary = {
         crumbs,
@@ -958,8 +968,8 @@ export class Tree {
         const note = r.error ? "showrunner failed" : r.offline ? "offline" : null;
         return base.mt(10).pl(4)
           .child(r.offline ? div().size(12).flex_none() : chevron(r.folded))
-          .child(icon("server", 13, t.muted))
-          .child(div().text_size(12).font_semibold().text_color(r.offline ? t.dim : t.muted).child(r.item.machine))
+          .child(icon(r.item.machine ? "server" : "laptop", 13, t.muted))
+          .child(div().text_size(12).font_semibold().text_color(r.offline ? t.dim : t.muted).child(r.item.label))
           .when(Boolean(hidden?.hot), (el) => el.child(fire))
           .child(div().flex_1())
           .when(Boolean(note), (el) => el.child(div().id(`sr-note-${r.key}`).text_size(11).text_color(t.dim).when(Boolean(r.error), (x) => x.tooltip(r.error)).child(note)))
