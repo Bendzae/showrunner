@@ -202,9 +202,14 @@ pub fn delete_task(project: &Project, task_name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Whether a session name belongs to a task's main session.
+/// Whether a session name belongs to a task's main session (an adhoc session
+/// may be called main too: it's no task's).
 pub fn is_main_session_name(cm_name: &str) -> bool {
-    cm_name.ends_with(&format!("__{}", session::MAIN_SESSION))
+    let mut parts = cm_name.rsplitn(3, "__");
+    let (Some(name), Some(task)) = (parts.next(), parts.next()) else {
+        return false;
+    };
+    session::is_main_session(name) && !session::is_adhoc_marker(task)
 }
 
 /// Kill a session, removing its worktree and per-session branch.
@@ -1129,5 +1134,18 @@ pub fn run_target_session(project: &Project, live: &session::LiveSession) -> Run
             .unwrap_or_else(|| project.path.clone()),
         space: session::task_space(&live.project_name, &live.task_name),
         project: project.name.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_main_session_name;
+
+    #[test]
+    fn only_a_tasks_main_session_is_main() {
+        assert!(is_main_session_name("cm__app__Fix-login__main"));
+        assert!(!is_main_session_name("cm__app__Fix-login__2"));
+        assert!(!is_main_session_name("cm__app__adhoc__main"));
+        assert!(!is_main_session_name("main"));
     }
 }

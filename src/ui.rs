@@ -1243,15 +1243,8 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
                 ..
             } => {
                 let indicator = if is_selected { " ▸ " } else { "   " };
-                // The main session sits on the task branch itself — mark it out.
-                let is_main = session::is_main_session(&session.session_name);
-                let name_color = if is_main {
-                    current().accent
-                } else {
-                    current().green
-                };
-                let mut style = Style::default().fg(name_color);
-                if is_selected || is_main {
+                let mut style = Style::default().fg(current().green);
+                if is_selected {
                     style = style.add_modifier(Modifier::BOLD);
                 }
 

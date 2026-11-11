@@ -338,7 +338,7 @@ async fn api_keys(
 
 async fn api_kill(Path(name): Path<String>) -> Result<StatusCode, ApiError> {
     validate_session_name(&name)?;
-    if name.ends_with(&format!("__{}", session::MAIN_SESSION)) {
+    if ops::is_main_session_name(&name) {
         return Err(bad_request(
             "the main session can't be killed — delete the task instead",
         ));

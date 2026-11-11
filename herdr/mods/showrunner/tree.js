@@ -144,6 +144,7 @@ export class Tree {
     else if (c === "panels") this.panelMenu();
     else if (c === "coordinator") this.openCoordinator();
     else if (c === "switcher") this.openSwitcher();
+    else if (c === "collapse") this.collapseAll();
     // `showrunner.select:<row key>`, e.g. `s:cm__app__fix__main` or `t:app/Fix login`.
     else if (c.startsWith("select:")) { this.expandTo(c.slice(7)); this.select(c.slice(7)); this.handle.focus(); }
   }
@@ -416,7 +417,7 @@ export class Tree {
         const projectRows = [];
         let sessionsTotal = 0;
         let lastGroup = null;
-        // Adhoc sessions, the project's own space: always first, also when empty.
+        // Adhoc sessions, the project's own space: first, when there are any.
         if (!this.archived) {
           const running = (p.adhoc_sessions ?? []).filter((s) => live[s.cm_name]);
           const stopped = [...(p.adhoc_stopped ?? []), ...(p.adhoc_sessions ?? []).filter((s) => !live[s.cm_name])];
@@ -424,7 +425,7 @@ export class Tree {
           this.names[p.space] = p.name;
           this.names[p.run] = "▶ run";
           if (hits.length) this.spaceOrder.push(p.space);
-          if (hits.length || !f) {
+          if (hits.length) {
             const akey = `a:${K}`;
             const status = worst(running.map((s) => live[s.cm_name].status));
             sessionsTotal += running.length;
@@ -626,7 +627,6 @@ export class Tree {
       case "coordinator":
         return this.openCoordinator();
       case "adhoc-group":
-        if (!row.count) return perform("new-adhoc", item);
         return this.toggle(row.key);
       case "machine":
       case "project":
@@ -713,6 +713,7 @@ export class Tree {
         this.filtering = true;
         this.input.focus();
         break;
+      case "C": this.collapseAll(); break;
       case "Z":
         this.archived = !this.archived;
         this.scroll = 0;
@@ -728,6 +729,17 @@ export class Tree {
       default: return false;
     }
     return true;
+  }
+
+  // Projects, groups, tasks and adhoc fold; machine sections stay as they
+  // are, so the projects show. The selection goes up to its project.
+  collapseAll() {
+    const row = this.allRows?.find((r) => r.key === this.sel);
+    const project = row?.parents?.find((k) => k.startsWith("p:"));
+    this.expanded.clear();
+    localStorage.setItem("expanded", "[]");
+    this.scroll = 0;
+    if (project) this.select(project);
   }
 
   closeFilter() {
@@ -801,6 +813,7 @@ export class Tree {
       .size_full().min_h(0).bg(t.chrome).text_size(13)
       .child(h_flex().h(HEADER).flex_none().pl(16).pr(8).gap(2).items_center().text_size(11.5).text_color(t.dim)
         .child(div().flex_1().child(this.archived ? "Archived tasks" : "Showrunner"))
+        .child(headerButton("sr-collapse", "chevrons-down-up", "Collapse all  C", false, () => this.collapseAll()))
         .child(headerButton("sr-filter", "search", "Filter  /", this.filtering, () => { this.filtering ? this.closeFilter() : (this.filtering = true, this.input.focus()); }))
         .child(headerButton("sr-archived", "archive", this.archived ? "Back to active tasks  Z" : "Archived tasks  Z", this.archived, () => { this.archived = !this.archived; this.scroll = 0; }))
         .child(headerButton("sr-add", "plus", "Add project  p", false, () => form("project", { kind: "global" }))))
@@ -1031,19 +1044,19 @@ export class Tree {
       }
       case "adhoc-group":
         return base
-          .child(r.count ? chevron(r.folded) : div().size(12).flex_none())
+          .child(chevron(r.folded))
           .child(icon("house", 12, t.accent))
-          .child(div().text_size(12).text_color(r.count ? t.muted : t.dim).child("adhoc"))
+          .child(div().text_size(12).text_color(t.muted).child("adhoc"))
           .when(Boolean(hidden?.hot), (el) => el.child(fire))
           .child(div().flex_1())
           .when(Boolean(activityBadge(t, hidden)), (el) => el.child(activityBadge(t, hidden)))
-          .when(r.folded && r.count > 0, (el) => el.child(countBox(r.count, "session")));
+          .when(r.folded, (el) => el.child(countBox(r.count, "session")));
       case "session":
       case "adhoc":
       case "stopped": {
         const { session } = r.item;
         const stopped = r.kind === "stopped";
-        const isMain = session.name === "main";
+        const isMain = Boolean(r.item.task) && session.name === "main";
         const shown = !stopped && activeTab === session.cm_name;
         const program = programIcon(r.program ?? { icon: `icons/${session.agent}.svg`, tint: false }, 13, t.muted);
         const branchTail = !isMain && r.branch && r.kind === "session" ? r.branch : null;
