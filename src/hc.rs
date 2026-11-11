@@ -156,7 +156,14 @@ pub fn list_all(labels: &[(&str, &str)]) -> Result<Vec<Terminal>> {
 fn list_where(labels: &[(&str, &str)], all: bool) -> Result<Vec<Terminal>> {
     let labels: HashMap<&str, &str> = labels.iter().copied().collect();
     let result = call("terminal.list", json!({"labels": labels, "all": all}))?;
-    Ok(serde_json::from_value(result["terminals"].clone())?)
+    let terminals: Vec<Terminal> = serde_json::from_value(result["terminals"].clone())?;
+    Ok(terminals.into_iter().filter(is_here).collect())
+}
+
+/// hc lists other machines' terminals too (`ec2/t5`): showrunner there runs
+/// those, and the same session names may be in use on both.
+fn is_here(terminal: &Terminal) -> bool {
+    !terminal.address.contains('/')
 }
 
 pub fn get(terminal: &str) -> Result<Terminal> {
@@ -311,4 +318,19 @@ fn read_frame(input: &mut BufReader<ChildStdout>) -> Result<(u32, u8, Vec<u8>)> 
     let mut payload = vec![0u8; len];
     input.read_exact(&mut payload)?;
     Ok((channel, header[4], payload))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Terminal, is_here};
+
+    #[test]
+    fn other_machines_terminals_are_not_here() {
+        let terminal = |address: &str| Terminal {
+            address: address.to_string(),
+            ..Default::default()
+        };
+        assert!(is_here(&terminal("t5")));
+        assert!(!is_here(&terminal("ec2/t5")));
+    }
 }
