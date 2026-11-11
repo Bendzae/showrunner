@@ -645,7 +645,18 @@ export class Tree {
     }
   }
 
-  // A click shows a session (or a task's main one) without taking the keyboard.
+  // A click selects a row and shows its session, the keyboard staying here
+  // (showing a tab hands it to the terminal, after this returns); a double
+  // click opens it.
+  click(row, count, cx) {
+    this.select(row.key);
+    if (count === 2) return this.activate(row);
+    this.preview(row);
+    this.handle.focus();
+    cx.timer.after(50, () => this.handle.focus());
+  }
+
+  // Shows a session (or a task's main one).
   preview(row) {
     const { item } = row;
     if (row.kind === "session" || row.kind === "adhoc" || (row.kind === "coordinator" && item.session.live)) show(item.space, item.session.cm_name, item.session.address, false);
@@ -938,12 +949,7 @@ export class Tree {
       .border_1().border_color(selected && treeFocused ? t.accent : "#00000000")
       .when(selected && treeFocused, (el) => el.bg(t.selected))
       .when(!(selected && treeFocused), (el) => el.hover((s) => s.bg(t.hover)))
-      .on_click((e, cx) => {
-        this.select(r.key);
-        if (e.click_count === 2) this.activate(r);
-        else this.preview(r);
-        cx.notify();
-      })
+      .on_click((e, cx) => { this.click(r, e.click_count, cx); cx.notify(); })
       .on_mouse_down("right", (_e, cx) => { this.select(r.key); this.menu(r, "pointer"); cx.notify(); });
     const chevron = (folded) => div().id(`sr-fold-${r.key}`).size(12).flex_none().flex().items_center().justify_center().text_color(t.dim)
       .on_click((_e, cx) => { cx.stop_propagation(); this.toggle(r.key); cx.notify(); })
