@@ -568,7 +568,8 @@ fn cmd_list(args: &[String]) -> Result<()> {
             "projects": projects,
             "data_dir": config::base_dir(),
             "machine_name": cfg.machine_name.clone().unwrap_or_else(crate::app::detect_hostname),
-            "default_agent": cfg.default_agent,
+            // Resolved as the TUI does: empty or unknown is the default agent.
+            "default_agent": AgentKind::from_id(&cfg.default_agent).unwrap_or_default().id(),
             "coordinator": {
                 "cm_name": session::COORDINATOR,
                 "space": session::coordinator_space(),
