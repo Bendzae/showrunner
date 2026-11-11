@@ -833,6 +833,19 @@ pub fn recreate_adhoc_session(
 /// name has no `<project>/<task>/<session>` parts, so no project lists it.
 pub const COORDINATOR: &str = "cm__coordinator__main";
 
+/// The Coordinator as a live session, while it runs. Its name has no project
+/// or task, so [`list_sessions`] leaves it out.
+pub fn coordinator_session() -> Option<LiveSession> {
+    session_terminal(COORDINATOR)?;
+    Some(LiveSession {
+        name: COORDINATOR.to_string(),
+        project_name: String::new(),
+        task_name: String::new(),
+        session_name: "coordinator".to_string(),
+        host: None,
+    })
+}
+
 pub fn coordinator_space() -> &'static str {
     herdr_ids(COORDINATOR).0
 }

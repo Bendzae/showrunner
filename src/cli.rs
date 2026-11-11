@@ -93,7 +93,8 @@ Talking to another session:
   showrunner attach <session>                   take over its terminal (ctrl+\\ detaches)
 
 <session> is a ref from `list` — `<project>/<task>/<session>`, `<project>/<task>`
-for that task's main session, or a raw `cm__…` session name.
+for that task's main session, or a raw `cm__…` session name. These four also
+take `coordinator`.
 
 With a [remote] configured, prefix a project or session ref with `<name>:` to
 run the command on that host (`showrunner ask ec2:myapp/fix-auth <question>`).
@@ -293,6 +294,9 @@ fn cmd_serve(args: &[String]) -> Result<()> {
 
 /// Canonical `<project>/<task>/<session>` ref for a session.
 pub(crate) fn session_ref(s: &LiveSession) -> String {
+    if s.name == session::COORDINATOR {
+        return "coordinator".to_string();
+    }
     format!("{}/{}/{}", s.project_name, s.task_name, s.session_name)
 }
 
@@ -300,6 +304,20 @@ pub(crate) fn session_ref(s: &LiveSession) -> String {
 /// terminals.
 pub(crate) fn current_session_name() -> Option<String> {
     session::session_of_terminal(&std::env::var("HC_TERMINAL_ID").ok()?)
+}
+
+/// Like [`resolve_session`], the Coordinator included (`coordinator`): sessions
+/// and scripts may tell it things, ask it and read its screen.
+fn resolve_session_or_coordinator(
+    reference: &str,
+    sessions: &[LiveSession],
+) -> Result<LiveSession> {
+    if reference == session::COORDINATOR || reference.eq_ignore_ascii_case("coordinator") {
+        return session::coordinator_session().ok_or_else(|| {
+            anyhow::anyhow!("the Coordinator isn't running (`showrunner coordinator` starts it)")
+        });
+    }
+    resolve_session(reference, sessions)
 }
 
 /// Resolve a session ref to a live session. Accepts a raw `cm__…` name,
@@ -1376,7 +1394,7 @@ fn cmd_send(args: &[String]) -> Result<()> {
     }
 
     let sessions = session::list_sessions().unwrap_or_default();
-    let session = resolve_session(reference, &sessions)?;
+    let session = resolve_session_or_coordinator(reference, &sessions)?;
     session::send_text(&session.name, &text, !flags.contains_key("no-submit"))?;
     println!("sent to {}", session_ref(&session));
     Ok(())
@@ -1387,7 +1405,7 @@ fn cmd_attach(args: &[String]) -> Result<()> {
         bail!("usage: attach <session>");
     };
     let sessions = session::list_sessions().unwrap_or_default();
-    session::attach_session(&resolve_session(reference, &sessions)?.name)
+    session::attach_session(&resolve_session_or_coordinator(reference, &sessions)?.name)
 }
 
 fn cmd_output(args: &[String]) -> Result<()> {
@@ -1403,7 +1421,7 @@ fn cmd_output(args: &[String]) -> Result<()> {
     };
 
     let sessions = session::list_sessions().unwrap_or_default();
-    let session = resolve_session(reference, &sessions)?;
+    let session = resolve_session_or_coordinator(reference, &sessions)?;
     let text = session::capture_output_plain(&session.name, lines.clamp(10, 5000))
         .ok_or_else(|| anyhow::anyhow!("could not capture output for {reference}"))?;
     println!(
@@ -1439,7 +1457,7 @@ fn cmd_ask(args: &[String]) -> Result<()> {
     };
 
     let sessions = session::list_sessions().unwrap_or_default();
-    let session = resolve_session(reference, &sessions)?;
+    let session = resolve_session_or_coordinator(reference, &sessions)?;
     let name = &session.name;
     if current_session_name().as_deref() == Some(name.as_str()) {
         bail!("that ref is this session — you can't ask yourself");
