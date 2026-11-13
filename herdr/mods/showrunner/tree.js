@@ -28,6 +28,19 @@ function clock(seconds, due) {
   return `${["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][at.getDay()]} ${time}`;
 }
 
+// What a row's item knows about its project.
+function projectInfo(p, data, machine) {
+  return { name: p.name, path: p.path, run_command: p.run_command, space: p.space, run: p.run, agent: data?.default_agent ?? "claude", machine };
+}
+
+// A routine's session by when it started ("<routine>-1113-0900" → "13 Nov 09:00").
+function runLabel(name) {
+  const m = /-(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})?$/.exec(name);
+  if (!m) return name;
+  const month = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][Number(m[1]) - 1];
+  return `${Number(m[2])} ${month} ${m[3]}:${m[4]}${m[5] ? `:${m[5]}` : ""}`;
+}
+
 // Another machine's listing with Herdr's names for its sessions, runs and spaces.
 function qualifyListing(data, m) {
   const q = (id) => qualify(m, id);
@@ -474,9 +487,31 @@ export class Tree {
         rows.push({ key: rkey, kind: "routines", depth: 0, folded: !open(rkey), count: all.length,
           running: all.some((r) => r.running), failed: all.filter((r) => r.failed && !r.paused).map((r) => r.name),
           item: { kind: "routines", ...base } });
-        for (const r of hits) rows.push({ key: `r:${r.name}`, kind: "routine", depth: 1, parents: [rkey], item: { kind: "routine", routine: r, ...base } });
+        // A prompt routine's sessions (adhoc ones of its project) sit under it, newest first.
+        const adhoc = {};
+        for (const p of this.data.projects ?? []) {
+          for (const s of p.adhoc_stopped ?? []) adhoc[s.cm_name] = { p, s, stopped: true };
+          for (const s of p.adhoc_sessions ?? []) adhoc[s.cm_name] = { p, s, stopped: !live[s.cm_name] };
+        }
+        for (const r of hits) {
+          const key = `r:${r.name}`;
+          const runs = (r.runs ?? []).map((cm) => adhoc[cm]).filter(Boolean).reverse();
+          rows.push({ key, kind: "routine", depth: 1, parents: [rkey], folded: !open(key), runs: runs.length, item: { kind: "routine", routine: r, ...base } });
+          for (const { p, s, stopped } of runs) {
+            this.names[s.cm_name] = s.name;
+            this.tabOrder.push(s.cm_name);
+            rows.push({
+              key: `s:${s.cm_name}`, kind: stopped ? "stopped" : "adhoc", depth: 2, parents: [rkey, key], label: runLabel(s.name),
+              item: { kind: stopped ? "stopped" : "adhoc", project: projectInfo(p, this.data, null), session: sessionInfo(s, stopped), space: p.space, run: s.run, machine: null },
+              status: stopped ? "stopped" : live[s.cm_name]?.status, program: live[s.cm_name]?.program,
+              diff: this.stats.sessions[s.cm_name]?.diff,
+            });
+          }
+        }
       }
     }
+    // Shown under their routine instead of their project's adhoc.
+    const routineRuns = new Set((R?.routines ?? []).flatMap((r) => r.runs ?? []));
     const sources = this.sources();
     for (const src of sources) {
       const M = src.machine;
@@ -500,7 +535,7 @@ export class Tree {
       for (const p of src.data?.projects ?? []) {
         // The project's key: other machines may have one with the same name.
         const K = qualify(M, p.name);
-        const P = { name: p.name, path: p.path, run_command: p.run_command, space: p.space, run: p.run, agent: src.data.default_agent ?? "claude", machine: M };
+        const P = projectInfo(p, src.data, M);
         const pkey = `p:${K}`;
         const projectHit = has(p.name);
         const tasks = (p.tasks ?? []).filter((t) => Boolean(t.archived) === this.archived);
@@ -509,8 +544,9 @@ export class Tree {
         let lastGroup = null;
         // Adhoc sessions, the project's own space: first, when there are any.
         if (!this.archived) {
-          const running = (p.adhoc_sessions ?? []).filter((s) => live[s.cm_name]);
-          const stopped = [...(p.adhoc_stopped ?? []), ...(p.adhoc_sessions ?? []).filter((s) => !live[s.cm_name])];
+          const own = (s) => Boolean(M) || !routineRuns.has(s.cm_name);
+          const running = (p.adhoc_sessions ?? []).filter((s) => live[s.cm_name] && own(s));
+          const stopped = [...(p.adhoc_stopped ?? []), ...(p.adhoc_sessions ?? []).filter((s) => !live[s.cm_name])].filter(own);
           const hits = [...running.map((s) => [s, false]), ...stopped.map((s) => [s, true])].filter(([s]) => projectHit || has(s.name, "adhoc"));
           this.names[p.space] = p.name;
           this.names[p.run] = "▶ run";
@@ -824,7 +860,7 @@ export class Tree {
       case "k": case "up": this.move(rows, -1); break;
       case "enter": if (row) this.activate(row, cx); break;
       case " ": case "space":
-        if (row && ["machine", "routines", "project", "group", "task", "adhoc-group"].includes(row.kind)) this.toggle(row.key);
+        if (row && ["machine", "routines", "routine", "project", "group", "task", "adhoc-group"].includes(row.kind)) this.toggle(row.key);
         break;
       case "a": this.menu(row); break;
       // On the selected row's machine.
@@ -1101,6 +1137,7 @@ export class Tree {
             .when(this.activeSpace(r.item.space), (el) => el.text_color(t.accent))
             .child("Routines"))
           .child(div().flex_1())
+          .when(Boolean(activityBadge(t, hidden)), (el) => el.child(activityBadge(t, hidden)))
           .when(r.running, (el) => el.child(svg("mods/showrunner/icons/spinner.svg").size(11).flex_none().text_color(t.ansi2).spin(1100)))
           .when(r.failed.length > 0, (el) => el.child(div().id("sr-routines-failed").size(7).flex_none().rounded(4).bg(t.blocked)
             .tooltip(`Last run failed: ${r.failed.join(", ")}`)))
@@ -1115,13 +1152,16 @@ export class Tree {
         const pic = R.command != null ? icon("terminal", 12, t.muted) : programIcon({ icon: `icons/${R.agent ?? r.item.agent}.svg`, tint: false }, 12, t.muted);
         const note = R.error ? "bad schedule" : R.paused ? "paused" : R.running ? null : R.next_run ? clock(R.next_run, true) : null;
         return base
+          .child(r.runs ? chevron(r.folded) : div().size(12).flex_none())
           .child(pic)
           .child(div().id(`sr-name-${r.key}`).flex_shrink(0).max_w(140).truncate()
             .text_color(R.paused ? t.muted : R.failed ? t.blocked : t.foreground)
             .tooltip(`${what}\n${R.schedule} · ${last}`)
             .child(R.name))
           .child(div().flex_shrink(1).min_w(0).truncate().text_size(11).text_color(t.dim).child(R.schedule))
+          .when(Boolean(hidden?.hot), (el) => el.child(fire))
           .child(div().flex_1())
+          .when(Boolean(activityBadge(t, hidden)), (el) => el.child(activityBadge(t, hidden)))
           .when(R.running, (el) => el.child(svg("mods/showrunner/icons/spinner.svg").size(11).flex_none().text_color(t.ansi2).spin(1100)))
           .when(Boolean(note), (el) => el.child(div().flex_none().text_size(11).text_color(R.error ? t.blocked : t.dim).child(note)));
       }
@@ -1225,7 +1265,7 @@ export class Tree {
           .child(div().flex_shrink(0).max_w(150).truncate()
             .text_color(stopped ? t.dim : r.status === "blocked" ? t.blocked : t.foreground)
             .when(shown, (el) => el.font_semibold())
-            .child(session.name))
+            .child(r.label ?? session.name))
           .when(Boolean(r.hot), (el) => el.child(fire))
           .when(stopped, (el) => el.child(div().text_size(11).text_color(t.dim).child(session.in_tmux ? "in tmux" : "stopped")))
           .when(Boolean(branchTail), (el) => el.child(div().flex_shrink(1).min_w(0).truncate().text_size(11).text_color(t.dim).child(branchTail)))
