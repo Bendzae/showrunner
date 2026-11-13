@@ -199,6 +199,12 @@ export function liveRuns() {
   return out;
 }
 
+// The routine scheduler's terminal here, while it runs.
+export function schedulerAddress() {
+  const t = terminals().find((x) => x.labels?.["showrunner.routines"] === "scheduler" && x.state === "live" && !machineOf(x.address));
+  return t?.address ?? null;
+}
+
 function isShellIdle(t) {
   const name = t.foreground?.name ?? "";
   const argv = t.foreground?.argv ?? [];
@@ -262,6 +268,7 @@ export function menuItems(item) {
         { key: "T", label: "Add task (choose agent)", action: "add-task-agent" },
         { key: "l", label: "Add task from Linear ticket", action: "add-task-ticket" },
         { key: "A", label: "New adhoc session", action: "new-adhoc" },
+        ...(item.machine ? [] : [{ key: "R", label: "New routine", action: "new-prompt-routine" }]),
         runItem,
         { key: "b", label: "Checkout branch", action: "checkout-branch" },
         { key: "f", label: "Fetch & pull all branches", action: "fetch" },
@@ -319,6 +326,19 @@ export function menuItems(item) {
         ...(main ? [] : [{ key: "d", label: "Delete", action: "delete", danger: true }]),
       ];
     }
+    case "routines":
+      return [
+        { key: "c", label: "New command routine", action: "new-command-routine" },
+        { key: "p", label: "New prompt routine", action: "new-prompt-routine" },
+        ...(item.scheduler ? [] : [{ key: "s", label: "Start the scheduler", action: "start-scheduler" }]),
+      ];
+    case "routine":
+      return [
+        { key: "r", label: "Run now", action: "routine-run" },
+        { key: "e", label: "Edit", action: "routine-edit" },
+        { key: "p", label: item.routine.paused ? "Resume" : "Pause", action: "routine-pause" },
+        { key: "d", label: "Delete", action: "routine-delete", danger: true },
+      ];
     case "stopped":
       return [
         { key: "s", label: "Start (resume its conversation)", action: "resume" },

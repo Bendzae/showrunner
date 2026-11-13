@@ -367,6 +367,7 @@ What works differently there:
 - The right panel (`Ctrl-'`) shows Files, Changes, the task's ideas, PR and Linear ticket, and **Activity**: what the selected session's Claude is doing, read from its conversation (`showrunner session activity`): its subagents nested under whoever started them, the call under way, task lists, shell commands with their last output lines, the turn's time and context fill.
 - `Cmd-K` switches sessions: a fuzzy list of the running sessions (`project - task - session`) but the one on screen, those that need you first, then those done since you looked, then the most recently used.
 - The **Coordinator** row on top is one Claude session above all projects: it keeps the overview across projects, tasks and sessions, starts and steers work through the `showrunner` CLI, and knows hc and Herdr (their `--skill` manuals are its skills). It runs in `~/.showrunner/coordinator`, starts with Herdr (`showrunner coordinator` starts it by hand) and resumes its conversation; `Ctrl-;` jumps to it from anywhere.
+- **Routines**, the row under the Coordinator, run on a schedule: a shell command, or a prompt that each run starts in a new adhoc session of a project (like the Claude desktop app's routines). Its menu (`a`) adds a command or prompt routine (a project's menu, `R`, adds a prompt routine there); a routine's menu runs it now, edits, pauses or deletes it. Each row shows the schedule and the next run (`due` when one was missed). `Enter` on a prompt routine shows its newest session; on a command routine, the scheduler's terminal, where commands print (a run that succeeds without printing stays quiet). See [Routines](#routines).
 
 `showrunner herdr install` adds `Ctrl-/`, `Ctrl-'`, `Ctrl-;` and `Cmd-K` to `keys.json` (skip with `--no-keys`); Herdr stops updating the defaults of a `keys.json` once it's edited. Run it again after updating showrunner.
 
@@ -407,6 +408,19 @@ showrunner restore                               # recreate saved sessions that 
 showrunner herdr install                         # the Herdr app's Showrunner layout (see "In the Herdr app")
 showrunner migrate                               # move idle sessions from tmux (older versions) into hc
 ```
+
+### Routines
+
+```sh
+showrunner routine add "Slack check" "every 1m" --command ~/bin/slack-check
+showrunner routine add "PR sweep" "weekdays 09:00" --project myapp --prompt "Check the open PRs for review comments" [--agent codex]
+showrunner routine list [--json]
+showrunner routine edit <name> [--name <n>] [--schedule <s>] [--command <cmd> | --project <p> --prompt <text> --agent <id>]
+showrunner routine pause|resume|run <name>
+showrunner routine delete <name> --yes
+```
+
+Schedules: `every 5m` (`m`, `h` or `d`), `daily 09:00`, `weekdays 09:00`, `weekends 10:00` or days like `mon,thu 09:00`, in local time. Routines live in `config.toml` (`[[routines]]`). A scheduler runs them from its own hc terminal (the *Routines* space in Herdr), started with the first routine and by `restore`; it restarts itself when the binary is updated. Commands run with `sh` in the home folder and print into the scheduler's terminal. A prompt routine starts a new adhoc session (`<routine>-<MMDD-HHMM>`) on its prompt each time; its three newest stay, older ones end. Runs missed while the machine slept come due once when it wakes; on macOS, nothing runs during the short dark wakes of a sleeping Mac (Power Nap). A resumed routine counts from when it was resumed.
 
 Everything the TUI's menus do has a command too (`project`, `group`, `task archive|update|push|pr|…`, `session adhoc|merge|update|resume`, `run`, `review`): `showrunner --help` lists them.
 

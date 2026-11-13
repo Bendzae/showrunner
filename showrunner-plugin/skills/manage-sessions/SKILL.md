@@ -121,6 +121,21 @@ showrunner session create <project> <task> [--prompt "<initial task>"] [--no-wor
 - New sessions start immediately in the background. Poll them with `list`, read them with `output`,
   or ask them with `ask`.
 
+## Routines
+
+Commands, or prompts each started in a new adhoc session of a project, run on a schedule. Set one
+up when the user asks for something recurring:
+
+```
+showrunner routine add "<name>" "<schedule>" --command "<shell command>"
+showrunner routine add "<name>" "<schedule>" --project <project> --prompt "<text>" [--agent <id>]
+showrunner routine list                      # schedules, last and next runs
+showrunner routine edit|pause|resume|run <name> ...   # `routine delete <name> --yes` removes one
+```
+
+Schedules: `every 5m` (m, h or d), `daily 09:00`, `weekdays 09:00`, `weekends 10:00`, `mon,thu 09:00`.
+A prompt routine's sessions start without you: make the prompt self-contained, like `--prompt` above.
+
 ## Deleting
 
 ```

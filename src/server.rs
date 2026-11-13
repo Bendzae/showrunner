@@ -550,6 +550,7 @@ async fn api_create_adhoc(
             &name,
             &cfg.startup_skills,
             agent,
+            None,
         )?;
         config::add_session_record(
             &cm_name,

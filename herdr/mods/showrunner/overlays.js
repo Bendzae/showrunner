@@ -74,7 +74,7 @@ export class Menu {
     const t = theme();
     const list = this.entries();
     const item = props().item ?? {};
-    const heading = props().title ?? (item.session?.name ? `${item.task?.name ?? "adhoc"} · ${item.session.name}` : item.task?.name ?? item.group ?? item.project?.name);
+    const heading = props().title ?? (item.session?.name ? `${item.task?.name ?? "adhoc"} · ${item.session.name}` : item.routine?.name ?? (item.kind === "routines" ? "Routines" : null) ?? item.task?.name ?? item.group ?? item.project?.name);
     return v_flex().id("sr-menu").track_focus(this.handle).w_full().min_h(0).p(5).bg(t.popover).text_size(12.8)
       .on_key_down((e, cx) => {
         const k = e.key.length === 1 ? e.key_char ?? e.key : e.key;
@@ -118,7 +118,7 @@ export class Form {
     this.branchEdited = false;
     this.handle = cx.focus_handle();
     for (const f of spec.fields) {
-      if (f.agent) { this.values[f.id] = p.item?.project?.agent ?? "claude"; continue; }
+      if (f.agent) { this.values[f.id] = (typeof f.value === "function" ? f.value(p) : null) ?? p.item?.project?.agent ?? "claude"; continue; }
       const value = typeof f.value === "function" ? f.value(p) : f.value ?? "";
       this.values[f.id] = value;
       const state = f.multiline
@@ -323,7 +323,7 @@ export class Picker {
             .when(index === this.at, (el) => el.bg(t.selected))
             .hover((s) => s.bg(t.hover))
             .on_click(() => this.pick(x))
-            .child(icon(x.create ? "plus" : p.picker === "group" ? "layers" : "git-branch", 13, t.dim))
+            .child(icon(x.create ? "plus" : this.spec.icon ?? (p.picker === "group" ? "layers" : "git-branch"), 13, t.dim))
             .child(div().flex_1().truncate().text_color(t.foreground).child(x.create ? `Create “${x.value}”` : x.value))
             .when(x.value === current && !x.create, (el) => el.child(icon("check", 13, t.accent)));
         })));

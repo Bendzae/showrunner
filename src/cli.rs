@@ -77,10 +77,24 @@ What the TUI's menus do:
   showrunner herdr install [--home <dir>] [--bin <path>] [--no-keys]
                                                 the Herdr app's Showrunner layout
 
+Routines (commands, or prompts each started in a new adhoc session, on a schedule):
+  showrunner routine list [--json]
+  showrunner routine add <name> <schedule> (--command <cmd> | --project <p> --prompt <text>
+                                            [--agent <id>])
+                                                schedule: `every 5m` (m, h or d),
+                                                    `daily 09:00`, `weekdays 09:00`,
+                                                    `weekends 10:00`, `mon,thu 09:00`
+  showrunner routine edit <name> [--name <n>] [--schedule <s>] [--command <cmd>]
+                                 [--project <p>] [--prompt <text>] [--agent <id>]
+  showrunner routine pause|resume|run <name> | delete <name> --yes
+  showrunner routine start                      start the scheduler's terminal unless it runs
+                                                    (`routine scheduler` is what it runs)
+
 Housekeeping:
   showrunner restore [--no-coordinator]         recreate saved sessions that
                                                     are no longer running (reboot),
-                                                    and the coordinator
+                                                    the coordinator and the routine
+                                                    scheduler
   showrunner coordinator                        start the coordinator (one agent
                                                     above all projects) unless it runs
   showrunner migrate                            move idle sessions still running
@@ -129,6 +143,7 @@ pub fn dispatch(args: &[String]) -> Option<Result<()>> {
         Some("review") => Some(cli_actions::cmd_review(rest)),
         Some("herdr") => Some(cli_actions::cmd_herdr(rest)),
         Some("ideas") => Some(cli_actions::cmd_ideas(rest)),
+        Some("routine") => Some(crate::routines::cmd_routine(rest)),
         Some("--help" | "-h" | "help") => {
             print!("{HELP}");
             Some(Ok(()))
@@ -592,6 +607,7 @@ fn cmd_list(args: &[String]) -> Result<()> {
                 "cm_name": session::COORDINATOR,
                 "space": session::coordinator_space(),
             },
+            "routines": crate::routines::listing(&cfg),
         });
         let hosts: Vec<Value> = host_listings
             .into_iter()

@@ -13,6 +13,7 @@ pub mod notify;
 pub mod ops;
 pub mod remote;
 mod review;
+mod routines;
 pub mod server;
 pub mod session;
 pub mod theme;

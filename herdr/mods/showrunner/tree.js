@@ -8,16 +8,25 @@
 import { div, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input } from "gpui-base";
 import { spaces, focused, run, theme, settings, shared, setShared, nextCommand, readTextFile, window, layout, themes, openOverlay, machines, notify } from "herdr";
-import { sr, act, clean, loadConfig, liveSessions, liveRuns, guessedStatus, worst, menuItems, show, runAct, qualify, bare, machineOf, hcMachines, reconnectMachine } from "./lib.js";
+import { sr, act, clean, loadConfig, liveSessions, liveRuns, schedulerAddress, guessedStatus, worst, menuItems, show, runAct, qualify, bare, machineOf, hcMachines, reconnectMachine } from "./lib.js";
 import { perform, openMenu, form } from "./actions.js";
 import { togglePanel, showPanel, panelEntries } from "./panels.js";
 import { icon, programIcon, statusGlyph, prColor, diffBadge, activityBadge, avatar, avatarColor, linearId, prSummary } from "./ui.js";
 
-const H = { coordinator: 34, machine: 34, project: 34, group: 26, task: 28, session: 26, stopped: 26, "adhoc-group": 26, adhoc: 26, "other-head": 32, space: 28, hint: 30 };
+const H = { coordinator: 34, routines: 30, routine: 26, machine: 34, project: 34, group: 26, task: 28, session: 26, stopped: 26, "adhoc-group": 26, adhoc: 26, "other-head": 32, space: 28, hint: 30 };
 const HOT_SECONDS = 2 * 3600;
 const HEADER = 31;
 // How long a machine without showrunner is left alone before it's asked again.
 const ABSENT_RETRY = 5 * 60 * 1000;
+
+// A routine's time: "14:05" today, else "Mon 09:00"; `due` says so once it has passed.
+function clock(seconds, due) {
+  const at = new Date(seconds * 1000);
+  if (due && at <= new Date()) return "due";
+  const time = `${String(at.getHours()).padStart(2, "0")}:${String(at.getMinutes()).padStart(2, "0")}`;
+  if (at.toDateString() === new Date().toDateString()) return time;
+  return `${["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][at.getDay()]} ${time}`;
+}
 
 // Another machine's listing with Herdr's names for its sessions, runs and spaces.
 function qualifyListing(data, m) {
@@ -218,7 +227,7 @@ export class Tree {
     cx.spawn(async (cx) => {
       const { home } = await loadConfig();
       const read = (f) => readTextFile(`${home}/${f}`).catch(() => null);
-      const text = `${await read("config.toml")}\0${await read("sessions.json")}`;
+      const text = `${await read("config.toml")}\0${await read("sessions.json")}\0${await read("routines/state.json")}`;
       this.watching = false;
       if (this.seen !== undefined && text !== this.seen) this.refresh(cx);
       this.seen = text;
@@ -448,6 +457,26 @@ export class Tree {
       rows.push({ key: `s:${c.cm_name}`, kind: "coordinator", depth: 0, status: l ? l.status : "stopped",
         item: { kind: "coordinator", space: c.space, session: { cm_name: c.cm_name, name: "Coordinator", agent: "claude", live: Boolean(l), address: l?.address ?? null } } });
     }
+    // Routines (`showrunner routine`), under the Coordinator: the scheduler's
+    // terminal is their space's one tab.
+    const R = this.data?.routines;
+    if (R && !this.archived) {
+      const all = R.routines ?? [];
+      const hits = all.filter((r) => has("Routines", r.name, r.project));
+      if (hits.length || has("Routines")) {
+        const rkey = "r:";
+        const scheduler = schedulerAddress();
+        this.names[R.space] = "Routines";
+        this.names[R.tab] = "scheduler";
+        this.spaceOrder.push(R.space);
+        this.tabOrder.push(R.tab);
+        const base = { space: R.space, tab: R.tab, scheduler, agent: this.data.default_agent ?? "claude", projects: (this.data.projects ?? []).map((p) => p.name) };
+        rows.push({ key: rkey, kind: "routines", depth: 0, folded: !open(rkey), count: all.length,
+          running: all.some((r) => r.running), failed: all.filter((r) => r.failed && !r.paused).map((r) => r.name),
+          item: { kind: "routines", ...base } });
+        for (const r of hits) rows.push({ key: `r:${r.name}`, kind: "routine", depth: 1, parents: [rkey], item: { kind: "routine", routine: r, ...base } });
+      }
+    }
     const sources = this.sources();
     for (const src of sources) {
       const M = src.machine;
@@ -662,7 +691,7 @@ export class Tree {
     // The tab's row, or the closest row above it that isn't folded away.
     const all = this.allRows ?? rows;
     const target = all.find((r) => r.key === `s:${tab}`)
-      ?? all.find((r) => (r.kind === "task" || r.kind === "adhoc-group") && r.item.space === space?.id)
+      ?? all.find((r) => (r.kind === "task" || r.kind === "adhoc-group" || r.kind === "routines") && r.item.space === space?.id)
       ?? all.find((r) => r.key === `o:${space?.id}`);
     const key = [target?.key, ...[...(target?.parents ?? [])].reverse()].find((k) => rows.some((r) => r.key === k));
     if (key) this.sel = key;
@@ -687,6 +716,10 @@ export class Tree {
     switch (row.kind) {
       case "coordinator":
         return this.openCoordinator();
+      case "routines":
+        return this.toggle(row.key);
+      case "routine":
+        return this.showRoutine(item, true);
       case "adhoc-group":
         return this.toggle(row.key);
       case "machine":
@@ -726,6 +759,18 @@ export class Tree {
     if (row.kind === "session" || row.kind === "adhoc" || (row.kind === "coordinator" && item.session.live)) show(item.space, item.session.cm_name, item.session.address, false);
     else if (row.kind === "task" && item.main) show(item.space, item.main.cm_name, item.main.address, false);
     else if (row.kind === "space") run("space.select", { id: item.space });
+    else if (row.kind === "routines" && item.scheduler) show(item.space, item.tab, item.scheduler, false);
+    else if (row.kind === "routine") this.showRoutine(item, false);
+  }
+
+  // A prompt routine's newest session while it runs, else the scheduler's
+  // terminal (where commands print), started when it isn't running.
+  showRoutine(item, focus) {
+    const latest = item.routine.runs?.at(-1);
+    const l = latest && liveSessions(this.guessed)[latest];
+    if (l) return show(latest.slice(0, latest.lastIndexOf("__")), latest, l.address, focus);
+    if (item.scheduler) return show(item.space, item.tab, item.scheduler, focus);
+    if (focus) perform("start-scheduler", item);
   }
 
   menu(row, at) {
@@ -779,7 +824,7 @@ export class Tree {
       case "k": case "up": this.move(rows, -1); break;
       case "enter": if (row) this.activate(row, cx); break;
       case " ": case "space":
-        if (row && ["machine", "project", "group", "task", "adhoc-group"].includes(row.kind)) this.toggle(row.key);
+        if (row && ["machine", "routines", "project", "group", "task", "adhoc-group"].includes(row.kind)) this.toggle(row.key);
         break;
       case "a": this.menu(row); break;
       // On the selected row's machine.
@@ -938,7 +983,7 @@ export class Tree {
     const item = row?.item;
     let summary = null;
     if (item && row.kind !== "space") {
-      const crumbs = [item.kind === "machine" ? item.label : item.machine, item.project?.name, item.task?.name ?? (item.kind === "adhoc" || item.kind === "adhoc-group" ? "adhoc" : null), item.group && !item.task ? item.group : null, item.session?.name].filter(Boolean);
+      const crumbs = item.kind === "routines" || item.kind === "routine" ? ["Routines", item.routine?.name].filter(Boolean) : [item.kind === "machine" ? item.label : item.machine, item.project?.name, item.task?.name ?? (item.kind === "adhoc" || item.kind === "adhoc-group" ? "adhoc" : null), item.group && !item.task ? item.group : null, item.session?.name].filter(Boolean);
       const stats = item.session ? this.stats.sessions[item.session.cm_name] : null;
       summary = {
         crumbs,
@@ -1046,6 +1091,39 @@ export class Tree {
           .child(div().flex_1())
           .when(stopped, (el) => el.child(div().text_size(11).text_color(t.dim).child("stopped")))
           .when(!stopped, (el) => el.child(statusGlyph(t, r.status)));
+      }
+      case "routines": {
+        const stopped = !r.item.scheduler && r.count > 0;
+        return base.mt(2).pl(4)
+          .child(chevron(r.folded))
+          .child(h_flex().size(18).flex_none().rounded(5).bg("#0e9fb8").items_center().justify_center().child(icon("clock", 13, "#ffffff")))
+          .child(div().font_semibold().text_color(t.foreground)
+            .when(this.activeSpace(r.item.space), (el) => el.text_color(t.accent))
+            .child("Routines"))
+          .child(div().flex_1())
+          .when(r.running, (el) => el.child(svg("mods/showrunner/icons/spinner.svg").size(11).flex_none().text_color(t.ansi2).spin(1100)))
+          .when(r.failed.length > 0, (el) => el.child(div().id("sr-routines-failed").size(7).flex_none().rounded(4).bg(t.blocked)
+            .tooltip(`Last run failed: ${r.failed.join(", ")}`)))
+          .when(stopped, (el) => el.child(div().id("sr-routines-stopped").text_size(11).text_color(t.dim)
+            .tooltip("The scheduler isn't running: a for its menu, or showrunner routine start").child("stopped")))
+          .when(r.folded && r.count > 0, (el) => el.child(countBox(r.count, "routine")));
+      }
+      case "routine": {
+        const R = r.item.routine;
+        const what = R.command ?? `${R.project}: ${(R.prompt ?? "").split("\n")[0]}`;
+        const last = R.last_run ? `Last run ${clock(R.last_run)}: ${R.last_result ?? ""}` : "Not run yet";
+        const pic = R.command != null ? icon("terminal", 12, t.muted) : programIcon({ icon: `icons/${R.agent ?? r.item.agent}.svg`, tint: false }, 12, t.muted);
+        const note = R.error ? "bad schedule" : R.paused ? "paused" : R.running ? null : R.next_run ? clock(R.next_run, true) : null;
+        return base
+          .child(pic)
+          .child(div().id(`sr-name-${r.key}`).flex_shrink(0).max_w(140).truncate()
+            .text_color(R.paused ? t.muted : R.failed ? t.blocked : t.foreground)
+            .tooltip(`${what}\n${R.schedule} · ${last}`)
+            .child(R.name))
+          .child(div().flex_shrink(1).min_w(0).truncate().text_size(11).text_color(t.dim).child(R.schedule))
+          .child(div().flex_1())
+          .when(R.running, (el) => el.child(svg("mods/showrunner/icons/spinner.svg").size(11).flex_none().text_color(t.ansi2).spin(1100)))
+          .when(Boolean(note), (el) => el.child(div().flex_none().text_size(11).text_color(R.error ? t.blocked : t.dim).child(note)));
       }
       case "machine": {
         const note = r.reconnecting ? "reconnecting…" : r.lost ? "offline" : r.error ? "showrunner failed"

@@ -728,6 +728,26 @@ pub struct Remote {
     pub wake_command: Option<String>,
 }
 
+/// Something run on a schedule (`showrunner routine`): a shell command, or
+/// a prompt started in a new adhoc session of `project` each time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Routine {
+    pub name: String,
+    /// `every 5m`, `daily 09:00`, … (see `routines::Schedule`).
+    pub schedule: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    /// The agent a prompt runs in (default: `default_agent`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub paused: bool,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Config {
     /// Diff review tool launched by the review action (default: hunk).
@@ -756,6 +776,8 @@ pub struct Config {
     pub machine_name: Option<String>,
     #[serde(default)]
     pub projects: Vec<Project>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub routines: Vec<Routine>,
     /// Startup skills/commands to run before the initial prompt (e.g. ["/prime", "/caveman ultra"])
     #[serde(
         default,

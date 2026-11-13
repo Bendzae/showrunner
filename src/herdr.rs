@@ -49,6 +49,8 @@ const FILES: &[(&str, &str)] = files![
     "mods/showrunner/icons/lightbulb.svg",
     "mods/showrunner/icons/git-pull-request.svg",
     "mods/showrunner/icons/ticket.svg",
+    "mods/showrunner/icons/clock.svg",
+    "mods/showrunner/icons/terminal.svg",
     "mods/showrunner-status/mod.json",
     "mods/showrunner-status/main.js",
 ];

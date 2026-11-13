@@ -195,7 +195,7 @@ pub fn to_branch_name(task_name: &str) -> String {
     result.trim_end_matches('-').to_string()
 }
 
-fn shell_escape(s: &str) -> String {
+pub(crate) fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
@@ -339,7 +339,7 @@ fn launch(spec: Launch) -> Result<()> {
 /// or tmux (the core hands its own environment to every terminal). Claude takes
 /// an inherited `CLAUDE_CODE_CHILD_SESSION` as a nested session and stops
 /// saving its transcript.
-const NESTING_ENV: [&str; 4] = [
+pub(crate) const NESTING_ENV: [&str; 4] = [
     "CLAUDECODE",
     "CLAUDE_CODE_CHILD_SESSION",
     "TMUX",
@@ -756,13 +756,14 @@ pub fn remove_session_keep_branch(
 
 /// Create an adhoc session: an agent running in the project directory
 /// on whatever branch is currently checked out, with no task or worktree.
-/// Applies `startup_skills` if any, but sends no user prompt.
+/// Applies `startup_skills` if any, then `prompt`.
 pub fn create_adhoc_session(
     project_name: &str,
     project_path: &str,
     session_name: &str,
     startup_skills: &[String],
     agent: AgentKind,
+    prompt: Option<&str>,
 ) -> Result<String> {
     let cm_name = build_session_name(project_name, ADHOC_MARKER, session_name);
     install_agent_skills(agent, project_path);
@@ -772,7 +773,7 @@ pub fn create_adhoc_session(
         agent,
         project_path,
         None,
-        build_initial_prompt(startup_skills, None, agent).as_deref(),
+        build_initial_prompt(startup_skills, prompt, agent).as_deref(),
         false,
         None,
         claude_session_id.as_deref(),

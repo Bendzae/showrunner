@@ -418,6 +418,13 @@ pub fn restore_sessions(cfg: &Config, coordinator: bool) -> RestoreReport {
             Err(e) => report.failures.push(format!("coordinator: {e}")),
         }
     }
+    if !cfg.routines.is_empty() {
+        match crate::routines::ensure_scheduler() {
+            Ok(true) => report.restored.push("routine scheduler".to_string()),
+            Ok(false) => {}
+            Err(e) => report.failures.push(format!("routine scheduler: {e}")),
+        }
+    }
     let saved = config::load_sessions();
     if saved.is_empty() {
         return report;
@@ -957,12 +964,13 @@ pub fn find_task<'a>(project: &'a Project, task_name: &str) -> Result<&'a config
 }
 
 /// Start an adhoc session: the agent in the project directory, on whatever
-/// branch is checked out there.
+/// branch is checked out there, starting on `prompt` when given.
 pub fn create_adhoc_session(
     cfg: &Config,
     project: &Project,
     name: &str,
     agent: AgentKind,
+    prompt: Option<&str>,
 ) -> Result<String> {
     let name = name.trim();
     if name.is_empty() {
@@ -978,6 +986,7 @@ pub fn create_adhoc_session(
         name,
         &cfg.startup_skills,
         agent,
+        prompt,
     )?;
     config::add_session_record(
         &cm_name,

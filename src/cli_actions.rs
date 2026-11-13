@@ -365,7 +365,7 @@ fn session_adhoc(args: &[String]) -> Result<()> {
     let cfg = Config::load()?;
     let project = load_project(&cfg, project)?;
     let agent = ops::resolve_agent(&cfg, flags.get("agent").map(String::as_str))?;
-    let cm_name = ops::create_adhoc_session(&cfg, &project, name, agent)?;
+    let cm_name = ops::create_adhoc_session(&cfg, &project, name, agent, None)?;
     println!("created session: {}", short_ref(&cm_name));
     Ok(())
 }

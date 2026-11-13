@@ -2,7 +2,7 @@
 // showrunner command, or move Herdr (show a tab, open a terminal beside one).
 
 import { exec, run, openOverlay, notify, knownAgents, panes } from "herdr";
-import { act, sr, clean, show, copy, openUrl, liveRuns, loadConfig, binOn, bare, RUN_MENU, taskRef } from "./lib.js";
+import { act, sr, clean, show, copy, openUrl, liveRuns, loadConfig, binOn, bare, enqueue, RUN_MENU, taskRef } from "./lib.js";
 
 const MOD = "showrunner";
 
@@ -136,6 +136,24 @@ export async function perform(action, item, at) {
       return act("Stopping run", ["run", itemRef(item), "--kill"], { success: "Run session killed", on });
     case "add-project":
       return form("project", { kind: "global", machine: on });
+    case "new-command-routine":
+      return form("routine-command", item);
+    case "new-prompt-routine":
+      if (!project) return picker("routine-project", item);
+      return form("routine-prompt", item, { project: project.name, agent: project.agent });
+    case "routine-edit": {
+      const r = item.routine;
+      if (r.command != null) return form("routine-command", item, { edit: r });
+      return form("routine-prompt", item, { edit: r, project: r.project, agent: r.agent ?? item.agent });
+    }
+    case "routine-run":
+      return act(`Running ${item.routine.name}`, ["routine", "run", item.routine.name]);
+    case "routine-pause":
+      return act(item.routine.paused ? "Resuming routine" : "Pausing routine", ["routine", item.routine.paused ? "resume" : "pause", item.routine.name]);
+    case "routine-delete":
+      return confirm(`Delete routine ${item.routine.name}?`, "It stops running. Sessions it started stay.", ["routine", "delete", item.routine.name, "--yes"], "Delete");
+    case "start-scheduler":
+      return act("Starting the routine scheduler", ["routine", "start"], { after: { reveal: { space: item.space, tab: item.tab, focus: false } } });
   }
 }
 
@@ -326,6 +344,41 @@ export const FORMS = {
   },
 };
 
+// What `routine add` takes; showrunner checks it again.
+const SCHEDULE = /^(every \d+[mhd]|(daily|weekdays|weekends|[a-z]+(,[a-z]+)*) \d{1,2}:\d{2})$/i;
+const SCHEDULE_HELP = "Schedule: every 5m (m, h or d), daily 09:00, weekdays 09:00, weekends 10:00 or mon,thu 09:00";
+const routineFields = (what) => [
+  { id: "name", label: "Name", placeholder: "Slack check", value: (p) => p.edit?.name ?? "" },
+  { id: "schedule", label: "Schedule", placeholder: "every 5m · daily 09:00 · weekdays 09:00 · mon,thu 17:30", value: (p) => p.edit?.schedule ?? "" },
+  what,
+];
+// The routine's name, schedule and what it runs, or why not.
+function routineArgs(v, p, what) {
+  const name = v.name.trim(), schedule = v.schedule.trim().replace(/\s+/g, " ");
+  if (!name) return "A routine needs a name";
+  if (!SCHEDULE.test(schedule)) return SCHEDULE_HELP;
+  const args = p.edit ? ["routine", "edit", p.edit.name, "--name", name, "--schedule", schedule] : ["routine", "add", name, schedule];
+  act(p.edit ? "Saving routine" : "Adding routine", [...args, ...what], { success: p.edit ? `Saved routine ${name}` : `Added routine ${name}` });
+}
+
+FORMS["routine-command"] = {
+  title: (p) => (p.edit ? `Edit routine ${p.edit.name}` : "New command routine"),
+  action: "Save",
+  fields: routineFields({ id: "command", label: "Command", placeholder: "~/bin/check-something", value: (p) => p.edit?.command ?? "" }),
+  hint: "Runs with sh in your home folder. What it prints shows in the scheduler's terminal (Enter on the routine); a run that succeeds without printing stays quiet.",
+  submit: (v, p) => (v.command.trim() ? routineArgs(v, p, ["--command", v.command.trim()]) : "Which command?"),
+};
+FORMS["routine-prompt"] = {
+  title: (p) => (p.edit ? `Edit routine ${p.edit.name}` : `New routine in ${p.project}`),
+  action: "Save",
+  fields: [
+    ...routineFields({ id: "prompt", label: "Prompt", placeholder: "What each run starts on", multiline: true, value: (p) => p.edit?.prompt ?? "" }),
+    { id: "agent", label: "Agent", agent: true, value: (p) => p.agent },
+  ],
+  hint: (p) => `Each run starts a new adhoc session in ${p.project} on this prompt. Its three newest runs stay open.`,
+  submit: (v, p) => (v.prompt.trim() ? routineArgs(v, p, ["--project", p.project, "--prompt", v.prompt.trim(), "--agent", v.agent]) : "What should each run do?"),
+};
+
 // Pickers: what they list and what picking does.
 export const PICKERS = {
   branch: {
@@ -341,6 +394,12 @@ export const PICKERS = {
     },
     current: (p) => p.item.task.base_branch,
     pick: (value, p) => act("Setting base branch", ["task", "set-base", p.item.project.name, p.item.task.name, value], { on: p.item.machine ?? null }),
+  },
+  "routine-project": {
+    title: () => "New prompt routine in…",
+    load: async (p) => p.item.projects ?? [],
+    icon: "folder",
+    pick: (value, p) => enqueue({ kind: "perform", action: "new-prompt-routine", item: { ...p.item, project: { name: value, agent: p.item.agent } } }),
   },
   group: {
     title: (p) => `Group for ${p.item.task.name}`,

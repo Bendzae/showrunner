@@ -3068,6 +3068,7 @@ impl App {
                 &session_name,
                 &startup_skills,
                 agent,
+                None,
             ) {
                 Ok(cm_name) => {
                     config::add_session_record(
