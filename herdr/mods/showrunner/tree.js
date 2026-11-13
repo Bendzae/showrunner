@@ -7,8 +7,8 @@
 
 import { div, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input } from "gpui-base";
-import { spaces, focused, run, theme, settings, shared, setShared, nextCommand, readTextFile, window, layout, themes, openOverlay, machines } from "herdr";
-import { sr, act, clean, loadConfig, liveSessions, liveRuns, guessedStatus, worst, menuItems, show, runAct, qualify, bare, machineOf } from "./lib.js";
+import { spaces, focused, run, theme, settings, shared, setShared, nextCommand, readTextFile, window, layout, themes, openOverlay, machines, notify } from "herdr";
+import { sr, act, clean, loadConfig, liveSessions, liveRuns, guessedStatus, worst, menuItems, show, runAct, qualify, bare, machineOf, hcMachines, reconnectMachine } from "./lib.js";
 import { perform, openMenu, form } from "./actions.js";
 import { togglePanel, showPanel, panelEntries } from "./panels.js";
 import { icon, programIcon, statusGlyph, prColor, diffBadge, activityBadge, avatar, avatarColor, linearId, prSummary } from "./ui.js";
@@ -83,6 +83,13 @@ export class Tree {
     this.statsBy = {};
     // Other machines: { data, error, absent (when it had no showrunner), restored, ... }.
     this.remote = {};
+    // The machines found without showrunner: no section, also while out of
+    // reach. Every other one keeps its row then, to reconnect it.
+    this.withoutShowrunner = new Set(JSON.parse(localStorage.getItem("machines-without-showrunner") ?? "[]"));
+    // hc's word on the machines out of reach ({ state, why, … } by name), and
+    // the ones being reconnected.
+    this.hcState = {};
+    this.reconnecting = new Set();
     this.guessed = {};
     // Folded unless opened: projects, groups, tasks and adhoc start closed.
     this.expanded = new Set(JSON.parse(localStorage.getItem("expanded") ?? "[]"));
@@ -131,6 +138,7 @@ export class Tree {
     });
     cx.timer.every(1500, (cx) => this.watch(cx));
     cx.timer.every(3000, (cx) => this.watchRemotes(cx));
+    cx.timer.every(5000, (cx) => this.refreshHcState(cx));
     cx.timer.every(30000, (cx) => this.refresh(cx));
     cx.timer.every(20000, (cx) => { if (window()?.active) this.refreshStats(cx); });
     cx.timer.every(4000, (cx) => this.refreshGuesses(cx));
@@ -285,9 +293,11 @@ export class Tree {
         st.loading = false;
         if (r.code === 0) {
           try { st.data = qualifyListing(JSON.parse(r.stdout), m); st.error = null; st.absent = null; } catch (e) { st.error = `Unreadable listing: ${e}`; }
+          if (st.data) this.rememberShowrunner(m, true);
         } else if (r.code === 127) {
           // No showrunner there: no section for it.
           Object.assign(st, { data: null, error: null, absent: Date.now(), restored: false });
+          this.rememberShowrunner(m, false);
         } else {
           st.error = clean(r.stderr) || "showrunner did not answer";
         }
@@ -295,6 +305,50 @@ export class Tree {
         if (!st.statsAsked && st.data) { st.statsAsked = true; this.refreshStatsOn(cx, m); }
       });
     }
+  }
+
+  rememberShowrunner(m, has) {
+    if (this.withoutShowrunner.has(m) === !has) return;
+    has ? this.withoutShowrunner.delete(m) : this.withoutShowrunner.add(m);
+    localStorage.setItem("machines-without-showrunner", JSON.stringify([...this.withoutShowrunner]));
+  }
+
+  // Why hc can't reach a machine, while one is out of reach.
+  refreshHcState(cx) {
+    if (this.askingHc || !machines().some((x) => x.name && x.layout !== "ready")) {
+      if (!this.askingHc && Object.keys(this.hcState).length) { this.hcState = {}; cx.notify(); }
+      return;
+    }
+    this.askingHc = true;
+    cx.spawn(async (cx) => {
+      const list = await hcMachines();
+      this.askingHc = false;
+      if (!list) return;
+      this.hcState = Object.fromEntries(list.map((x) => [x.name, x]));
+      cx.notify();
+    });
+  }
+
+  // Reconnect a machine out of reach, opening Tailscale's login page in the
+  // browser when its SSH asks for one.
+  reconnect(m, cx) {
+    if (!m || this.reconnecting.has(m)) return;
+    this.reconnecting.add(m);
+    notify({ title: `Reconnecting to ${m}`, body: "If Tailscale asks for a login, approve it in the browser page that opens.", level: "info", timeout: 8000 });
+    cx.notify();
+    cx.spawn(async (cx) => {
+      const { machine, error } = await reconnectMachine(m);
+      this.reconnecting.delete(m);
+      if (machine?.state === "connected") {
+        notify({ title: `Reconnected to ${m}`, level: "success", timeout: 4000 });
+        delete this.hcState[m];
+        this.refreshRemotes(cx);
+      } else {
+        if (machine) this.hcState[m] = machine;
+        notify({ title: `Couldn't reconnect to ${m}`, body: error || machine?.why || "hc still can't reach it.", level: "error", timeout: 12000 });
+      }
+      cx.notify();
+    });
   }
 
   // Other machines' config.toml and sessions.json, as `watch` reads this one's.
@@ -359,10 +413,12 @@ export class Tree {
   // that have showrunner, by name.
   sources() {
     const known = new Set(machines().map((m) => m.name).filter(Boolean));
-    const others = Object.entries(this.remote)
-      .filter(([m, st]) => known.has(m) && (st.data || st.error))
+    // One out of reach keeps its row, to reconnect it, unless it had no showrunner.
+    const others = [...known]
+      .map((m) => [m, this.remote[m] ?? {}])
+      .filter(([m, st]) => st.data || st.error || (!st.absent && !this.withoutShowrunner.has(m)))
       .sort(([a], [b]) => a.localeCompare(b));
-    return [{ machine: null, data: this.data }, ...others.map(([m, st]) => ({ machine: m, data: st.data, error: st.error }))];
+    return [{ machine: null, data: this.data }, ...others.map(([m, st]) => ({ machine: m, data: st.data ?? null, error: st.error ?? null }))];
   }
 
   // Every row, in order, as the TUI lists them; `allRows` keeps the ones
@@ -402,8 +458,13 @@ export class Tree {
       if (sources.length > 1) {
         const mkey = `m:${M ?? ""}`;
         const offline = Boolean(M) && !this.online(M);
+        const layout = M ? machines().find((x) => x.name === M)?.layout : null;
+        const hcState = this.hcState[M];
+        // hc gave up on it (not just connecting or loading): Reconnect.
+        const lost = offline && (layout === "unavailable" || ["unreachable", "needs_login"].includes(hcState?.state));
         const label = M ?? src.data?.machine_name ?? "This machine";
-        rows.push({ key: mkey, kind: "machine", depth: 0, folded: !open(mkey), offline, error: src.error, item: { kind: "machine", machine: M, label } });
+        rows.push({ key: mkey, kind: "machine", depth: 0, folded: !open(mkey), offline, layout, lost, why: hcState?.why ?? null,
+          reconnecting: this.reconnecting.has(M), error: src.error, item: { kind: "machine", machine: M, label } });
         if (offline) continue;
         section = [mkey];
       }
@@ -621,7 +682,7 @@ export class Tree {
   }
 
   // Enter: open what the row stands for, like attaching in the TUI.
-  activate(row) {
+  activate(row, cx) {
     const { item } = row;
     switch (row.kind) {
       case "coordinator":
@@ -629,6 +690,9 @@ export class Tree {
       case "adhoc-group":
         return this.toggle(row.key);
       case "machine":
+        // Out of reach: Enter reconnects (its section has nothing to open).
+        if (row.lost && cx) return this.reconnect(item.machine, cx);
+        return this.toggle(row.key);
       case "project":
       case "group":
         return this.toggle(row.key);
@@ -650,7 +714,7 @@ export class Tree {
   // click opens it.
   click(row, count, cx) {
     this.select(row.key);
-    if (count === 2) return this.activate(row);
+    if (count === 2) return this.activate(row, cx);
     this.preview(row);
     this.handle.focus();
     cx.timer.after(50, () => this.handle.focus());
@@ -713,7 +777,7 @@ export class Tree {
     switch (k) {
       case "j": case "down": this.move(rows, 1); break;
       case "k": case "up": this.move(rows, -1); break;
-      case "enter": if (row) this.activate(row); break;
+      case "enter": if (row) this.activate(row, cx); break;
       case " ": case "space":
         if (row && ["machine", "project", "group", "task", "adhoc-group"].includes(row.kind)) this.toggle(row.key);
         break;
@@ -918,7 +982,7 @@ export class Tree {
         return h_flex().id(`sr-rail-${r.key}`).relative().size(32).flex_none().rounded(7).items_center().justify_center()
           .when(on, (el) => el.bg(t.selected)).hover((s) => s.bg(t.hover))
           .tooltip(coordinator ? "Coordinator" : `${r.item.project.name} · ${name}`)
-          .on_click(() => this.activate(r))
+          .on_click((_e, cx) => this.activate(r, cx))
           .child(coordinator ? this.coordinatorMark(t, 20)
             : h_flex().size(20).rounded(5).bg(avatarColor(r.item.project.name)).items_center().justify_center()
               .text_size(11).font_bold().text_color("#ffffff").child([...name][0]?.toUpperCase() ?? "?"))
@@ -984,14 +1048,23 @@ export class Tree {
           .when(!stopped, (el) => el.child(statusGlyph(t, r.status)));
       }
       case "machine": {
-        const note = r.error ? "showrunner failed" : r.offline ? "offline" : null;
+        const note = r.reconnecting ? "reconnecting…" : r.lost ? "offline" : r.error ? "showrunner failed"
+          : r.offline ? (r.layout === "ready" ? "loading…" : "connecting…") : null;
+        const tip = r.lost ? r.why : r.error;
+        const reconnect = div().id(`sr-reconnect-${r.key}`).flex_none().px(5).rounded(4).border_1().border_color(t.border)
+          .text_size(11).text_color(t.muted).hover((s) => s.bg(t.hover).text_color(t.foreground))
+          .tooltip("Connect again. If Tailscale asks for a login, its page opens in the browser.")
+          .on_click((_e, cx) => { cx.stop_propagation(); this.reconnect(r.item.machine, cx); cx.notify(); })
+          .child("Reconnect");
         return base.mt(10).pl(4)
           .child(r.offline ? div().size(12).flex_none() : chevron(r.folded))
           .child(icon(r.item.machine ? "server" : "laptop", 13, t.muted))
           .child(div().text_size(12).font_semibold().text_color(r.offline ? t.dim : t.muted).child(r.item.label))
           .when(Boolean(hidden?.hot), (el) => el.child(fire))
           .child(div().flex_1())
-          .when(Boolean(note), (el) => el.child(div().id(`sr-note-${r.key}`).text_size(11).text_color(t.dim).when(Boolean(r.error), (x) => x.tooltip(r.error)).child(note)))
+          .when(r.reconnecting, (el) => el.child(svg("mods/showrunner/icons/spinner.svg").size(11).flex_none().text_color(t.muted).spin(1100)))
+          .when(Boolean(note), (el) => el.child(div().id(`sr-note-${r.key}`).text_size(11).text_color(t.dim).when(Boolean(tip), (x) => x.tooltip(tip)).child(note)))
+          .when(r.lost && !r.reconnecting, (el) => el.child(reconnect))
           .when(!note && Boolean(activityBadge(t, hidden)), (el) => el.child(activityBadge(t, hidden)));
       }
       case "project": {

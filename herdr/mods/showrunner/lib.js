@@ -2,7 +2,7 @@
 // tasks and sessions; Herdr shows their terminals: a space per task, a tab per
 // session (labels herdr.space / herdr.tab, set by showrunner).
 
-import { exec, readTextFile, appHome, home, notify, run, shared, setShared, spaces, agents, terminals } from "herdr";
+import { exec, hc, readTextFile, appHome, home, notify, run, shared, setShared, spaces, agents, terminals } from "herdr";
 
 // `local.json` beside this file can point at another binary or data folder
 // (a development build): { "bin": "/path/to/showrunner", "home": "/path/to/.showrunner" },
@@ -43,6 +43,72 @@ export async function sr(args, timeout = 120000, on = null) {
   } catch (e) {
     return { code: 127, stdout: "", stderr: String(e?.message ?? e) };
   }
+}
+
+// hc's machines ({ name, target, via, state, why, … }), null when hc doesn't answer.
+export async function hcMachines() {
+  try {
+    const r = await hc(["machine", "ls", "--json"]);
+    if (r.code === 0) return JSON.parse(r.stdout).machines ?? [];
+  } catch {}
+  return null;
+}
+
+// Reconnecting a machine hc lost. Tailscale SSH in check mode holds each
+// connection until someone logs in in a browser (every 12 hours by default)
+// and names the page only in ssh's banner, which hc's background connections
+// never show: hc just times out. So ssh here once, open that page when the
+// banner names one, and once ssh gets in have hc log in again. `hc machine
+// login` wants a terminal: `script` gives it one. No target (a machine hc
+// reaches through another): hc logs in alone.
+const RECONNECT = String.raw`
+target=$1 name=$2
+command -v hc >/dev/null 2>&1 || { echo "hc isn't on PATH" >&2; exit 127; }
+if [ -n "$target" ]; then
+  log=$(mktemp) || exit 1
+  trap 'rm -f "$log"' EXIT
+  ssh -o BatchMode=yes -o ConnectTimeout=20 "$target" true </dev/null 2>"$log" &
+  pid=$! opened= waited=0
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ -z "$opened" ]; then
+      url=$(grep -Eo 'https://login\.tailscale\.com/[^[:space:]]+' "$log" | head -n 1)
+      if [ -n "$url" ]; then
+        opened=1
+        if command -v open >/dev/null 2>&1; then open "$url"; else xdg-open "$url" >/dev/null 2>&1 & fi
+      fi
+    fi
+    if [ "$waited" -ge 300 ]; then
+      kill "$pid" 2>/dev/null
+      echo "Nobody approved the Tailscale login within 5 minutes." >&2
+      exit 1
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  if ! wait "$pid"; then
+    grep -v '^# ' "$log" >&2 || echo "ssh $target failed" >&2
+    exit 1
+  fi
+fi
+if [ "$(uname)" = Darwin ]; then
+  script -q /dev/null hc machine login "$name" </dev/null
+else
+  NAME=$name script -qec 'hc machine login "$NAME"' /dev/null </dev/null
+fi
+`;
+
+// Resolves with hc's machine afterwards (null if hc didn't answer) and what
+// went wrong on the way.
+export async function reconnectMachine(name) {
+  const m = (await hcMachines())?.find((x) => x.name === name);
+  let r;
+  try {
+    r = await exec("sh", ["-c", RECONNECT, "sh", m?.via ? "" : m?.target ?? "", name], { timeout: 330000 });
+  } catch (e) {
+    r = { code: 127, stdout: "", stderr: String(e?.message ?? e) };
+  }
+  const now = (await hcMachines())?.find((x) => x.name === name) ?? null;
+  return { machine: now, error: clean(r.stderr) || (r.code !== 0 ? clean(r.stdout) : "") };
 }
 
 export function clean(text) {
