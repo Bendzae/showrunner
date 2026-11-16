@@ -6,7 +6,7 @@ use std::process::{Command, Stdio};
 use anyhow::{Context, Result, bail};
 
 use crate::agent::AgentKind;
-use crate::hc;
+use crate::{hc, routines};
 
 const SESSION_SEP: &str = "__";
 
@@ -34,6 +34,13 @@ fn herdr_ids(cm_name: &str) -> (&str, &str) {
         .rsplit_once(SESSION_SEP)
         .map_or(cm_name, |(task, _)| task);
     (space, cm_name)
+}
+
+/// Where a session's terminals show: a routine's runs in its routine's space.
+fn session_herdr_ids(cm_name: &str) -> (String, String) {
+    let (space, tab) = herdr_ids(cm_name);
+    let space = routines::run_space(cm_name).unwrap_or_else(|| space.to_string());
+    (space, tab.to_string())
 }
 
 /// The Herdr space a task's sessions show in.
@@ -264,10 +271,10 @@ pub fn label_for_herdr() {
             continue;
         };
         if terminal.label(LABEL_HERDR_TAB).is_none() {
-            let (space, tab) = herdr_ids(cm_name);
+            let (space, tab) = session_herdr_ids(cm_name);
             let _ = hc::set_labels(
                 &terminal.address,
-                &[(LABEL_HERDR_SPACE, space), (LABEL_HERDR_TAB, tab)],
+                &[(LABEL_HERDR_SPACE, &space), (LABEL_HERDR_TAB, &tab)],
             );
         }
     }
@@ -315,11 +322,11 @@ fn launch(spec: Launch) -> Result<()> {
             hc::kill(&old.address);
         }
     }
-    let (space, tab) = herdr_ids(spec.cm_name);
+    let (space, tab) = session_herdr_ids(spec.cm_name);
     let mut labels = vec![
         (LABEL_SESSION, spec.cm_name),
-        (LABEL_HERDR_SPACE, space),
-        (LABEL_HERDR_TAB, tab),
+        (LABEL_HERDR_SPACE, &space),
+        (LABEL_HERDR_TAB, &tab),
         (LABEL_AGENT, spec.agent.id()),
         (LABEL_PROJECT_PATH, spec.project_path),
     ];
@@ -1423,14 +1430,14 @@ pub fn count_terminal_windows(session_name: &str) -> usize {
 
 /// Open a shell terminal for the session rooted at `work_dir`.
 pub fn create_terminal_window(session_name: &str, work_dir: &str) -> Result<()> {
-    let (space, tab) = herdr_ids(session_name);
+    let (space, tab) = session_herdr_ids(session_name);
     hc::run(
         work_dir,
         None,
         &[
             (LABEL_TERMINAL, session_name),
-            (LABEL_HERDR_SPACE, space),
-            (LABEL_HERDR_TAB, tab),
+            (LABEL_HERDR_SPACE, &space),
+            (LABEL_HERDR_TAB, &tab),
         ],
     )?;
     Ok(())
@@ -1882,7 +1889,7 @@ fn build_base_system_prompt(
     if worktree_branch.is_some() {
         prompt.push_str("\n- NEVER push the worktree branch unless explicitly told to do so");
     }
-    let (space, tab) = herdr_ids(cm_name);
+    let (space, tab) = session_herdr_ids(cm_name);
     prompt.push_str(&format!(
         "\n- The person may queue ideas for this task in the Herdr app's Ideas panel: see\n  \
          the `idea-queue` skill when they mention their ideas or the queue\n\

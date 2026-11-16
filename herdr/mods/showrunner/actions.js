@@ -152,6 +152,9 @@ export async function perform(action, item, at) {
       return act(item.routine.paused ? "Resuming routine" : "Pausing routine", ["routine", item.routine.paused ? "resume" : "pause", item.routine.name]);
     case "routine-delete":
       return confirm(`Delete routine ${item.routine.name}?`, "It stops running. Sessions it started stay.", ["routine", "delete", item.routine.name, "--yes"], "Delete");
+    case "routine-output":
+      return act(`Opening ${item.routine.name}'s output`, ["routine", "output", item.routine.name],
+        { quiet: true, after: { reveal: { space: item.space, tab: item.routine.output_tab, focus: Boolean(item.focus) } } });
     case "start-scheduler":
       return act("Starting the routine scheduler", ["routine", "start"], { after: { reveal: { space: item.space, tab: item.tab, focus: false } } });
   }
@@ -365,7 +368,7 @@ FORMS["routine-command"] = {
   title: (p) => (p.edit ? `Edit routine ${p.edit.name}` : "New command routine"),
   action: "Save",
   fields: routineFields({ id: "command", label: "Command", placeholder: "~/bin/check-something", value: (p) => p.edit?.command ?? "" }),
-  hint: "Runs with sh in your home folder. What it prints shows in the scheduler's terminal (Enter on the routine); a run that succeeds without printing stays quiet.",
+  hint: "Runs with sh in your home folder. What it prints shows in the routine's own tab (click it); a run that succeeds without printing stays quiet.",
   submit: (v, p) => (v.command.trim() ? routineArgs(v, p, ["--command", v.command.trim()]) : "Which command?"),
 };
 FORMS["routine-prompt"] = {

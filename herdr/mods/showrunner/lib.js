@@ -205,6 +205,12 @@ export function schedulerAddress() {
   return t?.address ?? null;
 }
 
+// The live terminal on this machine Herdr shows as this tab.
+export function tabAddress(tab) {
+  const t = terminals().find((x) => x.labels?.["herdr.tab"] === tab && x.state === "live" && !machineOf(x.address));
+  return t?.address ?? null;
+}
+
 function isShellIdle(t) {
   const name = t.foreground?.name ?? "";
   const argv = t.foreground?.argv ?? [];

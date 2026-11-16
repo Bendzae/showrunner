@@ -87,6 +87,7 @@ Routines (commands, or prompts each started in a new adhoc session, on a schedul
   showrunner routine edit <name> [--name <n>] [--schedule <s>] [--command <cmd>]
                                  [--project <p>] [--prompt <text>] [--agent <id>]
   showrunner routine pause|resume|run <name> | delete <name> --yes
+  showrunner routine output <name>              a command routine's output, in its own terminal
   showrunner routine start                      start the scheduler's terminal unless it runs
                                                     (`routine scheduler` is what it runs)
 

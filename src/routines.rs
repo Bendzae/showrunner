@@ -3,7 +3,8 @@
 //! (`showrunner routine scheduler`) and is the only writer of their state.
 
 use std::collections::{HashMap, HashSet};
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -26,6 +27,10 @@ const LABEL: &str = "showrunner.routines";
 /// Herdr shows the scheduler's terminal as this space and tab.
 pub const SPACE: &str = "cm__routines";
 pub const TAB: &str = "cm__routines__scheduler";
+/// On a command routine's output terminal: the routine's name, sanitized.
+const OUTPUT_LABEL: &str = "showrunner.routine-output";
+/// A command routine's output log is set aside past this size.
+const LOG_LIMIT: u64 = 1 << 20;
 const TICK: Duration = Duration::from_secs(5);
 /// A prompt routine's newest sessions stay; older ones end when it runs again.
 const KEEP_RUNS: usize = 3;
@@ -148,6 +153,92 @@ fn save_state(states: &States) {
     {
         let _ = fs::rename(&temp, &path);
     }
+}
+
+/// The Herdr space a routine's runs, or its output, show in.
+pub fn space(name: &str) -> String {
+    format!("cm__routine__{}", session::sanitize(name))
+}
+
+fn output_tab(name: &str) -> String {
+    format!("{}__output", space(name))
+}
+
+/// The space of the routine this session is a run of.
+pub fn run_space(cm_name: &str) -> Option<String> {
+    load_state()
+        .into_iter()
+        .find(|(_, s)| s.runs.iter().any(|run| run == cm_name))
+        .map(|(name, _)| space(&name))
+}
+
+fn log_path(name: &str) -> PathBuf {
+    dir()
+        .join("logs")
+        .join(format!("{}.log", session::sanitize(name)))
+}
+
+fn append_log(name: &str, text: &str) {
+    let path = log_path(name);
+    if fs::metadata(&path).is_ok_and(|m| m.len() > LOG_LIMIT) {
+        let _ = fs::rename(&path, path.with_extension("log.old"));
+    }
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = file.write_all(text.as_bytes());
+    }
+}
+
+fn output_terminals(name: &str) -> Vec<hc::Terminal> {
+    hc::list_all(&[(OUTPUT_LABEL, &session::sanitize(name))]).unwrap_or_default()
+}
+
+/// A terminal following what a command routine prints, started unless it runs.
+fn ensure_output(name: &str) -> Result<String> {
+    let (live, finished): (Vec<_>, Vec<_>) = output_terminals(name)
+        .into_iter()
+        .partition(|t| t.is_live());
+    for t in finished {
+        hc::remove(&t.address);
+    }
+    if let Some(t) = live.into_iter().next() {
+        return Ok(t.address);
+    }
+    append_log(name, "");
+    let note = format!(
+        "What {name} prints shows here, newest last; a run that succeeds without printing doesn't."
+    );
+    let line = format!(
+        "echo {}; exec tail -n 500 -F {}",
+        shell_escape(&note),
+        shell_escape(&log_path(name).to_string_lossy())
+    );
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
+    hc::run(
+        &home.to_string_lossy(),
+        Some(&line),
+        &[
+            (OUTPUT_LABEL, &session::sanitize(name)),
+            ("herdr.space", &space(name)),
+            ("herdr.tab", &output_tab(name)),
+        ],
+    )
+}
+
+/// Ends a routine's output terminal, and moves its log to the routine's new
+/// name or deletes it.
+fn move_output(name: &str, to: Option<&str>) {
+    for t in output_terminals(name) {
+        hc::kill(&t.address);
+    }
+    let log = log_path(name);
+    let _ = fs::remove_file(log.with_extension("log.old"));
+    let _ = match to {
+        Some(new) => fs::rename(&log, log_path(new)),
+        None => fs::remove_file(&log),
+    };
 }
 
 /// `routine run` leaves one of these for the scheduler.
@@ -353,12 +444,11 @@ fn start(routine: Routine, state: Arc<Mutex<States>>) {
                 ),
                 Err(e) => (format!("failed: {e}"), true, String::new()),
             },
-            None => match start_session(&routine, now) {
+            None => match start_session(&routine, now, &state) {
                 Ok(cm_name) => {
                     let ended = {
                         let mut states = state.lock().unwrap();
                         let runs = &mut states.entry(routine.name.clone()).or_default().runs;
-                        runs.push(cm_name.clone());
                         let extra = runs.len().saturating_sub(KEEP_RUNS);
                         runs.drain(..extra).collect::<Vec<_>>()
                     };
@@ -374,7 +464,12 @@ fn start(routine: Routine, state: Arc<Mutex<States>>) {
                 Err(e) => (format!("failed: {e:#}"), true, String::new()),
             },
         };
-        print!("{}", report(&routine.name, now, &result, failed, &output));
+        let heading = format!("{} {}", now.format("%H:%M"), routine.name);
+        print!("{}", report(&heading, &result, failed, &output));
+        if routine.command.is_some() {
+            let heading = now.format("%a %d %b %H:%M").to_string();
+            append_log(&routine.name, &report(&heading, &result, failed, &output));
+        }
         update(&state, &routine.name, |s| {
             s.running = false;
             s.failed = failed;
@@ -399,7 +494,7 @@ fn run_command(command: &str) -> Result<(Option<i32>, String)> {
 }
 
 /// A new adhoc session in the routine's project, starting on its prompt.
-fn start_session(routine: &Routine, now: DateTime<Local>) -> Result<String> {
+fn start_session(routine: &Routine, now: DateTime<Local>, state: &Mutex<States>) -> Result<String> {
     let cfg = Config::load()?;
     let name = routine.project.as_deref().unwrap_or_default();
     let project = cfg
@@ -417,16 +512,23 @@ fn start_session(routine: &Routine, now: DateTime<Local>) -> Result<String> {
     if taken(&run) {
         run = format!("{}-{}", routine.name, now.format("%m%d-%H%M%S"));
     }
-    ops::create_adhoc_session(&cfg, project, &run, agent, routine.prompt.as_deref())
+    // Listed first: its terminal shows in the routine's space (`run_space`).
+    let cm_name = session::build_session_name(&project.name, session::ADHOC_MARKER, &run);
+    update(state, &routine.name, |s| s.runs.push(cm_name.clone()));
+    let created = ops::create_adhoc_session(&cfg, project, &run, agent, routine.prompt.as_deref());
+    if created.is_err() {
+        update(state, &routine.name, |s| s.runs.retain(|r| r != &cm_name));
+    }
+    created
 }
 
 fn ref_of(cm_name: &str) -> String {
     cm_name.trim_start_matches("cm__").replace("__", "/")
 }
 
-/// What the scheduler's terminal shows for a run: nothing for a quiet success.
-fn report(name: &str, at: DateTime<Local>, result: &str, failed: bool, output: &str) -> String {
-    let time = at.format("%H:%M");
+/// What the scheduler's terminal, or a routine's output, shows for a run:
+/// nothing for a quiet success.
+fn report(heading: &str, result: &str, failed: bool, output: &str) -> String {
     let lines: Vec<&str> = output.lines().collect();
     let outcome = if failed {
         format!(" ({result})")
@@ -434,13 +536,13 @@ fn report(name: &str, at: DateTime<Local>, result: &str, failed: bool, output: &
         String::new()
     };
     match lines.as_slice() {
-        [] if failed => format!("{time} {name}: {result}\n"),
+        [] if failed => format!("{heading}: {result}\n"),
         [] if result == "ok" => String::new(),
-        [] => format!("{time} {name}: {result}\n"),
-        [line] => format!("{time} {name}: {line}{outcome}\n"),
+        [] => format!("{heading}: {result}\n"),
+        [line] => format!("{heading}: {line}{outcome}\n"),
         lines => {
             let body: String = lines.iter().map(|l| format!("  {l}\n")).collect();
-            format!("{time} {name}:{outcome}\n{body}")
+            format!("{heading}:{outcome}\n{body}")
         }
     }
 }
@@ -468,6 +570,8 @@ pub fn listing(cfg: &Config) -> Value {
                 "failed": s.failed,
                 "running": s.running,
                 "runs": s.runs,
+                "space": space(&r.name),
+                "output_tab": r.command.is_some().then(|| output_tab(&r.name)),
                 "error": Schedule::parse(&r.schedule).err().map(|e| e.to_string()),
             })
         })
@@ -478,7 +582,7 @@ pub fn listing(cfg: &Config) -> Value {
 const USAGE: &str = "usage: routine list [--json] | add <name> <schedule> (--command <cmd> | \
      --project <p> --prompt <text> [--agent <id>]) | edit <name> [--name <n>] [--schedule <s>] \
      [--command <cmd>] [--project <p>] [--prompt <text>] [--agent <id>] | \
-     pause|resume|run <name> | delete <name> --yes | start | scheduler";
+     pause|resume|run|output <name> | delete <name> --yes | start | scheduler";
 
 pub fn cmd_routine(args: &[String]) -> Result<()> {
     let rest = args.get(1..).unwrap_or_default();
@@ -489,6 +593,7 @@ pub fn cmd_routine(args: &[String]) -> Result<()> {
         Some("pause") => set_paused(rest, true),
         Some("resume") => set_paused(rest, false),
         Some("run") => run_now(rest),
+        Some("output") => output(rest),
         Some("delete") => delete(rest),
         Some("start") => {
             let started = ensure_scheduler()?;
@@ -622,6 +727,11 @@ fn edit(args: &[String]) -> Result<()> {
     validate(&cfg, &routine, Some(name))?;
     *find(&mut cfg, name)? = routine.clone();
     cfg.save()?;
+    if routine.command.is_none() {
+        move_output(name, None);
+    } else if &routine.name != name {
+        move_output(name, Some(&routine.name));
+    }
     println!(
         "updated routine {}: {}",
         routine.name,
@@ -681,6 +791,16 @@ fn run_now(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn output(args: &[String]) -> Result<()> {
+    let name = one_name(args, "output <name>")?;
+    let mut cfg = Config::load()?;
+    if find(&mut cfg, &name)?.command.is_none() {
+        bail!("routine {name} starts sessions: its runs show under it");
+    }
+    println!("output of routine {name}: {}", ensure_output(&name)?);
+    Ok(())
+}
+
 fn delete(args: &[String]) -> Result<()> {
     let (positional, flags) = parse_args(args, &[], &["yes"])?;
     let [name] = positional.as_slice() else {
@@ -694,6 +814,7 @@ fn delete(args: &[String]) -> Result<()> {
     cfg.routines.retain(|r| &r.name != name);
     cfg.save()?;
     let _ = fs::remove_file(request_path(name));
+    move_output(name, None);
     println!("deleted routine {name}");
     Ok(())
 }
@@ -840,12 +961,12 @@ mod tests {
 
     #[test]
     fn quiet_success_reports_nothing() {
-        let t = local(2026, 11, 13, 9, 5);
-        assert_eq!(report("x", t, "ok", false, ""), "");
-        assert_eq!(report("x", t, "exit 1", true, ""), "09:05 x: exit 1\n");
-        assert_eq!(report("x", t, "ok", false, "hi"), "09:05 x: hi\n");
+        let h = "09:05 x";
+        assert_eq!(report(h, "ok", false, ""), "");
+        assert_eq!(report(h, "exit 1", true, ""), "09:05 x: exit 1\n");
+        assert_eq!(report(h, "ok", false, "hi"), "09:05 x: hi\n");
         assert_eq!(
-            report("x", t, "exit 2", true, "a\nb"),
+            report(h, "exit 2", true, "a\nb"),
             "09:05 x: (exit 2)\n  a\n  b\n"
         );
     }

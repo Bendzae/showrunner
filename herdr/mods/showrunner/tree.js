@@ -8,7 +8,7 @@
 import { div, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input } from "gpui-base";
 import { spaces, focused, run, theme, settings, shared, setShared, nextCommand, readTextFile, window, layout, themes, openOverlay, machines, notify } from "herdr";
-import { sr, act, clean, loadConfig, liveSessions, liveRuns, schedulerAddress, guessedStatus, worst, menuItems, show, runAct, qualify, bare, machineOf, hcMachines, reconnectMachine } from "./lib.js";
+import { sr, act, clean, loadConfig, liveSessions, liveRuns, schedulerAddress, tabAddress, guessedStatus, worst, menuItems, show, runAct, qualify, bare, machineOf, hcMachines, reconnectMachine } from "./lib.js";
 import { perform, openMenu, form } from "./actions.js";
 import { togglePanel, showPanel, panelEntries } from "./panels.js";
 import { icon, programIcon, statusGlyph, prColor, diffBadge, activityBadge, avatar, avatarColor, linearId, prSummary } from "./ui.js";
@@ -493,16 +493,23 @@ export class Tree {
           for (const s of p.adhoc_stopped ?? []) adhoc[s.cm_name] = { p, s, stopped: true };
           for (const s of p.adhoc_sessions ?? []) adhoc[s.cm_name] = { p, s, stopped: !live[s.cm_name] };
         }
+        // Each routine has its own space: its runs, or its output.
         for (const r of hits) {
           const key = `r:${r.name}`;
           const runs = (r.runs ?? []).map((cm) => adhoc[cm]).filter(Boolean).reverse();
-          rows.push({ key, kind: "routine", depth: 1, parents: [rkey], folded: !open(key), runs: runs.length, item: { kind: "routine", routine: r, ...base } });
+          this.names[r.space] = r.name;
+          this.spaceOrder.push(r.space);
+          if (r.output_tab) {
+            this.names[r.output_tab] = "output";
+            this.tabOrder.push(r.output_tab);
+          }
+          rows.push({ key, kind: "routine", depth: 1, parents: [rkey], folded: !open(key), runs: runs.length, item: { kind: "routine", routine: r, ...base, space: r.space } });
           for (const { p, s, stopped } of runs) {
-            this.names[s.cm_name] = s.name;
+            this.names[s.cm_name] = runLabel(s.name);
             this.tabOrder.push(s.cm_name);
             rows.push({
               key: `s:${s.cm_name}`, kind: stopped ? "stopped" : "adhoc", depth: 2, parents: [rkey, key], label: runLabel(s.name),
-              item: { kind: stopped ? "stopped" : "adhoc", project: projectInfo(p, this.data, null), session: sessionInfo(s, stopped), space: p.space, run: s.run, machine: null },
+              item: { kind: stopped ? "stopped" : "adhoc", project: projectInfo(p, this.data, null), session: sessionInfo(s, stopped), space: r.space, run: s.run, machine: null },
               status: stopped ? "stopped" : live[s.cm_name]?.status, program: live[s.cm_name]?.program,
               diff: this.stats.sessions[s.cm_name]?.diff,
             });
@@ -727,7 +734,7 @@ export class Tree {
     // The tab's row, or the closest row above it that isn't folded away.
     const all = this.allRows ?? rows;
     const target = all.find((r) => r.key === `s:${tab}`)
-      ?? all.find((r) => (r.kind === "task" || r.kind === "adhoc-group" || r.kind === "routines") && r.item.space === space?.id)
+      ?? all.find((r) => ["task", "adhoc-group", "routines", "routine"].includes(r.kind) && r.item.space === space?.id)
       ?? all.find((r) => r.key === `o:${space?.id}`);
     const key = [target?.key, ...[...(target?.parents ?? [])].reverse()].find((k) => rows.some((r) => r.key === k));
     if (key) this.sel = key;
@@ -755,7 +762,7 @@ export class Tree {
       case "routines":
         return this.toggle(row.key);
       case "routine":
-        return this.showRoutine(item, true);
+        return this.showRoutine(row, true);
       case "adhoc-group":
         return this.toggle(row.key);
       case "machine":
@@ -796,17 +803,22 @@ export class Tree {
     else if (row.kind === "task" && item.main) show(item.space, item.main.cm_name, item.main.address, false);
     else if (row.kind === "space") run("space.select", { id: item.space });
     else if (row.kind === "routines" && item.scheduler) show(item.space, item.tab, item.scheduler, false);
-    else if (row.kind === "routine") this.showRoutine(item, false);
+    else if (row.kind === "routine") this.showRoutine(row, false);
   }
 
-  // A prompt routine's newest session while it runs, else the scheduler's
-  // terminal (where commands print), started when it isn't running.
-  showRoutine(item, focus) {
-    const latest = item.routine.runs?.at(-1);
+  // A command routine's output, started when it isn't open; a prompt
+  // routine's newest session while it runs, else (Enter) its runs.
+  showRoutine(row, focus) {
+    const r = row.item.routine;
+    if (r.output_tab) {
+      const address = tabAddress(r.output_tab);
+      if (address) return show(r.space, r.output_tab, address, focus);
+      return perform("routine-output", { ...row.item, focus });
+    }
+    const latest = r.runs?.at(-1);
     const l = latest && liveSessions(this.guessed)[latest];
-    if (l) return show(latest.slice(0, latest.lastIndexOf("__")), latest, l.address, focus);
-    if (item.scheduler) return show(item.space, item.tab, item.scheduler, focus);
-    if (focus) perform("start-scheduler", item);
+    if (l) return show(r.space, latest, l.address, focus);
+    if (focus && row.runs) this.toggle(row.key);
   }
 
   menu(row, at) {
