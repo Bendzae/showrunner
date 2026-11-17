@@ -69,6 +69,9 @@ What the TUI's menus do:
   showrunner session adhoc <project> <name> [--agent <id>]
   showrunner session merge <session> [--message <m>] | update <session>
   showrunner session resume <session>           start a recorded session that isn't running
+  showrunner session restart <session|coordinator>
+                                                end its agent and resume the conversation in a
+                                                    new terminal (applies agent config changes)
   showrunner run <project | project/task | session> [--command <cmd>] [--kill]
   showrunner review <project/task | session> [--tool hunk|difit]
                                                 review here, then send the comments

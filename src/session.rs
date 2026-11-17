@@ -1737,6 +1737,13 @@ pub fn kill_session(name: &str) -> Result<()> {
     kill_session_with_fallback(name, None)
 }
 
+/// End the session's agent, leaving its shell terminals, worktree and record.
+pub fn end_agent(cm_name: &str) {
+    if let Some(terminal) = session_terminal(cm_name) {
+        hc::kill(&terminal.address);
+    }
+}
+
 /// End the session's terminals only — leave worktrees, branches, and session
 /// records intact. Used when archiving a task so the session can be recreated
 /// later. Also ends run terminals, by their `cmrun-` name.

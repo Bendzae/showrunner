@@ -457,6 +457,7 @@ export class Tree {
     const sessionInfo = (s, stopped) => ({
       cm_name: s.cm_name, name: s.name, agent: s.agent, worktree: s.worktree ?? null,
       run: s.run ?? null, live: !stopped && Boolean(live[s.cm_name]), address: live[s.cm_name]?.address ?? null,
+      status: stopped ? null : live[s.cm_name]?.status ?? null,
       remote_control: s.remote_control ?? false,
       in_tmux: Boolean(stopped && s.in_tmux),
     });
@@ -468,7 +469,7 @@ export class Tree {
       this.spaceOrder.push(c.space);
       this.tabOrder.push(c.cm_name);
       rows.push({ key: `s:${c.cm_name}`, kind: "coordinator", depth: 0, status: l ? l.status : "stopped",
-        item: { kind: "coordinator", space: c.space, session: { cm_name: c.cm_name, name: "Coordinator", agent: "claude", live: Boolean(l), address: l?.address ?? null } } });
+        item: { kind: "coordinator", space: c.space, session: { cm_name: c.cm_name, name: "Coordinator", agent: "claude", live: Boolean(l), address: l?.address ?? null, status: l?.status ?? null } } });
     }
     // Routines (`showrunner routine`), under the Coordinator: the scheduler's
     // terminal is their space's one tab.
@@ -822,7 +823,7 @@ export class Tree {
   }
 
   menu(row, at) {
-    if (!row?.item || row.kind === "space" || row.kind === "coordinator") return;
+    if (!row?.item || row.kind === "space") return;
     const item = { ...row.item, groups: this.groupsOf(row.item.project?.name, row.item.machine) };
     if (!menuItems(item).length) return;
     openMenu(item, at ?? this.anchor(row));

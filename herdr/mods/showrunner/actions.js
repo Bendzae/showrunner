@@ -35,8 +35,8 @@ export const form = (name, item, extra) => {
   return overlay("form", props, { width: 520, height: formHeight(FORMS[name], props) });
 };
 export const picker = (name, item, extra) => overlay("picker", { picker: name, item, ...extra }, { width: 480, height: 440 });
-export const confirm = (title, detail, args, label, on = null) =>
-  overlay("confirm", { title, detail, args, label, on }, { width: 440, height: 190 });
+export const confirm = (title, detail, args, label, on = null, opts = null) =>
+  overlay("confirm", { title, detail, args, label, on, opts }, { width: 440, height: 190 });
 
 // The ref `run` and `review` take for an item.
 function itemRef(item) {
@@ -108,6 +108,14 @@ export async function perform(action, item, at) {
       return act("Updating session", ["session", "update", session.cm_name], { timeout: 300000, on });
     case "merge":
       return merge(item);
+    case "restart": {
+      const s = session ?? item.main;
+      const args = ["session", "restart", s.cm_name];
+      const opts = { success: `Restarted ${s.name}`, after: { reveal: { space: item.space, tab: s.cm_name, focus: true } }, on };
+      if (s.status === "working")
+        return confirm(`Restart ${s.name}?`, "Its agent is working: the turn stops, then the conversation resumes.", args, "Restart", on, { success: opts.success, after: opts.after });
+      return act(`Restarting ${s.name}`, args, opts);
+    }
     case "resume":
       if (session.in_tmux)
         return notify({ title: `${session.name} still runs in tmux`, body: "Move it here with `showrunner migrate`, from a terminal outside tmux.", level: "warning", timeout: 8000 });

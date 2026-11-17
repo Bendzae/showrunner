@@ -361,6 +361,7 @@ What works differently there:
 - Forms instead of prompts: a new task asks name, branch, first prompt and agent in one dialog; base branch, group and checkout use fuzzy pickers; adding a project offers the system's folder picker.
 - `t` (terminal) opens a shell beside the session in its tab; `x` (run) runs the project's command in a `▶ run` tab of the space; `r` (review) runs the review tool in a pane beside the session and sends the comments to it when it closes.
 - A session whose tab was closed stays in the list as *stopped*; `Enter` starts it again, resuming its conversation.
+- **Restart** (`s` in a running session's menu, a task's for its main session, the Coordinator's) ends the agent and resumes its conversation in a new terminal: changed agent config (settings, plugins, MCP servers, skills) applies. A working agent asks first.
 - A project lists *adhoc* only when it has adhoc sessions; its menu (`a`, then `A`) starts one.
 - Creating a task or session shows its tab; the keyboard stays in the list.
 - **Other machines**: every machine Herdr reaches (`hc machine add`, or Settings > Machines) that runs showrunner gets a section below this machine's projects, with its own projects, tasks and sessions. They run in that machine's hc and show as its Herdr spaces; the menus, the right panels and `Cmd-K` work on them as here, by running showrunner there. Its saved sessions come back when Herdr first reaches it, and again after it was out of reach (a reboot). Setup: [herdr/README.md](herdr/README.md#another-machine). (The `[remote]` ssh host is the CLI's own way there, for `ec2:`-style refs.)
@@ -400,6 +401,7 @@ showrunner task set-group <project> <task> [<group>] # omit the group to ungroup
 showrunner task delete <project> <task> --yes
 showrunner session create <project> <task> [--prompt <text>] [--no-worktree] [--agent claude|codex|pi]
 showrunner session kill <session> --yes
+showrunner session restart <session|coordinator>  # end the agent, resume its conversation in a new terminal (applies config changes)
 showrunner ask <session> <question> [--timeout <secs>]
 showrunner send <session> <text> [--no-submit]
 showrunner output <session> [--lines <n>]

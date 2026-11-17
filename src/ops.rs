@@ -510,6 +510,17 @@ pub fn resume_session(cfg: &Config, cm_name: &str) -> Result<()> {
     Ok(())
 }
 
+/// End a session's agent and resume its conversation in a new terminal, so
+/// it picks up changed agent config (settings, plugins, MCP servers).
+pub fn restart_session(cfg: &Config, cm_name: &str) -> Result<()> {
+    session::end_agent(cm_name);
+    if cm_name == session::COORDINATOR {
+        session::ensure_coordinator()?;
+        return Ok(());
+    }
+    resume_session(cfg, cm_name)
+}
+
 /// Recreate a task session from its record. A missing worktree (the task was
 /// archived, or it was removed by hand) is first rebuilt at its old path from
 /// the session branch, so the agent resumes the old conversation. When that

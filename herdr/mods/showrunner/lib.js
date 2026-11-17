@@ -263,6 +263,7 @@ export const taskRef = (project, task) => `${project.name}/${task.name}`;
 export function menuItems(item) {
   const { kind, task, session } = item;
   const runItem = { key: "x", label: "Run", action: "run" };
+  const restart = (s) => (s?.live ? [{ key: "s", label: "Restart", action: "restart" }] : []);
   const remote = (s) =>
     s && s.agent === "claude" && s.live
       ? [{ key: "R", label: s.remote_control ? "Disable Remote Control" : "Enable Remote Control", action: "remote-control" }]
@@ -291,8 +292,10 @@ export function menuItems(item) {
         { key: "g", label: "Rename group", action: "rename-group" },
         { key: "G", label: "Ungroup tasks", action: "ungroup" },
       ];
+    case "coordinator":
+      return restart(session);
     case "adhoc":
-      return [runItem, ...remote(session), { key: "d", label: "Delete", action: "delete", danger: true }];
+      return [runItem, ...restart(session), ...remote(session), { key: "d", label: "Delete", action: "delete", danger: true }];
     case "task": {
       if (task.archived)
         return [
@@ -312,6 +315,7 @@ export function menuItems(item) {
         { key: "o", label: "Open PR", action: "open-pr" },
         { key: "g", label: "Set group", action: "set-group" },
         ...(task.linear ? [{ key: "l", label: "Open Linear ticket", action: "open-linear" }] : []),
+        ...restart(item.main),
         ...remote(item.main),
         { key: "A", label: "Archive", action: "archive" },
         { key: "d", label: "Delete", action: "delete", danger: true },
@@ -328,6 +332,7 @@ export function menuItems(item) {
         { key: "t", label: "Terminal", action: "terminal" },
         runItem,
         { key: "y", label: "Copy worktree path", action: "copy-path" },
+        ...restart(session),
         ...remote(session),
         ...(main ? [] : [{ key: "d", label: "Delete", action: "delete", danger: true }]),
       ];

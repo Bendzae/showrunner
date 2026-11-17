@@ -74,7 +74,7 @@ export class Menu {
     const t = theme();
     const list = this.entries();
     const item = props().item ?? {};
-    const heading = props().title ?? (item.session?.name ? `${item.task?.name ?? "adhoc"} · ${item.session.name}` : item.routine?.name ?? (item.kind === "routines" ? "Routines" : null) ?? item.task?.name ?? item.group ?? item.project?.name);
+    const heading = props().title ?? (item.kind === "coordinator" ? "Coordinator" : null) ?? (item.session?.name ? `${item.task?.name ?? "adhoc"} · ${item.session.name}` : item.routine?.name ?? (item.kind === "routines" ? "Routines" : null) ?? item.task?.name ?? item.group ?? item.project?.name);
     return v_flex().id("sr-menu").track_focus(this.handle).w_full().min_h(0).p(5).bg(t.popover).text_size(12.8)
       .on_key_down((e, cx) => {
         const k = e.key.length === 1 ? e.key_char ?? e.key : e.key;
@@ -441,7 +441,7 @@ export class Confirm {
 
   yes() {
     const p = props();
-    close({ kind: "act", label: p.label ?? "Working", args: p.args, opts: { timeout: 300000, on: p.on ?? null } });
+    close({ kind: "act", label: p.label ?? "Working", args: p.args, opts: { timeout: 300000, on: p.on ?? null, ...p.opts } });
   }
 
   render() {

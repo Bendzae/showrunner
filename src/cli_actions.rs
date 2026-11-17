@@ -69,6 +69,7 @@ pub fn session_action(sub: &str, args: &[String]) -> Option<Result<()>> {
         "merge" => session_merge(args),
         "update" => session_update(args),
         "resume" => session_resume(args),
+        "restart" => session_restart(args),
         _ => return None,
     })
 }
@@ -409,6 +410,25 @@ fn session_resume(args: &[String]) -> Result<()> {
     };
     ops::resume_session(&Config::load()?, &cm_name)?;
     println!("resumed {}", short_ref(&cm_name));
+    Ok(())
+}
+
+fn session_restart(args: &[String]) -> Result<()> {
+    let [reference] = args else {
+        bail!("usage: session restart <project>/<task>/<session> | coordinator");
+    };
+    let cm_name =
+        if reference.eq_ignore_ascii_case("coordinator") || reference == session::COORDINATOR {
+            session::COORDINATOR.to_string()
+        } else {
+            resolve_recorded_session(reference)?
+        };
+    ops::restart_session(&Config::load()?, &cm_name)?;
+    if cm_name == session::COORDINATOR {
+        println!("restarted the Coordinator");
+    } else {
+        println!("restarted {}", short_ref(&cm_name));
+    }
     Ok(())
 }
 
