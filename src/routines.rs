@@ -197,11 +197,9 @@ fn output_terminals(name: &str) -> Vec<hc::Terminal> {
 
 /// A terminal following what a command routine prints, started unless it runs.
 fn ensure_output(name: &str) -> Result<String> {
-    let (live, finished): (Vec<_>, Vec<_>) = output_terminals(name)
-        .into_iter()
-        .partition(|t| t.is_live());
+    let (live, finished): (Vec<_>, Vec<_>) = output_terminals(name).into_iter().partition(runs_own);
     for t in finished {
-        hc::remove(&t.address);
+        hc::kill(&t.address);
     }
     if let Some(t) = live.into_iter().next() {
         return Ok(t.address);
@@ -259,8 +257,17 @@ fn when(time: DateTime<Local>) -> String {
     time.format(format).to_string()
 }
 
+/// Whether it still runs what it was started with: Herdr keeps the terminals
+/// it shows, so a lost program (a restart) leaves a live login shell behind.
+fn runs_own(terminal: &hc::Terminal) -> bool {
+    terminal.is_live() && terminal.argv.get(1).is_some_and(|a| a == "-c")
+}
+
 fn scheduler_terminal() -> Option<hc::Terminal> {
-    hc::list(&[(LABEL, "scheduler")]).ok()?.into_iter().next()
+    hc::list(&[(LABEL, "scheduler")])
+        .ok()?
+        .into_iter()
+        .find(runs_own)
 }
 
 /// Start the scheduler in its terminal unless it runs. Returns whether it was started.
@@ -269,7 +276,7 @@ pub fn ensure_scheduler() -> Result<bool> {
         return Ok(false);
     }
     for old in hc::list_all(&[(LABEL, "scheduler")])? {
-        hc::remove(&old.address);
+        hc::kill(&old.address);
     }
     let exe = std::env::current_exe()?;
     let unset: String = session::NESTING_ENV

@@ -201,15 +201,19 @@ export function liveRuns() {
 
 // The routine scheduler's terminal here, while it runs.
 export function schedulerAddress() {
-  const t = terminals().find((x) => x.labels?.["showrunner.routines"] === "scheduler" && x.state === "live" && !machineOf(x.address));
+  const t = terminals().find((x) => x.labels?.["showrunner.routines"] === "scheduler" && x.state === "live" && ownProgram(x) && !machineOf(x.address));
   return t?.address ?? null;
 }
 
 // The live terminal on this machine Herdr shows as this tab.
 export function tabAddress(tab) {
-  const t = terminals().find((x) => x.labels?.["herdr.tab"] === tab && x.state === "live" && !machineOf(x.address));
+  const t = terminals().find((x) => x.labels?.["herdr.tab"] === tab && x.state === "live" && ownProgram(x) && !machineOf(x.address));
   return t?.address ?? null;
 }
+
+// Still runs what showrunner started (`sh -c …`), not the login shell a kept
+// terminal gets when its program was lost.
+const ownProgram = (t) => t.argv?.[1] === "-c";
 
 function isShellIdle(t) {
   const name = t.foreground?.name ?? "";
